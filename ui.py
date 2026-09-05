@@ -12,16 +12,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from activities.stream import LOG_RE
+from activities.stream import LOG_GLOB, LOG_RE
 
 ROOT = Path(__file__).resolve().parent
-LOG_TAIL = 60_000  # bytes per log file served per poll
+
+# The line append_log puts at the top of a log it has cut down to LOG_CAP // 2.
+# A copy, because this phase does not touch activities/stream.py, so
+# test_the_truncation_marker_matches_the_writer pins it against the writer.
+HEAD_MARK = b"[... head truncated ...]\n"
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>loopgraph</title><style>
@@ -121,12 +126,34 @@ runs(); setInterval(runs, 4000); setInterval(poll, 2000);
 
 # ---------- data providers ----------
 
-def log_tails(runs_dir: Path, slug: str) -> dict[str, str]:
-    logs = {}
-    for f in sorted((runs_dir / slug / "logs").glob("*.log")):
-        data = f.read_bytes()[-LOG_TAIL:]
-        logs[f.name] = data.decode(errors="replace")
-    return logs
+def bad_param(value: str) -> bool:
+    """A path segment that arrived over the wire and must stay one segment."""
+    return not value or "/" in value or ".." in value
+
+
+def log_names(runs_dir: Path, slug: str) -> list[str]:
+    """The run's log file names, sorted, no content. Missing directory: []."""
+    return sorted(f.name for f in (runs_dir / slug / "logs").glob(LOG_GLOB))
+
+
+def log_slice(path: Path, offset: int) -> dict:
+    """The bytes past `offset`, plus the two signals that say "start again".
+
+    `offset` comes back lower than it went in when the stored offset was past the
+    end of the file. That misses the other half: append_log rewrites an over-cap
+    file as HEAD_MARK plus its last 500 KB, so an offset under 500 KB still looks
+    valid while every byte behind it has moved. `head_truncated` is read from the
+    file's first bytes on every reply, so the page sees that flag go true and
+    replaces its text instead of appending from the middle of a line.
+    """
+    with path.open("rb") as f:
+        head = f.read(len(HEAD_MARK))
+        size = f.seek(0, 2)
+        if offset > size:
+            offset = 0
+        f.seek(offset)
+        text = f.read().decode(errors="replace")
+    return {"text": text, "offset": offset, "size": size, "head_truncated": head == HEAD_MARK}
 
 
 def run_dirs(runs_dir: Path) -> list[str]:
@@ -228,9 +255,23 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                 self.wfile.write(body)
             elif u.path == "/api/logs":
                 slug = parse_qs(u.query).get("dir", [""])[0]
-                if not slug or "/" in slug or ".." in slug:
-                    return self._json({"logs": {}}, 400)
-                self._json({"logs": log_tails(runs_dir, slug)})
+                if bad_param(slug):
+                    return self._json({"error": "dir must be a run directory name"}, 400)
+                self._json({"logs": log_names(runs_dir, slug)})
+            elif u.path == "/api/log":
+                q = parse_qs(u.query)
+                slug, name = q.get("dir", [""])[0], q.get("name", [""])[0]
+                if bad_param(slug) or bad_param(name):
+                    return self._json({"error": "dir and name must be single names"}, 400)
+                if not re.match(LOG_RE, name):
+                    return self._json({"error": "name is not a log file name"}, 400)
+                offset = q.get("offset", ["0"])[0]  # parse_qs drops &offset=, so 0
+                if not re.fullmatch(r"[0-9]+", offset):
+                    return self._json({"error": "offset must be a whole number"}, 400)
+                path = runs_dir / slug / "logs" / name
+                if not path.is_file():
+                    return self._json({"error": "no such log file"}, 404)
+                self._json(log_slice(path, int(offset)))
             elif u.path == "/api/runs":
                 wf = feed.runs() if feed else []
                 known = {w["dir"] for w in wf}
