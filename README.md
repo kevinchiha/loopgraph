@@ -83,17 +83,37 @@ there for.
 
 </details>
 
-When it finishes:
+## Using it
 
-```bash
-lg where                                                # paths and ports here
-lg start runs/example-hello /projects/loopgraph-example
-```
+The installer links a skill into `~/.claude/skills/`, so your agent already knows
+how to drive the engine. You describe the work; it writes the run and starts it.
 
-The run implements a `--hello` flag, gates it, audits it, and stops to ask whether
-to merge. Answer it and you have seen the whole engine.
+Start with the example, which ships with the repo:
+
+> Run the example through loopgraph.
+
+The agent checks the stack is up, starts the run, and tells you how to answer the
+decision. The run adds a `--hello` flag, gates it, audits it, and stops to ask
+whether to merge. Answer it and you have seen the whole engine.
+
+Then point it at something real, in a repo under the tree you mounted:
+
+> Run this through loopgraph: add a --json flag to the export command in myapp.
+
+The agent writes the brief and the write set, digs the actual check commands out
+of the project's `package.json` or `pyproject.toml`, confirms they pass on a clean
+tree before starting, then starts the run and reports back. You hear from it again
+when there is a decision to make.
+
+That last step is the point. It refuses to start a run whose gates cannot pass on
+an untouched repo, because a broken gate burns all three rounds and then the
+report blames the executor for your build.
 
 ## Defining a run
+
+The skill writes these for you, but read this section anyway. It is what you are
+checking when the agent shows you a brief before starting a run, and a brief you
+did not read is a run you cannot judge.
 
 A run is a directory under `runs/`. Three files:
 
@@ -152,12 +172,17 @@ minutes so you can press one key is a bad way to spend an afternoon.
 
 Merge cards take letters only. A stray text reply can never decide a merge.
 
-## Using it from a coding agent
+## Doing it by hand
 
-`skills/loopgraph/` is a Claude Code skill that teaches an agent to write the run
-directory, check the gates, start the run and report back. `install.sh` offers to
-link it into `~/.claude/skills/`. After that, "run this through loopgraph" in a
-Claude Code session does the whole setup for you.
+Nothing above needs an agent. The skill is a shortcut, not a dependency.
+
+```bash
+lg where                                                # paths and ports here
+lg start runs/example-hello /projects/loopgraph-example
+```
+
+The skill itself is `skills/loopgraph/SKILL.md`. It is worth reading even if you
+never use it: it is the shortest description of how to drive this thing properly.
 
 ## Limits, honestly
 

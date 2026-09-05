@@ -28,6 +28,10 @@ cd <engine_root> && <docker> compose ps
 
 ## 1. Write the run dir
 
+**Asked for the shipped example?** ("run the example", "try loopgraph", a first run
+after installing.) The run dir already exists. Skip to step 2 with
+`runs/example-hello` and `/projects/loopgraph-example`. Do not write a new brief.
+
 `<engine_root>/runs/<YYYY-MM-DD>-<short-slug>/` with exactly:
 
 - `brief.md` — the feature, the checkable done-when, and the write set (the exact
