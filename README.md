@@ -102,10 +102,31 @@ Then point it at something real, in a repo under the tree you mounted:
 > Update every place in the code that still says customer, including the tests, and
 > keep everything passing.
 
-That is the shape worth a loop. Big, boring, and easy to get almost right. An
-agent will tell you it changed all forty places. The gates and the audit are how
-you find out it changed thirty-eight and quietly left two, which is the kind of
-thing you would have waved through at 6pm on a Friday.
+> Run this through loopgraph: redesign the app to match the screenshots in
+> `mockups/`. Start with the settings page, and don't break anything it already does.
+
+> Run this through loopgraph: the payments module has no tests. Write them, cover
+> the refund and partial-refund paths, and change no behaviour while you do it.
+
+> Run this through loopgraph: upgrade to the new major version of the date library
+> and fix everything it breaks.
+
+What those have in common: big, boring, and easy to get almost right. An agent
+will tell you it changed all forty places. The gates and the audit are how you
+find out it changed thirty-eight and quietly left two, which is the kind of thing
+you would have waved through at 6pm on a Friday.
+
+The redesign is the odd one out, and worth being straight about. No gate can tell
+you a page looks right. What the gates prove is that it still builds, the tests
+still pass, and nothing outside the page you named got touched. You judge the look
+yourself, on the branch, when it asks. That is still most of the tedium off your
+desk, and you are reviewing a finished thing instead of watching it get made.
+
+Note the "start with the settings page". A run does one job at a time, so a whole
+app is a series of runs, one page each. That is not a limitation to work around,
+it is what keeps the write set small enough for the scope gate to mean anything.
+Ask for the whole app in one brief and you get one enormous diff nobody can audit,
+which is the thing you were trying to get away from.
 
 The agent writes the brief and the write set, digs the real check commands out of
 `package.json` or `pyproject.toml`, confirms they pass on a clean tree before
