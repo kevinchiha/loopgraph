@@ -98,14 +98,14 @@ whether to merge. Answer it and you have seen the whole engine.
 
 Then point it at something real, in a repo under the tree you mounted:
 
-> Run this through loopgraph: replace every direct `process.env` read in `src/`
-> with a call to the typed `config` module, and keep the build and the test suite
-> green.
+> Run this through loopgraph: we renamed "customer" to "account" in the database.
+> Update every place in the code that still says customer, including the tests, and
+> keep everything passing.
 
-That is the shape worth a loop. Wide, mechanical, and easy to get almost right.
-An agent will tell you it converted all thirty call sites. The gates and the audit
-are how you find out it converted twenty-eight and quietly left two, which is the
-kind of thing you would have accepted at 6pm on a Friday.
+That is the shape worth a loop. Big, boring, and easy to get almost right. An
+agent will tell you it changed all forty places. The gates and the audit are how
+you find out it changed thirty-eight and quietly left two, which is the kind of
+thing you would have waved through at 6pm on a Friday.
 
 The agent writes the brief and the write set, digs the real check commands out of
 `package.json` or `pyproject.toml`, confirms they pass on a clean tree before
