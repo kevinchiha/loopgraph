@@ -124,6 +124,8 @@ answers. Tell them a decision is coming and how to answer it:
   are answering when more than one is in flight.
 - From a terminal: `lg approve <workflow-id> A`. Give them this too; it is faster
   when they are already at the machine.
+- A merge card takes a letter and nothing else. If they type an answer instead,
+  the engine tells them so and keeps waiting; the run is not stuck.
 
 **Parked items.** An item that cannot go green after three rounds is parked and
 the run carries on with the rest. The user gets a message straight away, which
@@ -133,7 +135,9 @@ report which ones were parked and why. Do not describe such a run as done.
 
 Runs end as `merge-ready` (waiting on the user, your job is done), `merged`,
 `merge-failed` (the merge was refused or rolled back — read `merge.reason`),
-`held` or `discarded` (their answer; a discard deletes the branch), or `stopped`. `stopped` means either every
+`held` or `discarded` (their answer; a discard deletes the branch and its
+worktree), `discard-failed` (they chose C and the branch survived — read
+`discard.reason` and tell them it is still there), or `stopped`. `stopped` means either every
 item was parked or the supervisor said stop, which is the one verdict that ends a
 whole run. Read `reason` in the ledger and report it with the red gate's output
 tail, verbatim.

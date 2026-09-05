@@ -246,8 +246,8 @@ merged.
 lg approve <workflow-id> A     # A merge, B keep the branch, C delete the branch
 ```
 
-A merge is local and is never pushed. C deletes the run's branch, so the work is
-gone; B is the one to pick if you want to look at it later.
+A merge is local and is never pushed. C deletes the run's branch and its worktree,
+so the work is gone; B is the one to pick if you want to look at it later.
 
 The same question is already on your phone with buttons, and a tap does the same
 thing. `lg approve` is for when you are at the machine anyway; it is not a
@@ -260,7 +260,13 @@ replying to a card routes correctly even with several runs going. If you send a
 bare message while two runs are waiting, it says so rather than guessing, because
 guessing is how an answer meant for one run merges another.
 
-Merge cards take letters only. A stray text reply can never decide a merge.
+Merge cards take letters only. A stray text reply can never decide a merge, and if
+you send one it tells you what the card will take rather than swallowing it.
+
+That is the rule for anything the engine cannot use. If C cannot delete the branch
+because something else has it checked out, you get told and the run says
+`discard-failed` instead of claiming it discarded something. If it cannot work out
+which run your message answers, it says that too.
 
 So the run carries on by itself exactly when nothing needs your judgment, and the
 moment something does, it stops and waits.
@@ -272,7 +278,13 @@ Nothing above needs an agent. The skill is a shortcut, not a dependency.
 ```bash
 lg where                                                # paths and ports here
 lg start runs/example-hello /projects/loopgraph-example
+lg status <workflow-id> ledger                          # everything the run knows
+lg approve <workflow-id> A
 ```
+
+`lg start` exits non-zero only when the engine could not finish: `stopped`,
+`merge-failed` or `discard-failed`. Choosing B or C is your decision, not a
+failure, so it exits 0. That matters if you script it.
 
 The skill itself is `skills/loopgraph/SKILL.md`. It is worth reading even if you
 never use it: it is the shortest description of how to drive this thing properly.
@@ -301,6 +313,10 @@ never use it: it is the shortest description of how to drive this thing properly
 [SPEC.md](SPEC.md) is the original design doctrine and still the best explanation
 of why the pieces are arranged this way. `docs/architecture.html` is an explorable
 diagram of the same thing.
+
+Both predate the dispatcher. They show a run reading Telegram for itself, which is
+how it worked until one poller replaced per-run polling; the shape everywhere else
+is unchanged. `dispatcher.py` and this README are the current word on that part.
 
 ## License
 

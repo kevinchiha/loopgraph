@@ -332,7 +332,7 @@
       "id": "card",
       "from": "run",
       "to": "telegram",
-      "label": "send card, poll reply"
+      "label": "send card"
     },
     {
       "id": "reply",
