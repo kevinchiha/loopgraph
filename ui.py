@@ -42,6 +42,12 @@ PAGE = """<!doctype html>
   :root { --bg:#0b0e14; --pane:#11151d; --panel:#151a24; --line:#232a36; --fg:#d6dbe2;
           --dim:#7d8590; --accent:#58a6ff; --purple:#bc8cff; }
   * { box-sizing:border-box; margin:0; }
+  /* The browser's own [hidden] rule is display:none at user-agent weight, which
+     every rule below beats. #state is a flex box and the answer command is
+     inline-block, so both set the attribute and stayed on screen — a run's last
+     status still above the line saying there is no state. One rule here rather
+     than a display:none per section, so a section added later is covered too. */
+  [hidden] { display:none !important; }
   body { background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column;
          font:14px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif; }
   header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; gap:10px; align-items:baseline; }
@@ -77,9 +83,14 @@ PAGE = """<!doctype html>
   /* The question is the text of the card the owner saw, line breaks and all. */
   #awaiting .q { white-space:pre-wrap; word-break:break-word; margin-bottom:10px; }
   #awaiting .opt { font-size:13px; }
+  #awaiting .answer { margin-top:11px; }
+  /* Beside the command and never inside it: user-select:all covers the element
+     it is set on, so a label in the box would be selected with the command and
+     pasted into a shell. */
+  #awaiting .lbl { color:var(--dim); font-size:12.5px; margin-right:8px; }
   /* One click selects the whole command, so it can be pasted into a terminal
      without picking the ends off it by hand. */
-  #awaiting .cmd { display:inline-block; user-select:all; margin-top:10px; padding:4px 9px;
+  #awaiting .cmd { display:inline-block; user-select:all; padding:4px 9px;
                    background:var(--bg); border:1px solid var(--line); border-radius:6px;
                    color:var(--purple); word-break:break-all;
                    font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
@@ -255,7 +266,7 @@ function buildBoard() {
       '<div id="state" hidden><span class="pill"></span><span class="reason"></span></div>'
     + '<div id="why" hidden></div>'
     + '<section id="awaiting" hidden><h2></h2><div class="q"></div><div class="opts"></div>'
-    + '<code class="cmd"></code>'
+    + '<div class="answer"><span class="lbl">answer with:</span><code class="cmd"></code></div>'
     + '<div class="nocard">no card was sent; the lg approve command is the only way to answer</div>'
     + '</section>'
     + '<section id="items" hidden><h2>work items</h2><div class="rows"></div>'
@@ -312,7 +323,7 @@ function patchAwaiting(ledger) {
   const a = ledger && ledger.awaiting;
   box.hidden = !a;
   if (!a) return;
-  const [head, q, opts, cmd, nocard] = box.children;
+  const [head, q, opts, answer, nocard] = box.children;
   setText(head, 'awaiting: ' + (a.kind || ''));
   // A card that went up before this phase recorded no question. Everything else
   // is still worth reading, so the question is left out rather than drawn as an
@@ -320,8 +331,10 @@ function patchAwaiting(ledger) {
   q.hidden = !a.question;
   setText(q, a.question || '');
   patchOptions(opts, a.options || {});
-  cmd.hidden = !a.answer_with;
-  setText(cmd, a.answer_with || '');
+  // The label goes with the command: an empty box under the words `answer with:`
+  // would be worse than neither.
+  answer.hidden = !a.answer_with;
+  setText(answer.lastElementChild, a.answer_with || '');
   // No card was sent, so the owner's phone never buzzed and the command above is
   // the only way in. lg status says this sentence too, word for word.
   nocard.hidden = !!a.telegram;

@@ -1171,6 +1171,64 @@ def test_a_null_ledger_hides_the_state_sections_and_keeps_the_logs():
     assert "getElementById('rounds')" not in src, "the log cards are hidden with the state"
 
 
+def test_a_hidden_section_is_really_off_the_page():
+    """`hidden` is an attribute, and the rule that acts on it is the browser's own
+    `[hidden] { display: none }` — at user-agent weight, which any `display` in
+    the page's own stylesheet beats.
+
+    Two selectors here do exactly that. `#state` is a flex box and the answer
+    command is inline-block, so both set the attribute, stayed on screen, and cost
+    the reader the truth: a poll that lands a null ledger on a run already
+    selected drew the last status it had above the line saying there is no state.
+    That is reachable without anyone doing anything wrong — feed.ledger() answers
+    null whenever the ledger query fails on a running workflow, which is
+    nondeterminism on 7 of the 15 histories on this machine.
+
+    One rule beside the reset settles it for every section this page hides, the
+    ones Tasks 15 and 16 add included. It has to carry !important, because the
+    page's own rules are the ones it is overruling.
+    """
+    rule = re.search(r"\[hidden\]\s*\{([^}]*)\}", ui.page_html())
+    assert rule, "nothing in the page's own stylesheet hides an element with `hidden`"
+    body = rule.group(1).replace(" ", "")
+    assert "display:none" in body, "the rule does not take the element out of the layout"
+    assert "!important" in body, \
+        "a page rule that sets display beats this one, and #state and .cmd both set it"
+
+
+def test_the_first_run_is_clicked_only_when_nothing_is_chosen_yet():
+    """runs() selects the first row by clicking it, which reaches buildBoard two
+    hops from an interval — the shape this file's own notes record as invisible to
+    every rule in it. So the guard is pinned by hand.
+
+    `!sel` is the whole of it. Without those two characters the click fires on
+    every 4-second poll: the board is built again, the reader's selection dies and
+    every log pane they had open closes, with this suite green throughout.
+    """
+    src = function_source(ui.page_html(), "runs")
+    guard = re.search(r"if\s*\(([^)]*)\)\s*\w+\.click\(\);", src)
+    assert guard, "the first row is clicked with no `if` in front of it"
+    assert re.search(r"!\s*sel\b", guard.group(1)), \
+        "nothing stops the click firing again on every poll"
+
+
+def test_the_answer_command_says_what_it_is():
+    """AC-4 asks only that the command be selectable in one gesture, and a box of
+    monospace text with no label is what that gets you. `lg status` prints
+    `answer with:` in front of it; someone reading the page on a phone has no
+    terminal to infer it from.
+
+    The words go beside the <code>, never inside it: user-select:all covers the
+    element it is set on, so a label within the box would be selected along with
+    the command and pasted into a shell.
+    """
+    html = ui.page_html()
+    assert "answer with:" in html, "the command sits in a box with nothing saying what it is"
+    build = function_source(html, "buildBoard")
+    label = re.search(r"answer with:[^<]*(</\w+>)", build)
+    assert label and label.group(1) != "</code>", "the label is inside the <code> and selects with it"
+
+
 def test_the_recorded_question_keeps_its_own_line_breaks():
     """AC-5. The question is the text of the card the owner saw, location line and
     blank line included. Collapsed to one line it stops being that."""
