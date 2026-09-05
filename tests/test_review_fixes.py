@@ -7,6 +7,7 @@ banked once something fails when the bug comes back.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import re
 import subprocess
 from pathlib import Path
@@ -234,13 +235,39 @@ def _gate(cmd, timeout=10):
     return {"name": "g", "cmd": cmd, "green_exit": 0, "timeout": timeout}
 
 
-def test_a_loud_gate_does_not_grow_the_worker_without_bound():
-    """The failure: the whole of a gate's stdout was buffered before the tail was
-    taken, so a gate that prints continuously ate memory until the worker died."""
+def test_the_gate_buffer_stays_bounded_while_it_reads():
+    """The old version of this test could not fail: its first assertion was
+    guaranteed by a slice in the return statement and its second was a tautology,
+    so it passed against the entire pre-fix gate.py. Watch the buffer instead."""
+    from activities.gate import _drain
+
+    class Flood:
+        """20MB in 64KB chunks, then EOF."""
+        def __init__(self): self.left = 320
+
+        async def read(self, n):
+            if not self.left:
+                return b""
+            self.left -= 1
+            return bytes([65 + (self.left % 26)]) * 65536
+
+    keep = 4000
+    buf = bytearray()
+    peak = []
+    real_extend = buf.extend
+
+    asyncio.run(_drain(Flood(), keep, buf))
+    assert len(buf) <= keep * 2, f"buffer grew to {len(buf)} for a 20MB gate"
+    assert len(buf) >= keep, "it trimmed away more than the tail it must keep"
+
+
+def test_the_gate_keeps_the_END_of_the_output_not_the_start():
     from activities.gate import OUTPUT_TAIL, _run_one
-    r = asyncio.run(_run_one(_gate("yes ABCDEFGHIJ | head -c 4000000"), "/tmp"))
+    r = asyncio.run(_run_one(
+        {"name": "g", "cmd": "seq 1 400000", "green_exit": 0, "timeout": 30}, "/tmp"))
     assert len(r["output_tail"]) <= OUTPUT_TAIL
-    assert r["output_tail"].strip().endswith("ABCDEFGHIJ"[-1]) or r["output_tail"]
+    assert r["output_tail"].rstrip().endswith("400000"), "kept the wrong end"
+    assert "\n1\n" not in r["output_tail"]
 
 
 def test_a_timed_out_gate_keeps_what_it_printed():
@@ -691,3 +718,163 @@ def test_the_auditor_loads_nothing_from_the_tree_it_is_judging():
         src = inspect.getsource(mod)
         assert "setting_sources=[]" in src, \
             f"{mod.__name__} would load settings from the tree under audit"
+
+
+# ---------- the round's call site, run for real ----------
+# Everything except the Claude call is exercised: ensure_worktree, the reset, the
+# git status flags, the branch and worktree naming, undo_self_commit. Several
+# fixes were only tested through their helpers, so putting the old bug back at the
+# CALL SITE left the suite green.
+
+@pytest.fixture
+def target(tmp_path):
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "cli.py").write_text("x = 1\n")
+    (repo / ".gitignore").write_text("ignored/\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    return repo
+
+
+@pytest.fixture
+def rundir(tmp_path):
+    run = tmp_path / "runs" / "demo"
+    (run / "logs").mkdir(parents=True)
+    (run / "brief.md").write_text("# Feature\n\ndo the thing\n")
+    (run / "constraints.md").write_text("")
+    (run / "gates.yaml").write_text('- name: always-green\n  cmd: "true"\n  timeout: 10\n')
+    return run
+
+
+def _round(rundir, target, do, **kw):
+    """Run the real execute_round with `do(worktree)` standing in for the executor."""
+    from activities import execute_round as er
+
+    async def fake_round(prompt, exec_fn, gate_fn, max_attempts=3):
+        wt = kw.get("_seen_worktree")
+        do(wt[0] if wt else None)
+        await gate_fn()
+        return {"status": "green", "attempt": 1,
+                "result": {"claims": [], "files_changed": [], "summary": "did it"},
+                "gate_results": []}
+
+    seen = []
+    real_reset = er.reset_to_checkpoint
+
+    async def spy_reset(worktree, base_commit=None):
+        seen.append((worktree, base_commit))
+        kw.setdefault("_seen_worktree", []).append(worktree)
+        return await real_reset(worktree, base_commit)
+
+    er.reset_to_checkpoint = spy_reset
+    er.run_round = fake_round
+    # A real activity context, so the heartbeats inside the gate runner work.
+    from temporalio.testing import ActivityEnvironment
+    try:
+        out = asyncio.run(ActivityEnvironment().run(
+            er.execute_round, str(rundir), str(target), "do the thing",
+            kw.get("round_no", 1), None, kw.get("item_no", 1),
+            kw.get("run_token", "ab12cd"), kw.get("base_commit")))
+    finally:
+        er.reset_to_checkpoint = real_reset
+    out["_resets"] = seen
+    return out
+
+
+def test_every_round_resets_including_the_first(rundir, target):
+    """Putting the old `if round_no > 1` guard back around the reset reintroduces
+    the parked-item leak, and the helper-only test stayed green when it did."""
+    r = _round(rundir, target, lambda wt: None, round_no=1)
+    assert len(r["_resets"]) == 1, "round 1 did not reset, so a parked item's leftovers survive"
+
+
+def test_the_round_resets_to_the_baseline_it_was_given(rundir, target):
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=target, capture_output=True,
+                          text=True).stdout.strip()
+    r = _round(rundir, target, lambda wt: None, base_commit=base)
+    assert r["_resets"][0][1] == base, "the workflow's baseline never reached the reset"
+
+
+def test_the_write_set_survives_a_filename_with_a_space(rundir, target):
+    """Reverting the -z and --untracked-files=all flags at this call site returns
+    one garbage entry, and every test still passed."""
+    def write(wt):
+        (pathlib.Path(wt) / "my file.py").write_text("hi\n")
+        (pathlib.Path(wt) / "pkg").mkdir()
+        (pathlib.Path(wt) / "pkg" / "a.py").write_text("a\n")
+    r = _round(rundir, target, write)
+    assert "my file.py" in r["files"], r["files"]
+    assert "pkg/a.py" in r["files"], "a new directory must be listed file by file"
+    assert "pkg/" not in r["files"]
+
+
+def test_the_branch_and_worktree_belong_to_this_run(rundir, target):
+    r = _round(rundir, target, lambda wt: None, run_token="zz99")
+    assert r["branch"] == "lg-demo-zz99"
+    assert r["worktree"].endswith("/worktrees/zz99")
+
+
+def test_an_executor_commit_is_put_back_and_reported(rundir, target):
+    def commit_own_work(wt):
+        (pathlib.Path(wt) / "cli.py").write_text("x = 2\n")
+        _git(pathlib.Path(wt), "add", "-A")
+        _git(pathlib.Path(wt), "commit", "-qm", "the executor committing")
+    r = _round(rundir, target, commit_own_work)
+    assert r["self_committed"] is True, "the red-line breach was not noticed"
+    assert "cli.py" in r["files"], "the work is hidden from the write set"
+
+
+def test_a_plain_directory_at_the_worktree_path_is_refused(rundir, target):
+    """The bug: an early return on isdir alone meant the reset that follows ran
+    `git reset --hard` against whatever repository encloses that path."""
+    from activities.execute_round import ensure_worktree
+    stray = rundir / "worktrees" / "ab12cd"
+    stray.mkdir(parents=True)
+    (stray / "someones-work.py").write_text("do not delete me\n")
+    with pytest.raises(RuntimeError) as e:
+        asyncio.run(ensure_worktree(str(target), str(stray), "lg-demo-ab12cd"))
+    assert "not a git worktree" in str(e.value)
+    assert (stray / "someones-work.py").exists()
+
+
+# ---------- fixes that could be reverted with the suite still green ----------
+
+def test_the_auditor_holds_no_tool_that_can_change_anything():
+    """Removing tools/disallowed_tools leaves the auditor with Write, Edit and
+    Bash auto-approved under bypassPermissions, inside the worktree it is judging.
+    Nothing objected, and the audit's independence is the whole point."""
+    import inspect
+
+    from activities import audit
+    src = inspect.getsource(audit.run_supervisor)
+    assert 'tools=["Read", "Glob", "Grep"]' in src, "the auditor's tool set is not restricted"
+    denied = src.split("disallowed_tools=[")[1].split("]")[0]
+    for banned in ("Write", "Edit", "Bash"):
+        assert banned in denied, f"{banned} is not denied to the auditor"
+    assert "setting_sources=[]" in src, "it would load settings from the tree under audit"
+
+
+def test_choosing_C_actually_calls_discard():
+    """discard() has three tests of its own, but nothing proved the workflow ever
+    calls it, so the wiring could be dropped with the suite green."""
+    import inspect
+
+    from workflows.run import LoopGraphRun
+    src = inspect.getsource(LoopGraphRun._owner_card)
+    after_c = src.split('elif letter == "C"')[1]
+    assert "discard" in after_c.split("else:")[0], "C no longer discards anything"
+    assert "result[\"branch\"]" in after_c, "it must discard THIS run's branch"
+
+
+def test_the_workflow_captures_a_baseline_before_the_first_round():
+    """base_commit stayed None until the first accepted checkpoint, so on a
+    single-item brief the retry protection never applied at all."""
+    import inspect
+
+    from workflows.run import LoopGraphRun
+    src = inspect.getsource(LoopGraphRun.run)
+    before_loop = src.split("for i, item in enumerate")[0]
+    assert "run_baseline" in before_loop, "no baseline is captured before the run starts"
+    assert "self._base_commit = await workflow.execute_activity" in before_loop

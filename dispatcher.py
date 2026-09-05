@@ -56,36 +56,54 @@ async def pump(client: Client, http: httpx.AsyncClient, token: str, chat: str,
     updates = r.json().get("result", [])
     if not updates:
         return offset
-    ids = await open_run_ids(client) if any(
-        not (u.get("callback_query") or {}).get("message") for u in updates) else []
+    # Fetch the open runs for every batch. Deciding from the shape of the updates
+    # meant a tap on a card older than ~48h — Telegram sends an InaccessibleMessage
+    # with no text — routed or was refused depending on whether an unrelated update
+    # happened to arrive in the same 25-second batch.
+    ids = await open_run_ids(client)
     for u in updates:
-        offset = max(offset, u["update_id"] + 1)
         try:
-            hit = route_update(u, chat, ids)
-        except Exception as e:  # a malformed update must never stop the pump
-            print(f"dispatcher: could not read update {u.get('update_id')}: {e}", flush=True)
-            continue
-        if not hit:
-            continue
-        if hit.get("problem"):
-            print(f"dispatcher: {hit['problem']}", flush=True)
-            await http.post(f"{API}/bot{token}/sendMessage",
-                            json={"chat_id": chat, "text": f"loopgraph: {hit['problem']}"})
-            if hit.get("callback_id"):
-                await http.post(f"{API}/bot{token}/answerCallbackQuery",
-                                json={"callback_query_id": hit["callback_id"],
-                                      "text": "could not place that"})
-            continue
-        try:
-            print("dispatcher: " + await deliver(client, hit), flush=True)
-            note = f"{hit['value'][:20]} recorded"
-        except Exception as e:
-            print(f"dispatcher: could not signal {hit['wf_id']}: {e}", flush=True)
-            note = "that run is not accepting answers"
+            # Advance first and keep it. Losing this on a later failure re-fetched
+            # the whole batch and acted on it again: duplicate decisions, repeated
+            # messages to the owner, and every later update in the batch stuck
+            # behind the failing one, once every five seconds, forever.
+            offset = max(offset, u.get("update_id", offset - 1) + 1)
+            await handle(client, http, token, chat, u, ids)
+        except Exception as e:  # one bad update must never stop the pump
+            print(f"dispatcher: update {u.get('update_id')} failed: {e}", flush=True)
+    return offset
+
+
+async def handle(client: Client, http: httpx.AsyncClient, token: str, chat: str,
+                 update: dict, ids: list[str]) -> None:
+    hit = route_update(update, chat, ids)
+    if not hit:
+        return
+    if hit.get("problem"):
+        print(f"dispatcher: {hit['problem']}", flush=True)
+        await http.post(f"{API}/bot{token}/sendMessage",
+                        json={"chat_id": chat, "text": f"loopgraph: {hit['problem']}"})
         if hit.get("callback_id"):
             await http.post(f"{API}/bot{token}/answerCallbackQuery",
-                            json={"callback_query_id": hit["callback_id"], "text": note})
-    return offset
+                            json={"callback_query_id": hit["callback_id"],
+                                  "text": "could not place that"})
+        return
+    try:
+        print("dispatcher: " + await deliver(client, hit), flush=True)
+        note = f"{hit['value'][:20]} recorded"
+        problem = None
+    except Exception as e:
+        print(f"dispatcher: could not signal {hit['wf_id']}: {e}", flush=True)
+        note, problem = "that run is not accepting answers", str(e)[:200]
+    if hit.get("callback_id"):
+        await http.post(f"{API}/bot{token}/answerCallbackQuery",
+                        json={"callback_query_id": hit["callback_id"], "text": note})
+    elif problem:
+        # A typed answer has no toast, so without this the owner's reply would
+        # vanish leaving only a line in a container log.
+        await http.post(f"{API}/bot{token}/sendMessage",
+                        json={"chat_id": chat,
+                              "text": f"loopgraph: could not deliver that answer: {problem}"})
 
 
 async def main() -> None:

@@ -16,7 +16,7 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from activities.audit import audit
     from activities.checkpoint import checkpoint, discard, merge
-    from activities.execute_round import execute_round
+    from activities.execute_round import execute_round, run_baseline
     from activities.gate import run_gates
     from activities.items import load_work_items
     from activities.learn import learn
@@ -120,6 +120,14 @@ class LoopGraphRun:
         a park immediately and their reply is picked up before the next item.
         """
         self._target_repo = target_repo
+        # Capture the starting commit before anything runs, so the very first round
+        # already has a baseline to reset to rather than trusting HEAD.
+        self._base_commit = await workflow.execute_activity(
+            run_baseline,
+            args=[target_repo],
+            start_to_close_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
         items = await workflow.execute_activity(
             load_work_items,
             args=[run_dir],

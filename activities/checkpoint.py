@@ -41,8 +41,11 @@ async def _already_committed(worktree: str, message: str) -> str | None:
     the old code reported committed:false. The workflow then parked an item whose
     commit was already on the branch, and the merge card lied about what was in it.
     """
-    head_msg = await _git("log", "-1", "--format=%B", cwd=worktree)
-    if head_msg.strip() != message.strip():
+    # Subject line only. Comparing the whole message failed on any repo where git
+    # rewrote it — it strips per-line trailing whitespace, and a commit-msg hook
+    # appends to it — so the guard never matched and the retry bug came back.
+    head_subject = (await _git("log", "-1", "--format=%s", cwd=worktree)).strip()
+    if not head_subject or head_subject != message.strip().splitlines()[0].strip():
         return None
     return (await _git("rev-parse", "HEAD", cwd=worktree)).strip()
 

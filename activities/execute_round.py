@@ -101,12 +101,33 @@ async def _git(*args: str, cwd: str | None = None) -> str:
 
 async def ensure_worktree(target_repo: str, worktree: str, branch: str) -> None:
     if os.path.isdir(worktree):
+        # It has to actually BE a worktree. Returning on isdir alone meant a plain
+        # directory left at that path was treated as one, and the reset that runs
+        # next would `git reset --hard` and `git clean -fd` whatever repository
+        # encloses it — inside the container, the bind-mounted engine repo.
+        if not os.path.exists(os.path.join(worktree, ".git")):
+            raise RuntimeError(
+                f"{worktree} exists but is not a git worktree. Remove it and start "
+                f"the run again; refusing to reset whatever repo contains it.")
         return  # retry of a round that already made its worktree
     branches = await _git("branch", "--list", branch, cwd=target_repo)
     if branch in branches:
         await _git("worktree", "add", worktree, branch, cwd=target_repo)
     else:
         await _git("worktree", "add", "-b", branch, worktree, cwd=target_repo)
+
+
+@activity.defn
+async def run_baseline(target_repo: str) -> str:
+    """The commit a run starts from, captured once before the first round.
+
+    reset_to_checkpoint fell back to HEAD whenever base_commit was None, and the
+    workflow had no base_commit until its first accepted checkpoint. So on a
+    single-item brief — the common case — a Temporal retry adopted the commit the
+    executor had made during the failed attempt as the baseline, which is the
+    exact failure the reset exists to prevent.
+    """
+    return (await _git("rev-parse", "HEAD", cwd=target_repo)).strip()
 
 
 async def reset_to_checkpoint(worktree: str, base_commit: str | None = None) -> None:
