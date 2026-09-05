@@ -378,8 +378,10 @@ def main() -> int:
     g.add_argument("workdir", nargs="?", default="/app")
     g.set_defaults(fn=cmd_gate)
     s = sub.add_parser("status", help="read a run: lg status <workflow-id|run-dir> [ledger]")
-    s.add_argument("workflow_id", metavar="arg")
-    s.add_argument("query", nargs="?", default=None)
+    s.add_argument("workflow_id", metavar="arg",
+                   help="a workflow id, or a run directory like runs/2026-09-05-feature")
+    s.add_argument("query", nargs="?", default=None,
+                   help="one query by name; ledger prints the raw ledger as JSON")
     s.add_argument("--json", action="store_true",
                    help="print the raw query result instead of the summary")
     s.set_defaults(fn=cmd_status)

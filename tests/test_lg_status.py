@@ -402,7 +402,14 @@ def test_an_unanswerable_positional_query_prints_one_line_and_exits_1(lg, monkey
 # ---------- what the help and the docs teach ----------
 
 def help_text(lg, monkeypatch, capsys, *argv) -> str:
-    """What argparse prints for `lg [...] --help`."""
+    """What argparse prints for `lg [...] --help`, at a width this test picks.
+
+    argparse rewraps its output to the terminal, and textwrap breaks on hyphens,
+    so in a 40-column window `<workflow-id|run-dir>` arrives as three pieces on
+    three lines. The width is pinned here because these assertions are about the
+    wording, and a narrow terminal is not a reason for them to go red.
+    """
+    monkeypatch.setenv("COLUMNS", "100")
     monkeypatch.setattr(sys, "argv", ["lg", *argv, "--help"])
     with pytest.raises(SystemExit):
         lg.main()
@@ -410,13 +417,18 @@ def help_text(lg, monkeypatch, capsys, *argv) -> str:
 
 
 def test_the_status_help_offers_a_run_directory(lg, monkeypatch, capsys):
-    """A slug is no use to an owner who has no way of learning it works. The
-    subcommand line names both forms, and the usage line calls the argument
-    `arg`, because `workflow_id` reads as a refusal to take anything else."""
+    """A slug is no use to an owner who has no way of learning it works, and
+    `lg status --help` is where they look. The argument is called `arg` there,
+    because `workflow_id` reads as a refusal to take anything else — so it has
+    to carry a help string naming both forms, and the subcommand line has to
+    name both too. That string cannot come from the subcommand line itself:
+    argparse keeps a subparser's `help=` on the parent and prints it only under
+    `lg --help`."""
     assert "<workflow-id|run-dir>" in help_text(lg, monkeypatch, capsys)
     status = help_text(lg, monkeypatch, capsys, "status")
     assert status.splitlines()[0] == "usage: lg status [-h] [--json] arg [query]"
     assert "workflow_id" not in status
+    assert "a workflow id, or a run directory like runs/2026-09-05-feature" in status
 
 
 @pytest.mark.parametrize("doc", ["README.md", "skills/loopgraph/SKILL.md"])
