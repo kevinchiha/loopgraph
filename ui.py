@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import signal
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -21,6 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from activities.stream import LOG_GLOB, LOG_RE
+from envfile import read_env
 
 ROOT = Path(__file__).resolve().parent
 
@@ -237,9 +241,16 @@ def resolve_repo(worktree: str, runs_dir: Path,
     pointer = runs_dir / worktree[len(CONTAINER_RUNS):] / ".git"
     try:
         text = pointer.read_text(errors="replace")
-    except OSError:
+    except (OSError, ValueError):
         # Gone (discard removes the worktree), unreadable, or a directory: a real
         # clone's .git is one. Either way there is no pointer to follow.
+        #
+        # ValueError as well as OSError, and both halves are load-bearing. A NUL
+        # anywhere in `worktree` makes read_text raise ValueError: embedded null
+        # byte, which is not an OSError, and errors="replace" is what keeps a
+        # pointer file that is not valid UTF-8 from raising UnicodeDecodeError —
+        # also a ValueError, so this catch holds the line if that argument is ever
+        # dropped. Either way the caller gets a line, never a traceback.
         return None, f"no worktree pointer at {pointer}"
     line = next((ln for ln in text.splitlines() if ln.strip().startswith("gitdir:")), "")
     # Everything before /.git/worktrees/ is the repository. A line that names no
@@ -256,9 +267,193 @@ def resolve_repo(worktree: str, runs_dir: Path,
     path = Path(repo)
     try:
         found = path.is_dir()
-    except OSError:
-        found = False
+    except OSError:  # is_dir() swallows ENOENT and a NUL but re-raises
+        found = False  # ENAMETOOLONG, and a pointer file is not a bounded input
     return (path, "") if found else (None, f"repository not found: {path}")
+
+
+DIFF_CAP = 204_800     # bytes of patch kept
+STAT_CAP = 20_480      # bytes of --stat kept
+DIFF_TIMEOUT = 20      # seconds, per git command
+REF_CAP = 4_096        # rev-parse prints one object name; this is room to spare
+ERR_CAP = 4_096        # enough of a failed command's message to name the cause
+
+
+class _GitTimeout(Exception):
+    """A git command outlived DIFF_TIMEOUT and was killed. It gets its own line."""
+
+
+def _git_read_only(repo: Path, argv: list[str], cap: int) -> tuple[int, bytes, bool, str]:
+    """One git command in `repo`, on a deadline, with its output cut at `cap` bytes.
+
+    Returns (exit code, at most `cap` bytes of stdout, whether the cap cut it,
+    stderr).
+
+    The cut is what bounds memory, so it has to happen while the command is still
+    running. Reading a command to completion and slicing afterwards puts the whole
+    diff in the dashboard's heap first, which is the one thing the cap exists to
+    prevent: a round that rewrote a lockfile is tens of megabytes, and the owner
+    may open it on a laptop. So this reads exactly cap + 1 bytes — the extra byte
+    is how it knows there was more — and then kills the command, which by then is
+    blocked writing into a pipe nobody is draining.
+
+    The deadline governs the PROCESS, not the read. activities/gate.py carries the
+    scar from the other way round: a timeout that waited on the drain was silently
+    not enforced, the activity ran past it with no heartbeat, and Temporal killed
+    and retried it, running the executor twice. A hang is not an exception, so
+    without a timer nothing here ever raises and the browser's fetch never fills.
+    Killing the process is also what closes the pipe and lets the read return.
+
+    Killing git alone is not enough, which is gate.py's other half: there,
+    signalling the shell left `npm run build`'s children running past the timeout.
+    git runs a repository's own external-diff and textconv helpers as children
+    that inherit its pipes, so one that backgrounds something holds the
+    dashboard's pipe open after git itself has gone — and a dead process cannot be
+    killed twice. The read below then waits on that helper for as long as it
+    lives. So git gets a session of its own and the deadline kills the whole
+    group: 30 seconds against 1 on a repository configured that way.
+
+    stdin is /dev/null so git can never sit waiting on a terminal that is not
+    there, and stderr is read only when it is going to be used: a command stopped
+    at the cap or at the deadline is being killed and has nothing left to explain.
+    """
+    proc = subprocess.Popen(argv, cwd=repo, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    expired = threading.Event()
+
+    def _stop() -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # already gone, or reaped between the getpgid and the kill
+
+    def _expire() -> None:
+        expired.set()
+        _stop()
+
+    timer = threading.Timer(DIFF_TIMEOUT, _expire)
+    timer.start()
+    try:
+        out = proc.stdout.read(cap + 1)
+        truncated = len(out) > cap
+        err = b"" if truncated or expired.is_set() else proc.stderr.read(ERR_CAP)
+    finally:
+        timer.cancel()
+        _stop()  # a no-op once it has exited; the cut's stop button otherwise
+        proc.stdout.close()
+        proc.stderr.close()
+        proc.wait()
+    if expired.is_set():
+        raise _GitTimeout(" ".join(argv))
+    return proc.returncode, out[:cap], truncated, err.decode(errors="replace")
+
+
+def _checked(repo: Path, argv: list[str], cap: int) -> tuple[bytes, bool]:
+    """A git command whose failure is a fault, not an answer. Raises on one.
+
+    A command stopped at the cap exits non-zero too — this is what killed it — so
+    the exit code only means anything when the output ran to its end.
+    """
+    rc, out, truncated, err = _git_read_only(repo, argv, cap)
+    if rc != 0 and not truncated:
+        raise RuntimeError(err.strip() or f"git exited {rc}")
+    return out, truncated
+
+
+def _reason(line: str) -> dict:
+    """The shape /api/diff always answers in, carrying one line instead of a diff."""
+    return {"stat": line, "patch": "", "truncated": False}
+
+
+def branch_diff(repo: Path, base_branch: str, branch: str) -> dict:
+    """`git diff <base_branch>...<branch>` in `repo`, cut to size and decoded.
+
+    Two commands, --stat then the patch, each on its own deadline and each cut at
+    its own cap. Nothing else runs: no fetch, no checkout, no worktree, no config
+    write, no gc. The owner may be working in this repository at the moment a poll
+    arrives, and a command that took the index lock would block their own git.
+
+    The cut is made on bytes and the decode comes after, exactly as log_slice does
+    it for /api/log. Cutting the decoded text would measure characters, so a diff
+    of files written in Greek or Japanese would arrive at up to four times the
+    stated cap; cutting bytes and then decoding strictly would raise on the
+    character the cut landed inside, turning every large diff into `diff failed`.
+    errors="replace" costs one replacement character at the seam instead, and
+    execute_round documents non-ASCII filenames as ordinary here.
+
+    An empty `stat` means both commands ran and found nothing. That is a result,
+    not a fault, and it is the state of every run the owner approved: merge_branch
+    merges the branch into its base with --no-ff and deletes neither, so the branch
+    becomes an ancestor of the base and A...B holds nothing. Which of the two empty
+    cases it is depends on the ledger's status, which this does not have, so the
+    caller fills that line in.
+    """
+    try:
+        for ref in (base_branch, branch):
+            # A ref is a name here, never an option. `git diff --output=<file>...x`
+            # writes a file, and a leading `-` is all that separates the two;
+            # rev-parse refuses such a value anyway, but a read-only endpoint
+            # should not rest its read-onlyness on git's option table.
+            if not ref or ref.startswith("-"):
+                return _reason(f"branch not found: {ref}")
+            rc, _, _, _ = _git_read_only(repo, ["git", "rev-parse", "--verify", ref], REF_CAP)
+            if rc != 0:
+                return _reason(f"branch not found: {ref}")
+
+        span = f"{base_branch}...{branch}"
+        stat, _ = _checked(repo, ["git", "diff", "--stat", span], STAT_CAP)
+        patch, cut = _checked(repo, ["git", "diff", span], DIFF_CAP)
+    except _GitTimeout:
+        return _reason(f"git took longer than {DIFF_TIMEOUT}s; nothing to show")
+    return {"stat": stat.decode(errors="replace"),
+            "patch": patch.decode(errors="replace"), "truncated": cut}
+
+
+def diff_payload(wf_id: str, feed, runs_dir: Path) -> dict:
+    """The whole body of /api/diff: one run's branch diff, or a line saying why not.
+
+    Every failure below is a run the owner can still look at — a worktree `discard`
+    removed, a repository since moved, a branch they deleted by hand after merging
+    — so each answers 200 with its own line in `stat`, rather than a 500 the page
+    would render as a blank pane and a console error.
+
+    `worktree`, `branch` and `base_branch` are read off the LAST round of the
+    ledger and never off the request. Every round of a run shares one branch and
+    one worktree (execute_round derives both from the run token), so this is one
+    diff per run and not one per round; and a branch name that arrived in a URL and
+    reached a git command would be an injection. The request supplies an id.
+
+    .env is read per request rather than at import, so a machine that installs
+    loopgraph while `lg ui` is already running starts resolving repositories
+    without a restart.
+    """
+    try:
+        ledger = feed.ledger(wf_id) if feed else None
+        if not ledger:
+            return _reason("no ledger for this workflow")
+        rounds = ledger.get("rounds") or []
+        if not rounds:
+            return _reason("no rounds yet")
+        last = rounds[-1]
+        repo, why = resolve_repo(last.get("worktree", ""), runs_dir,
+                                 read_env(ROOT / ".env").get("LOOPGRAPH_PROJECTS_DIR"))
+        if repo is None:
+            return _reason(why)
+
+        base_branch = last.get("base_branch", "")
+        out = branch_diff(repo, base_branch, last.get("branch", ""))
+        if not out["stat"]:
+            # Both commands ran and found nothing. The ledger the handler already
+            # holds tells the two empty diffs apart; merge-base, log and status are
+            # all forbidden here and none of them is needed.
+            out["stat"] = (f"already merged into {base_branch}; the branch adds nothing to it"
+                           if ledger.get("status") == "merged"
+                           else "no changes on this branch yet")
+        return out
+    except Exception as e:
+        first = next((ln for ln in str(e).splitlines() if ln.strip()), type(e).__name__)
+        return _reason(f"diff failed: {first.strip()}")
 
 
 async def _still_running(handle) -> bool:
@@ -452,6 +647,13 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                 # `temporal` says the feed is connected, nothing about the id.
                 self._json({"ledger": feed.ledger(wf_id) if feed else None,
                             "temporal": bool(feed and feed.connected)})
+            elif u.path == "/api/diff":
+                wf_id = parse_qs(u.query).get("id", [""])[0]
+                if bad_param(wf_id):
+                    return self._json({"error": "id must be a workflow id"}, 400)
+                # Nothing else in the query is read, on purpose: the branches come
+                # from the ledger, so a branch name in a URL reaches no git command.
+                self._json(diff_payload(wf_id, feed, runs_dir))
             else:
                 self.send_error(404)
 

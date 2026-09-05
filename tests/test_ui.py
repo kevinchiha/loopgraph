@@ -1,9 +1,12 @@
 import asyncio
 import inspect
 import json
+import os
 import re
+import subprocess
 import threading
 import time
+import tracemalloc
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -39,8 +42,8 @@ def logs(tmp_path):
     return tmp_path / "2026-01-01-demo" / "logs"
 
 
-def get(url):
-    return urllib.request.urlopen(url, timeout=5)
+def get(url, timeout=5):
+    return urllib.request.urlopen(url, timeout=timeout)
 
 
 def getjson(url):
@@ -337,6 +340,7 @@ class StubHandle:
     def __init__(self, query, result, status=WorkflowExecutionStatus.COMPLETED):
         self._query, self._result, self._status = query, result, status
         self.result_awaited = False
+        self.queried = []
 
     @staticmethod
     async def _answer(canned):
@@ -347,6 +351,10 @@ class StubHandle:
         return canned
 
     async def query(self, name):
+        # Recorded, not asserted here: _ledger swallows every exception the query
+        # raises, so an assert in this coroutine would be eaten and the feed would
+        # quietly fall through to result(). The caller asserts on the record.
+        self.queried.append(name)
         return await self._answer(self._query)
 
     async def result(self):
@@ -383,8 +391,9 @@ def test_the_feed_falls_back_from_query_to_result(monkeypatch):
     workflows on this machine 8 answer query("ledger") and 7 raise [TMPRL1100]
     Nondeterminism, because a query replays the whole history against the workflow
     code registered now. Their ledger is the value the workflow returned."""
+    queryable = StubHandle(LEDGER, RuntimeError("result() must not be reached"))
     feed = stub_feed(monkeypatch, {
-        "wf-queryable": StubHandle(LEDGER, RuntimeError("result() must not be reached")),
+        "wf-queryable": queryable,
         "wf-replay-diverged": StubHandle(RuntimeError("[TMPRL1100] Nondeterminism error"), LEDGER),
         "wf-neither": StubHandle(RuntimeError("query failed"), RuntimeError("result failed")),
     })
@@ -392,6 +401,10 @@ def test_the_feed_falls_back_from_query_to_result(monkeypatch):
     assert feed.ledger("wf-replay-diverged") == LEDGER
     assert feed.ledger("wf-neither") is None
     assert feed.ledger("wf-never-existed") is None
+    # The name is the whole of the query. A stub that ignores it lets `ledger`
+    # become `status` with the suite still green, while every queryable run on the
+    # live dashboard loses its ledger and falls back to a result that never comes.
+    assert queryable.queried == ["ledger"]
 
 
 @pytest.mark.parametrize("status", [WorkflowExecutionStatus.RUNNING, None],
@@ -526,3 +539,305 @@ def test_each_resolve_failure_returns_its_line(wt, tmp_path, case):
         want = f"repository not found: {tmp_path / 'elsewhere' / 'proj'}"
 
     assert ui.resolve_repo(worktree, wt.runs_dir, projects) == (None, want)
+
+
+def test_a_gitdir_line_naming_no_repository_is_refused(wt):
+    """Path("") is PosixPath("."), and "." is a directory on every machine. Without
+    the emptiness guard resolve_repo hands back the dashboard's own working
+    directory as "the repository", and /api/diff runs git in the loopgraph
+    checkout instead of the owner's."""
+    wt.pointer.write_text("gitdir:\n")
+    assert ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects) == (
+        None, "pointer file has no gitdir line")
+
+    # The other half of the same guard: a value that names a repository but no
+    # worktree under it still resolves to that repository, never to ".".
+    wt.pointer.write_text("gitdir: /projects/proj\n")
+    path, err = ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects)
+    assert (path, err) == (wt.repo, "")
+    assert path != Path("."), "the server's own directory is not a run's repository"
+
+
+def test_a_pointer_that_is_not_utf8_still_answers(wt):
+    """A pointer file is bytes on disk, and nothing guarantees they decode. Without
+    errors="replace" this raises UnicodeDecodeError, which is not an OSError, so it
+    goes straight past the handler and `lg ui` prints a traceback."""
+    wt.pointer.write_bytes(b"gitdir: /projects/proj/.git/worktrees/\xff\xfe\n")
+    assert ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects) == (wt.repo, "")
+
+
+def test_a_worktree_holding_a_nul_byte_answers_instead_of_raising(wt):
+    """read_text on a path with a NUL raises ValueError, not OSError: the one input
+    shape that escaped the reason line and reached the socket as a traceback."""
+    worktree = "/app/runs/x\x00y/worktrees/ab12cd"
+    path, err = ui.resolve_repo(worktree, wt.runs_dir, wt.projects)
+    assert path is None
+    assert err.startswith("no worktree pointer at ")
+
+
+def test_a_repository_path_too_long_for_the_filesystem_answers(wt):
+    """Path.is_dir() swallows ENOENT and a NUL, but NOT ENAMETOOLONG — it re-raises
+    that one. A pointer file is not a bounded input, so the guard around it is live
+    code, not decoration."""
+    wt.pointer.write_text(f"gitdir: /projects/{'p' * 5000}/.git/worktrees/ab12cd\n")
+    path, err = ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects)
+    assert path is None
+    assert err.startswith("repository not found: ")
+
+
+# ---------- the diff of a run's branch ----------
+
+DIFF_ID = "run-x-ab12cd"
+BASE = "main"
+BRANCH = "lg-x-ab12cd"
+WORKTREE = "/app/runs/x/worktrees/ab12cd"  # the container path the `wt` fixture holds
+
+# The caller's git, with none of the caller's configuration: a global hook, an
+# init template or a default branch name would otherwise decide what these assert.
+GIT_ENV = {**os.environ,
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+           "GIT_AUTHOR_NAME": "lg", "GIT_AUTHOR_EMAIL": "lg@example.invalid",
+           "GIT_COMMITTER_NAME": "lg", "GIT_COMMITTER_EMAIL": "lg@example.invalid"}
+
+
+def git(repo, *args) -> str:
+    done = subprocess.run(["git", *args], cwd=repo, env=GIT_ENV, check=True,
+                          capture_output=True, text=True)
+    return done.stdout
+
+
+def commit(repo, name, text, message):
+    (repo / name).write_text(text, encoding="utf-8")
+    git(repo, "add", "--", name)
+    git(repo, "commit", "-qm", message)
+
+
+def ledger_for(status="merge-ready", **last_round):
+    """A ledger shaped like the engine's.
+
+    Two rounds, because the handler must read the LAST one: a run's worktree and
+    branches are recorded per round, and round 1 of a real ledger predates them.
+    """
+    last = {"worktree": WORKTREE, "branch": BRANCH, "base_branch": BASE, "verdict": "PASS"}
+    last.update(last_round)
+    return {"status": status, "rounds": [{"verdict": "REDO"}, last]}
+
+
+@pytest.fixture
+def diffing(tmp_path, monkeypatch, wt):
+    """Everything /api/diff needs, wired the way a request wires it.
+
+    A real repository at the far end of `wt`'s pointer file, a .env naming the
+    projects tree, and a feed holding one run's ledger — so the pointer, the
+    prefix swap and the two git commands are exercised together rather than
+    separately mocked.
+    """
+    assert wt.worktree == WORKTREE, "the ledger and the pointer fixture must agree"
+    git(wt.repo, "init", "-q", "-b", BASE)
+    commit(wt.repo, "README.md", "base\n", "base")
+    git(wt.repo, "checkout", "-q", "-b", BRANCH)
+    commit(wt.repo, "feature.txt", "hello from the branch\n", "add the feature")
+    git(wt.repo, "checkout", "-q", BASE)
+
+    (tmp_path / ".env").write_text(f"LOOPGRAPH_PROJECTS_DIR={wt.projects}\n")
+    monkeypatch.setattr(ui, "ROOT", tmp_path)
+
+    feed = FakeFeed(ledgers={DIFF_ID: ledger_for()})
+    srv = ui.make_server(0, wt.runs_dir, temporal_addr=None, feed=feed)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield SimpleNamespace(url=f"http://127.0.0.1:{srv.server_address[1]}",
+                          repo=wt.repo, feed=feed, wt=wt, env=tmp_path / ".env")
+    srv.shutdown()
+
+
+def test_diff_names_the_changed_file_and_carries_the_patch(diffing):
+    d = getjson(f"{diffing.url}/api/diff?id={DIFF_ID}")
+    assert "feature.txt" in d["stat"]
+    assert "+hello from the branch" in d["patch"]
+    assert d["truncated"] is False
+
+
+def test_diff_without_temporal_is_200_with_a_reason(server):
+    r = get(f"{server}/api/diff?id={KNOWN}")
+    assert r.status == 200
+    assert json.loads(r.read()) == {"stat": "no ledger for this workflow",
+                                    "patch": "", "truncated": False}
+
+
+@pytest.mark.parametrize("case", ["no rounds", "host path", "discarded worktree",
+                                  "no gitdir line", "projects dir unset",
+                                  "repository gone", "branch gone", "base gone"])
+def test_each_failure_is_a_200_with_its_line(diffing, tmp_path, case):
+    """None of these is a 500 and none of them is a traceback. Each is a run the
+    owner can still open, with one line in `stat` saying why there is no diff."""
+    wt, ledger = diffing.wt, ledger_for()
+    if case == "no rounds":
+        ledger["rounds"] = []
+        want = "no rounds yet"
+    elif case == "host path":  # the ledger records the container path, not this one
+        ledger["rounds"][-1]["worktree"] = str(wt.pointer.parent)
+        want = f"worktree is not a container path: {wt.pointer.parent}"
+    elif case == "discarded worktree":  # `lg discard` removed it, pointer and all
+        ledger["rounds"][-1]["worktree"] = "/app/runs/x/worktrees/gone"
+        want = f"no worktree pointer at {wt.runs_dir / 'x' / 'worktrees' / 'gone' / '.git'}"
+    elif case == "no gitdir line":
+        wt.pointer.write_text("ref: refs/heads/main\n")
+        want = "pointer file has no gitdir line"
+    elif case == "projects dir unset":  # no .env on this machine yet
+        diffing.env.unlink()
+        want = "LOOPGRAPH_PROJECTS_DIR is not set; run ./install.sh"
+    elif case == "repository gone":  # the repository moved after the run
+        diffing.env.write_text(f"LOOPGRAPH_PROJECTS_DIR={tmp_path / 'elsewhere'}\n")
+        want = f"repository not found: {tmp_path / 'elsewhere' / 'proj'}"
+    elif case == "branch gone":  # the owner deleted it after merging by hand
+        ledger["rounds"][-1]["branch"] = "lg-x-deleted"
+        want = "branch not found: lg-x-deleted"
+    else:
+        ledger["rounds"][-1]["base_branch"] = "trunk"
+        want = "branch not found: trunk"
+    diffing.feed.ledgers[DIFF_ID] = ledger
+
+    r = get(f"{diffing.url}/api/diff?id={DIFF_ID}")
+    assert r.status == 200
+    assert json.loads(r.read()) == {"stat": want, "patch": "", "truncated": False}
+
+
+def test_a_large_patch_is_cut_at_the_cap(diffing):
+    """300 KB of a three-byte character, so bytes and characters are far apart.
+    Cutting characters lets three times the cap through; cutting bytes and then
+    decoding strictly raises on the character the cut lands inside, which would
+    turn every large diff into `diff failed`."""
+    git(diffing.repo, "checkout", "-q", BRANCH)
+    commit(diffing.repo, "big.txt", "€" * 100_000 + "\n", "a large non-ascii file")
+    git(diffing.repo, "checkout", "-q", BASE)
+
+    d = getjson(f"{diffing.url}/api/diff?id={DIFF_ID}")
+    assert d["truncated"] is True
+    # errors="replace" turns the one or two bytes of a character the cut landed
+    # inside into a single U+FFFD, which re-encodes to three, so the decoded patch
+    # can measure two bytes over the cut. Two, not two hundred thousand.
+    assert len(d["patch"].encode()) <= ui.DIFF_CAP + 2
+    assert ui.DIFF_CAP == 204_800 and ui.STAT_CAP == 20_480
+
+
+def test_the_cap_bounds_what_is_read_not_only_what_is_returned(diffing):
+    """The cap exists to keep a huge diff out of the dashboard's memory. Applied
+    after git has run to completion it does nothing about that: the 16 MB is
+    already in the process by the time the slice happens."""
+    git(diffing.repo, "checkout", "-q", BRANCH)
+    commit(diffing.repo, "huge.txt", ("x" * 79 + "\n") * 200_000, "16 MB of diff")
+    git(diffing.repo, "checkout", "-q", BASE)
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        d = getjson(f"{diffing.url}/api/diff?id={DIFF_ID}")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert d["truncated"] is True
+    assert peak < 4_000_000, f"the whole diff was read before it was cut ({peak} bytes)"
+
+
+def test_a_git_command_past_its_deadline_answers_instead_of_hanging(diffing, tmp_path,
+                                                                    monkeypatch):
+    """gate.py carries the scar: a deadline that governed the drain instead of the
+    process was silently not enforced. A hang is not an exception, so nothing else
+    catches it and the browser's fetch never fills."""
+    assert ui.DIFF_TIMEOUT == 20, "the line the owner reads says 20s"
+    slow = tmp_path / "slow-textconv"
+    slow.write_text("#!/bin/sh\nsleep 5\n")
+    slow.chmod(0o755)
+    git(diffing.repo, "config", "diff.slow.textconv", str(slow))
+    (diffing.repo / ".gitattributes").write_text("feature.txt diff=slow\n")
+    monkeypatch.setattr(ui, "DIFF_TIMEOUT", 1)
+
+    t0 = time.monotonic()
+    d = getjson(f"{diffing.url}/api/diff?id={DIFF_ID}")
+    assert time.monotonic() - t0 < 4, "the deadline did not govern git itself"
+    assert d == {"stat": "git took longer than 1s; nothing to show",
+                 "patch": "", "truncated": False}
+
+
+def test_a_helper_git_left_behind_cannot_pin_the_request(diffing, tmp_path, monkeypatch):
+    """A deadline that kills git alone is no deadline at all once git has exited.
+
+    git runs a repository's own external-diff driver with git's own stdout, so a
+    driver that leaves a child running holds the dashboard's pipe open long after
+    git is gone, and killing a process that has already exited does nothing —
+    gate.py's scar, where killing the shell left `npm run build`'s children alive
+    past the timeout. Killing the whole process group is what ends it: 30 seconds
+    against 1 on this repository."""
+    driver = tmp_path / "external-diff"
+    driver.write_text("#!/bin/sh\nsleep 30 &\necho 'external diff output'\n")
+    driver.chmod(0o755)
+    git(diffing.repo, "config", "diff.stray.command", str(driver))
+    (diffing.repo / ".gitattributes").write_text("feature.txt diff=stray\n")
+    monkeypatch.setattr(ui, "DIFF_TIMEOUT", 1)
+
+    t0 = time.monotonic()
+    d = json.loads(get(f"{diffing.url}/api/diff?id={DIFF_ID}", timeout=45).read())
+    assert time.monotonic() - t0 < 10, "a child git left behind pinned the request thread"
+    assert d["patch"] == "" and d["truncated"] is False
+
+
+def test_a_merged_branch_says_it_is_merged(diffing):
+    """merge_branch merges the run's branch into its base with --no-ff and deletes
+    neither, so the branch becomes an ancestor of the base and the three-dot diff
+    holds nothing. That is every run the owner approved, and it is the state they
+    come back to look at, so an empty pane there would be the common case."""
+    git(diffing.repo, "merge", "-q", "--no-ff", "-m", "merge the run", BRANCH)
+    diffing.feed.ledgers[DIFF_ID] = ledger_for(status="merged")
+
+    r = get(f"{diffing.url}/api/diff?id={DIFF_ID}")
+    assert r.status == 200
+    assert json.loads(r.read()) == {
+        "stat": "already merged into main; the branch adds nothing to it",
+        "patch": "", "truncated": False}
+
+
+def test_a_branch_with_no_commits_says_so(diffing):
+    """The same empty diff, from the other end: a run whose branch is still where
+    it started. The ledger's status is what tells the two apart, never a third
+    git command."""
+    git(diffing.repo, "branch", "-f", BRANCH, BASE)
+    diffing.feed.ledgers[DIFF_ID] = ledger_for(status="running")
+
+    assert getjson(f"{diffing.url}/api/diff?id={DIFF_ID}") == {
+        "stat": "no changes on this branch yet", "patch": "", "truncated": False}
+
+
+def test_extra_request_parameters_are_ignored(diffing):
+    """The request supplies a workflow id and nothing else. A branch name that
+    arrives in a URL and reaches a git command is an injection."""
+    plain = get(f"{diffing.url}/api/diff?id={DIFF_ID}").read()
+    spiked = get(f"{diffing.url}/api/diff?id={DIFF_ID}&branch=main&base=x").read()
+    assert spiked == plain
+
+
+def test_the_diff_leaves_the_repository_alone(diffing):
+    """The owner may be working in this repository while the dashboard polls it.
+    Only the refs are asserted: an unrelated git call refreshes the index, which
+    would make a working-tree assertion flaky rather than true."""
+    def refs():
+        return git(diffing.repo, "symbolic-ref", "HEAD"), git(diffing.repo, "show-ref")
+
+    before = refs()
+    getjson(f"{diffing.url}/api/diff?id={DIFF_ID}")
+    assert refs() == before
+
+
+@pytest.mark.parametrize("bad", ["", "a/b", ".."])
+def test_diff_rejects_bad_ids(server, bad):
+    assert status_of(f"{server}/api/diff?{urlencode({'id': bad})}") == 400
+
+
+def test_the_dashboard_has_no_write_methods():
+    """AC-38, read off the source: one handler method, and every git invocation
+    naming its subcommand right next to the program, so this can see them all."""
+    src = Path(ui.__file__).read_text()
+    assert re.findall(r"def (do_\w+)\(", src) == ["do_GET"]
+    subcommands = re.findall(r'"git",\s*"([a-z][a-z-]*)"', src)
+    assert set(subcommands) == {"rev-parse", "diff"}
+    assert src.count('"git"') == len(subcommands), \
+        "a git invocation whose subcommand is not a literal beside it"
