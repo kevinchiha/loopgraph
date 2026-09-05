@@ -273,10 +273,19 @@ class LoopGraphRun:
         self._decisions.append(str(value))
 
     def _peek(self, allowed: set[str] | None) -> int | None:
-        """Index of the first queued answer this card will accept, or None."""
+        """Index of the first queued answer this card will accept, or None.
+
+        A letters-only card takes a letter and nothing else. Matching on the first
+        character would turn "Abort, do not merge" into A and merge the branch,
+        which is the opposite of what the owner typed.
+        """
         for i, raw in enumerate(self._decisions):
             v = raw.strip()
-            if v and (allowed is None or v[:1].upper() in allowed):
+            if not v:
+                continue
+            if allowed is None:
+                return i
+            if len(v) == 1 and v.upper() in allowed:
                 return i
         return None
 
@@ -292,6 +301,12 @@ class LoopGraphRun:
         """
         wf_id = workflow.info().workflow_id
         allowed = None if accept_text else set(options)
+        # Only an answer sent AFTER this card counts. Anything already queued was
+        # meant for an earlier card, or was sent before the owner could have seen
+        # this one, and must never decide it.
+        if self._decisions:
+            self._ledger.setdefault("ignored_answers", []).extend(self._decisions)
+            self._decisions = []
         telegram = await workflow.execute_activity(
             telegram_configured,
             start_to_close_timeout=timedelta(seconds=30),
@@ -322,14 +337,16 @@ class LoopGraphRun:
                 retry_policy=RetryPolicy(maximum_attempts=100),  # durable indefinite wait
             ))
             tasks.append(poll)
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # workflow.wait, not asyncio.wait: the Temporal sandbox flags the asyncio one
+        # as non-deterministic, and this is the code path that decides a merge.
+        done, pending = await workflow.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
             t.add_done_callback(_swallow)
         self._ledger.pop("awaiting", None)
         if sig in done:
             value = self._decisions.pop(self._peek(allowed)).strip()
-            return value[:1].upper() if allowed else value
+            return value.upper() if allowed else value
         return poll.result()["value"]
 
     async def _ask_owner(self, run_dir: str, question: str, options: dict) -> str:

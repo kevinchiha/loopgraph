@@ -136,9 +136,15 @@ right contracts; the engine just enforces what Markdown could only request.
 **Gates are code, never model:**
 ```yaml
 # gates.yaml — write the condition FIRST, so a program can fail it
-- name: tests        cmd: "pytest -x -q"                    green_when: exit 0
-- name: lint         cmd: "ruff check ."                    green_when: exit 0
-- name: scope        cmd: "./scripts/check-write-set.sh"    green_when: exit 0
+- name: tests
+  cmd: "pytest -x -q"
+  timeout: 600
+- name: lint
+  cmd: "ruff check ."
+  timeout: 300
+- name: scope
+  cmd: "./scripts/check-write-set.sh"
+  timeout: 60
 ```
 The scope gate enforces the post's `SCOPE fix this file only` line mechanically.
 

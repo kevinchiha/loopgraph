@@ -100,13 +100,26 @@ def test_signal_queues_answers_and_letters_are_matched_case_insensitively():
     assert wf._peek({"A", "B", "C"}) == 0
 
 
-def test_merge_card_ignores_an_answer_that_is_not_one_of_its_letters():
-    """A stray `lg approve <id> yes` must never be read as 'merge it'."""
+@pytest.mark.parametrize("stray", [
+    "Abort, do not merge, I want to read the diff first",  # starts with A
+    "B was wrong, actually hold off",                      # starts with B
+    "cancel this please",                                  # starts with C
+    "yes please",
+])
+def test_a_merge_card_ignores_free_text_however_it_starts(stray):
+    """The bug this pins: _peek matched on the FIRST CHARACTER, so "Abort, do not
+    merge" was read as A and the branch was merged. The old test missed it by
+    picking a stray answer that happened to start with Y."""
     wf = _run()
-    wf.decide("yes please")
-    assert wf._peek({"A", "B", "C"}) is None
-    wf.decide("B")
-    assert wf._peek({"A", "B", "C"}) == 1, "the valid answer is found past the invalid one"
+    wf.decide(stray)
+    assert wf._peek({"A", "B", "C"}) is None, f"{stray!r} was accepted as a merge letter"
+
+
+def test_a_merge_card_still_takes_a_bare_letter():
+    wf = _run()
+    wf.decide("Abort, do not merge")
+    wf.decide("b")
+    assert wf._peek({"A", "B", "C"}) == 1, "the valid letter is found past the invalid text"
 
 
 def test_question_card_takes_free_text():

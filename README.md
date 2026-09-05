@@ -182,9 +182,15 @@ executor context to move one line.
 **`gates.yaml`** — the real check commands for that project.
 
 ```yaml
-- name: tests  cmd: "pytest -x -q"                        timeout: 600
-- name: build  cmd: "npm run build"                       timeout: 1800
-- name: scope  cmd: "/app/runs/my-run/check-write-set.sh" timeout: 60
+- name: tests
+  cmd: "pytest -x -q"
+  timeout: 600
+- name: build
+  cmd: "npm run build"
+  timeout: 1800
+- name: scope
+  cmd: "/app/runs/my-run/check-write-set.sh"
+  timeout: 60
 ```
 
 Paths here resolve **inside the container**: the run dir is `/app/runs/<slug>` and
@@ -264,8 +270,13 @@ never use it: it is the shortest description of how to drive this thing properly
 - One run at a time per target repo. Concurrent worktree branches collide.
 - Target repos must live under the one directory tree you mount. Nothing outside
   it is reachable, by design.
-- The executor runs with permissions bypassed inside the container. It is confined
-  to a git worktree and to your projects tree, but read a brief before you start it.
+- The executor runs with permissions bypassed inside the container. Its file writes
+  are confined to a git worktree, but the worker uses host networking, so its shell
+  can reach anything listening on your machine's loopback: Temporal, a local
+  database, a dev server, whatever else you have running. Temporal is bound to
+  loopback so nothing on your network can reach it, but the executor is not "on
+  your network", it is on your machine. Read a brief before you start it, and do
+  not run this on a box where loopback is a trust boundary.
 - Three rounds, then it escalates. It does not grind forever, and it does not
   quietly give up either.
 - Linux and Docker only.

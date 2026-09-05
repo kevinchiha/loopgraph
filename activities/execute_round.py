@@ -22,7 +22,7 @@ from pathlib import Path
 from temporalio import activity
 
 from activities.gate import _run_one, load_gates
-from activities.stream import stream_query
+from activities.stream import log_name, stream_query
 from graphs.round_graph import run_round
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
@@ -93,6 +93,19 @@ async def ensure_worktree(target_repo: str, worktree: str, branch: str) -> None:
         await _git("worktree", "add", "-b", branch, worktree, cwd=target_repo)
 
 
+async def reset_to_checkpoint(worktree: str) -> None:
+    """Start a round from the last checkpoint, dropping anything uncommitted.
+
+    Rounds restart at 1 for each work item, so resetting only on a redo left a
+    PARKED item's gate-red changes lying in the shared worktree, where the next
+    item swept them into its write set, its audit diff and its commit. Committed
+    checkpoints are untouched, and `clean -fd` leaves ignored files alone, so a
+    node_modules or a venv survives.
+    """
+    await _git("reset", "-q", "--hard", "HEAD", cwd=worktree)
+    await _git("clean", "-qfd", cwd=worktree)
+
+
 async def undo_self_commit(worktree: str, start_head: str) -> bool:
     """Put an executor's own commit back into the working tree.
 
@@ -148,11 +161,9 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
     branch = f"lg-{run.name}"
     base_branch = (await _git("branch", "--show-current", cwd=target_repo)).strip()
     await ensure_worktree(target_repo, worktree, branch)
-    if round_no > 1:  # a redo: drop the rejected attempt, keep every checkpoint
-        await _git("reset", "-q", "--hard", "HEAD", cwd=worktree)
-        await _git("clean", "-qfd", cwd=worktree)
+    await reset_to_checkpoint(worktree)
     (run / "logs").mkdir(parents=True, exist_ok=True)
-    log_path = str(run / "logs" / f"i{item_no}-r{round_no}-executor.log")
+    log_path = str(run / "logs" / log_name(item_no, round_no, "executor"))
 
     gates = load_gates(str(run / "gates.yaml"))
 

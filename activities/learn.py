@@ -51,7 +51,14 @@ async def distil_constraint(brief: str, claims: list[str], reasons: list[str]) -
     )
     chunks: list[str] = []
     async for msg in query(prompt=prompt, options=ClaudeAgentOptions(
-        permission_mode="bypassPermissions", allowed_tools=[], max_turns=1,
+        permission_mode="bypassPermissions",
+        # Same trap as the auditor: an empty allowed_tools grants no auto-approval
+        # but removes nothing, and bypassPermissions approves everything anyway.
+        # This step only distils a sentence; it needs no tools at all.
+        tools=[], allowed_tools=[],
+        disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
+                          "BashOutput", "KillShell", "Task", "WebFetch", "WebSearch"],
+        max_turns=1,
     )):
         activity.heartbeat("distil streaming")
         if isinstance(msg, AssistantMessage):

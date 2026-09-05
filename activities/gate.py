@@ -2,7 +2,9 @@
 
 gates.yaml format (SPEC.md §5):
 
-    - name: tests   cmd: "pytest -x -q"   green_when: "exit 0"   timeout: 600
+    - name: tests
+  cmd: "pytest -x -q"
+  timeout: 600
 
 `green_when` supports only `exit N` (default: `exit 0`). A gate is a command a
 program can fail — anything richer belongs in a script the gate calls.

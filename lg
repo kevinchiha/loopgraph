@@ -128,7 +128,10 @@ async def cmd_tail(args: argparse.Namespace) -> int:
     """Follow the live stream logs of a run (executor + supervisor, as they work)."""
     import os
     from pathlib import Path
-    logs = sorted(Path(args.run_dir, "logs").glob("r*-*.log"))
+    from activities.stream import LOG_GLOB
+    # Names carry the item and round (i2-r1-audit.log). A glob pinned to the old
+    # r<N>- shape matched nothing at all, so this command found no logs, ever.
+    logs = sorted(Path(args.run_dir, "logs").glob(LOG_GLOB))
     if not logs:
         print(f"no logs yet under {args.run_dir}/logs", file=sys.stderr)
         return 1

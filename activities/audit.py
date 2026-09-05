@@ -15,7 +15,7 @@ from pathlib import Path
 from temporalio import activity
 
 from activities.execute_round import _git, parse_final_json
-from activities.stream import stream_query
+from activities.stream import log_name, stream_query
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -73,9 +73,37 @@ async def run_supervisor(prompt: str, worktree: str, log_path: str) -> dict:
     text = await stream_query(prompt, ClaudeAgentOptions(
         cwd=worktree,
         permission_mode="bypassPermissions",
-        allowed_tools=["Read", "Glob", "Grep"],  # read-only by construction
+        # allowed_tools only says what is auto-approved, NOT what exists: on its
+        # own it left the auditor holding Write, Edit and Bash, auto-approved. It
+        # could edit the code it was judging, or push. `tools` sets the base set
+        # and `disallowed_tools` denies the rest, and a deny beats bypass.
+        tools=["Read", "Glob", "Grep"],
+        allowed_tools=["Read", "Glob", "Grep"],
+        disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
+                          "BashOutput", "KillShell", "Task", "WebFetch", "WebSearch"],
     ), log_path)
     return parse_verdict(text)
+
+
+async def diff_including_new_files(worktree: str) -> str:
+    """The diff the auditor judges, including files the executor created.
+
+    In a worktree `git diff HEAD` reports tracked changes only, so a brief that
+    says "add parsers/csv.py" produced an EMPTY diff: the auditor either rejected
+    work it was never shown, or accepted it sight unseen, while the checkpoint
+    committed the file anyway. Marking untracked files intent-to-add puts them in
+    the diff; the reset afterwards leaves the index exactly as it was found, so the
+    scope gate and the checkpoint see what they expect.
+    """
+    untracked = [f for f in (await _git(
+        "ls-files", "--others", "--exclude-standard", cwd=worktree)).split("\n") if f.strip()]
+    if not untracked:
+        return await _git("diff", "HEAD", cwd=worktree)
+    await _git("add", "--intent-to-add", "--", *untracked, cwd=worktree)
+    try:
+        return await _git("diff", "HEAD", cwd=worktree)
+    finally:
+        await _git("reset", "-q", "--", *untracked, cwd=worktree)
 
 
 @activity.defn
@@ -85,8 +113,8 @@ async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: in
     brief = (run / "brief.md").read_text()
     constraints = (run / "constraints.md").read_text() if (run / "constraints.md").exists() else ""
     worktree = round_result["worktree"]
-    diff = (await _git("diff", "HEAD", cwd=worktree))[:DIFF_CAP]
+    diff = (await diff_including_new_files(worktree))[:DIFF_CAP]
     prompt = assemble_audit_prompt(brief, constraints, round_result, diff)
-    verdict = await run_supervisor(prompt, worktree, str(run / "logs" / f"i{item_no}-r{round_no}-audit.log"))
+    verdict = await run_supervisor(prompt, worktree, str(run / "logs" / log_name(item_no, round_no, "audit")))
     verdict["diff_chars"] = len(diff)
     return verdict

@@ -18,7 +18,10 @@ services:
       POSTGRES_PWD: temporal
       POSTGRES_SEEDS: postgresql
     ports:
-      - "7233:7233"
+      # Loopback only. The frontend has no auth and no TLS, and a merge approval
+      # is just a Temporal signal, so publishing this on 0.0.0.0 let anyone on the
+      # same wifi approve a merge or start a workflow that runs code as the worker.
+      - "127.0.0.1:7233:7233"
     networks: [temporal-net]
 
   temporal-ui:
@@ -27,7 +30,7 @@ services:
     environment:
       TEMPORAL_ADDRESS: temporal:7233
     ports:
-      - "8233:8080"
+      - "127.0.0.1:8233:8080"
     networks: [temporal-net]
 
   worker:

@@ -147,12 +147,18 @@ async def wait_decision(wf_id: str, accept_text: bool = True) -> dict:
     before this wait began) are never answers to this card."""
     token, chat = _creds()
     offset = 0
+    # Skip the backlog on the FIRST attempt only. A retry means the worker
+    # restarted or Telegram hiccuped, and the owner may well have answered during
+    # the gap. Re-skipping to the queue head on every attempt threw that answer
+    # away and left the run waiting for a reply it had already been given.
+    first_try = activity.info().attempt == 1 if activity.in_activity() else True
     async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(f"{API}/bot{token}/getUpdates", json={"timeout": 0, "offset": -1})
-        if r.status_code < 300:
-            backlog = r.json().get("result", [])
-            if backlog:
-                offset = backlog[-1]["update_id"] + 1
+        if first_try:
+            r = await client.post(f"{API}/bot{token}/getUpdates", json={"timeout": 0, "offset": -1})
+            if r.status_code < 300:
+                backlog = r.json().get("result", [])
+                if backlog:
+                    offset = backlog[-1]["update_id"] + 1
         while True:
             r = await client.post(f"{API}/bot{token}/getUpdates",
                                   json={"timeout": 25, "offset": offset})
@@ -169,4 +175,11 @@ async def wait_decision(wf_id: str, accept_text: bool = True) -> dict:
                 if cb_id:
                     await client.post(f"{API}/bot{token}/answerCallbackQuery",
                                       json={"callback_query_id": cb_id, "text": f"{value} recorded"})
+                # Confirm the answer before returning. Telegram only drops an
+                # update once a getUpdates asks past it, so without this the tap
+                # that decided this card stayed pending and the next poll_reply
+                # read it again and fed it to the executor as a fresh instruction
+                # the owner never sent.
+                await client.post(f"{API}/bot{token}/getUpdates",
+                                  json={"timeout": 0, "offset": offset})
                 return {"kind": kind, "value": value}

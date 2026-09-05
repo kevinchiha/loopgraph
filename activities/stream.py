@@ -1,7 +1,7 @@
 """Shared Claude streaming: collect the final text AND append a readable live log.
 
-Every executor/supervisor call writes runs/<slug>/logs/r<N>-<role>.log as it
-streams, so `lg tail runs/<slug>` shows what the nodes are doing right now —
+Every executor/supervisor call writes runs/<slug>/logs/i<item>-r<round>-<role>.log
+as it streams, so `lg tail runs/<slug>` shows what the nodes are doing right now —
 the thing watching Claude Code gave for free. Logs are bounded: head-truncated
 past LOG_CAP, per the SPEC's bounded-durable-sections rule.
 """
@@ -14,6 +14,18 @@ from pathlib import Path
 from temporalio import activity
 
 LOG_CAP = 1_000_000  # bytes per log file
+
+# One source of truth for a run's log filenames. Three places used to hardcode the
+# shape: the writers here, `lg tail`'s glob, and the dashboard's regex. When the
+# item number joined the name, both readers silently stopped matching and nobody
+# could watch a run at all. Anything that reads these files uses these.
+LOG_GLOB = "*.log"
+LOG_RE = r"^(?:i(\d+)-)?r(\d+)-(executor|audit)\.log$"
+
+
+def log_name(item_no: int, round_no: int, role: str) -> str:
+    """e.g. i2-r1-audit.log"""
+    return f"i{item_no}-r{round_no}-{role}.log"
 
 
 def _ts() -> str:

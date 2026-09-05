@@ -59,9 +59,15 @@ after installing.) The run dir already exists. Skip to step 2 with
 - `gates.yaml` — the project's REAL check commands. Read `package.json`,
   `Makefile`, `pyproject.toml` or `Cargo.toml` to find them:
   ```yaml
-  - name: tests  cmd: "pytest -x -q"                      timeout: 600
-  - name: build  cmd: "npm run build"                     timeout: 1800
-  - name: scope  cmd: "/app/runs/<slug>/check-write-set.sh"  timeout: 60
+  - name: tests
+    cmd: "pytest -x -q"
+    timeout: 600
+  - name: build
+    cmd: "npm run build"
+    timeout: 1800
+  - name: scope
+    cmd: "/app/runs/<slug>/check-write-set.sh"
+    timeout: 60
   ```
   **Paths in gates.yaml resolve INSIDE the container.** The run dir is
   `/app/runs/<slug>` and the target repo is `/projects/<name>`. Never host paths.

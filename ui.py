@@ -18,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from activities.stream import LOG_RE
+
 ROOT = Path(__file__).resolve().parent
 LOG_TAIL = 60_000  # bytes per log file served per poll
 
@@ -93,16 +95,19 @@ async function runs() {
 async function poll() {
   if (!sel) return;
   const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(sel))).json();
+  const LOG_RE = new RegExp('__LOG_RE__');
   const rounds = {};
   for (const [name, text] of Object.entries(d.logs)) {
-    const m = name.match(/^r(\\d+)-(executor|audit)\\.log$/);
+    // Pattern comes from activities/stream.py so it cannot drift from the writers.
+    const m = name.match(LOG_RE);
     if (!m) continue;
-    (rounds[m[1]] ||= {})[m[2]] = text;
+    const key = m[1] ? `item ${m[1]} · round ${m[2]}` : `round ${m[2]}`;
+    (rounds[key] ||= {})[m[3]] = text;
   }
   const board = document.getElementById('board');
-  const keys = Object.keys(rounds).sort((a,b) => b - a);
+  const keys = Object.keys(rounds).sort().reverse();
   board.innerHTML = keys.length ? keys.map(n => `
-    <div class="round"><h2>round ${n}</h2><div class="panels">
+    <div class="round"><h2>${n}</h2><div class="panels">
       ${rounds[n].executor !== undefined ? `<div class="panel exec"><header>executor</header>
         <div class="body" data-stick>${colorize(rounds[n].executor)}</div></div>` : ''}
       ${rounds[n].audit !== undefined ? `<div class="panel audit"><header>supervisor</header>
@@ -188,6 +193,11 @@ class TemporalFeed:
 
 # ---------- server ----------
 
+def page_html() -> str:
+    """The dashboard, with the log-name pattern injected from its one owner."""
+    return PAGE.replace("__LOG_RE__", LOG_RE)
+
+
 def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhost:7233"):
     feed = TemporalFeed(temporal_addr) if temporal_addr else None
 
@@ -203,7 +213,7 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
         def do_GET(self):
             u = urlparse(self.path)
             if u.path == "/":
-                body = PAGE.encode()
+                body = page_html().encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

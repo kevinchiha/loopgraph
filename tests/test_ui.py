@@ -10,7 +10,12 @@ import ui
 def server(tmp_path):
     run = tmp_path / "2026-01-01-demo"
     (run / "logs").mkdir(parents=True)
-    (run / "logs" / "r1-executor.log").write_text("[10:00:00 assistant] hello\n[10:00:01 tool:Bash] true\n")
+    # The name the engine actually writes today. This fixture used to plant the
+    # stale r1-executor.log, so the suite stayed green while the dashboard showed
+    # "no logs yet" for every real run.
+    from activities.stream import log_name
+    (run / "logs" / log_name(1, 1, "executor")).write_text(
+        "[10:00:00 assistant] hello\n[10:00:01 tool:Bash] true\n")
     srv = ui.make_server(0, tmp_path, temporal_addr=None)  # port 0 = ephemeral
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
@@ -28,8 +33,13 @@ def test_page_serves(server):
 
 def test_logs_endpoint(server):
     import json
+    import re
+
+    from activities.stream import LOG_RE, log_name
     d = json.loads(get(server + "/api/logs?dir=2026-01-01-demo").read())
-    assert "hello" in d["logs"]["r1-executor.log"]
+    name = log_name(1, 1, "executor")
+    assert "hello" in d["logs"][name]
+    assert re.match(LOG_RE, name), "the page would drop this file and render nothing"
 
 
 def test_logs_reject_traversal(server):
