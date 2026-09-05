@@ -1,19 +1,27 @@
-"""What `lg status` prints, and which workflow a run-directory slug names.
+"""What `lg status` prints, which workflow a run-directory slug names, and how
+the command wires the two together.
 
-Both are pure functions over plain data, so they are tested on dictionaries and
-lists with no Temporal anywhere. The ledgers here are the shapes the engine has
+The summary and the resolution are pure functions over plain data, so they are
+tested on dictionaries and lists. The ledgers here are the shapes the engine has
 really produced, old ones included: a run that closed before `items` existed
-hands back a dictionary without the key, and printing it must not raise.
+hands back a dictionary without the key, and printing it must not raise. The
+command itself runs against a fake client, which is the only way to test the
+paths that matter — a run that has not finished, and an id nobody has.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
+import sys
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from temporalio.client import WorkflowExecutionStatus, WorkflowQueryFailedError
+from temporalio.service import RPCError, RPCStatusCode
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -185,3 +193,206 @@ def test_two_matches_pick_the_later_start_and_report_two(lg):
 
 def test_no_match_is_none_and_zero(lg):
     assert lg.resolve_run_arg("nothing", [("run-toy-ab12cd", at(1))]) == (None, 0)
+
+
+# ---------- the command itself ----------
+
+NO_HANDLER = "Query handler for 'status' expected but not found, known queries: [ledger]"
+UNDECODABLE = RuntimeError("failed to decode query result")
+
+LEDGER = {"status": "merged",
+          "items": [{"n": 1, "item": "one", "status": "done", "commit": "3f2a1b9c0d5e"}],
+          "rounds": [{"item_no": 1, "round": 1, "status": "green", "verdict": "accept"}]}
+
+
+def not_found(wf_id: str) -> RPCError:
+    """What Temporal answers when the id has never existed."""
+    return RPCError(f"workflow not found for ID: {wf_id}", RPCStatusCode.NOT_FOUND, b"")
+
+
+class FakeHandle:
+    """One workflow. `answers` maps a query name to its value or to the exception
+    it raises; an unlisted name raises the SDK's own no-handler error, which is
+    what a LoopGraphRun really answers to `status`."""
+
+    def __init__(self, wf_id, answers=None, status=WorkflowExecutionStatus.COMPLETED,
+                 result=None, missing=False):
+        self.id, self.answers, self.status = wf_id, answers or {}, status
+        self._result, self.missing = result, missing
+        self.queried: list[str] = []
+        self.awaited_result = False
+
+    async def query(self, name):
+        self.queried.append(name)
+        if self.missing:
+            raise not_found(self.id)
+        answer = self.answers.get(name, WorkflowQueryFailedError(NO_HANDLER))
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def describe(self):
+        return SimpleNamespace(status=self.status)
+
+    async def result(self):
+        self.awaited_result = True
+        if self._result is None:
+            raise AssertionError("result() was awaited on a run that has not finished")
+        return self._result
+
+
+class FakeClient:
+    """Records every handle asked for and every listing, so a test can prove a
+    lookup did not happen."""
+
+    def __init__(self, handles=None, listed=()):
+        self.handles = dict(handles or {})
+        self.listed = list(listed)
+        self.asked_for: list[str] = []
+        self.list_queries: list[str] = []
+
+    def get_workflow_handle(self, wf_id):
+        self.asked_for.append(wf_id)
+        if wf_id not in self.handles:
+            self.handles[wf_id] = FakeHandle(wf_id, missing=True)
+        return self.handles[wf_id]
+
+    def list_workflows(self, query):
+        self.list_queries.append(query)
+
+        async def gen():
+            for wf_id, start in self.listed:
+                yield SimpleNamespace(id=wf_id, start_time=start)
+        return gen()
+
+
+def run_status(lg, monkeypatch, client, *argv) -> int:
+    """`lg status ...` end to end, argparse included, on a fake Temporal."""
+    async def fake_client():
+        return client
+    monkeypatch.setattr(lg, "_client", fake_client)
+    monkeypatch.setattr(sys, "argv", ["lg", "status", *argv])
+    return lg.main()
+
+
+def test_a_real_id_prints_a_summary_and_never_lists(lg, monkeypatch, capsys):
+    """The id is tried as an id, exactly as before. A run named in full must not
+    cost a listing of every workflow on the machine."""
+    client = FakeClient({"run-toy-ab12cd": FakeHandle("run-toy-ab12cd", {"ledger": LEDGER})})
+    code = run_status(lg, monkeypatch, client, "run-toy-ab12cd")
+    out, err = capsys.readouterr()
+    assert (code, out, err) == (0, lg.format_status(LEDGER), "")
+    assert client.list_queries == []
+
+
+def test_a_status_query_answer_prints_json(lg, monkeypatch, capsys):
+    """GateCheckRun and RoundRun answer `status` and have no ledger, so their
+    answer prints as JSON the way it always has."""
+    gate = {"red": [], "green": ["tests"]}
+    client = FakeClient({"gate-ab12cd": FakeHandle("gate-ab12cd", {"status": gate})})
+    assert run_status(lg, monkeypatch, client, "gate-ab12cd") == 0
+    assert json.loads(capsys.readouterr().out) == gate
+
+
+def test_json_flag_prints_the_raw_ledger(lg, monkeypatch, capsys):
+    client = FakeClient({"run-toy-ab12cd": FakeHandle("run-toy-ab12cd", {"ledger": LEDGER})})
+    assert run_status(lg, monkeypatch, client, "run-toy-ab12cd", "--json") == 0
+    assert json.loads(capsys.readouterr().out) == LEDGER
+
+
+def test_positional_query_still_prints_json(lg, monkeypatch, capsys):
+    """`lg status <id> ledger` is what README.md and the skill teach. It keeps
+    printing JSON, and it asks only the query it was given."""
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": LEDGER})
+    assert run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}),
+                      "run-toy-ab12cd", "ledger") == 0
+    assert json.loads(capsys.readouterr().out) == LEDGER
+    assert handle.queried == ["ledger"]
+
+
+def test_an_unknown_id_is_retried_as_a_slug(lg, monkeypatch, capsys):
+    """Only Temporal saying the id does not exist turns the argument into a slug."""
+    client = FakeClient({"run-toy-ab12cd": FakeHandle("run-toy-ab12cd", {"ledger": LEDGER})},
+                        listed=[("run-toy-ab12cd", at(1))])
+    code = run_status(lg, monkeypatch, client, "toy")
+    out, err = capsys.readouterr()
+    assert (code, out, err) == (0, lg.format_status(LEDGER), "")
+    assert client.list_queries == ['WorkflowType = "LoopGraphRun"']
+
+
+def test_runs_form_resolves(lg, monkeypatch, capsys):
+    """`runs/toy/` is what tab completion hands the owner."""
+    client = FakeClient({"run-toy-ab12cd": FakeHandle("run-toy-ab12cd", {"ledger": LEDGER})},
+                        listed=[("run-toy-ab12cd", at(1))])
+    assert run_status(lg, monkeypatch, client, "runs/toy/") == 0
+    assert capsys.readouterr().out == lg.format_status(LEDGER)
+
+
+@pytest.mark.parametrize("flag", [[], ["--json"]])
+def test_two_matches_use_the_newest_and_say_so_in_both_modes(lg, monkeypatch, capsys, flag):
+    """The notice goes to stderr in both modes, so `lg status toy --json | jq`
+    still gets nothing but JSON."""
+    client = FakeClient({"run-toy-ef34gh": FakeHandle("run-toy-ef34gh", {"ledger": LEDGER})},
+                        listed=[("run-toy-ab12cd", at(1)), ("run-toy-ef34gh", at(9))])
+    assert run_status(lg, monkeypatch, client, "toy", *flag) == 0
+    out, err = capsys.readouterr()
+    assert err == "using run-toy-ef34gh (newest of 2 for toy)\n"
+    if flag:
+        assert json.loads(out) == LEDGER
+    else:
+        assert out == lg.format_status(LEDGER)
+
+
+def test_no_match_names_the_prefix_and_exits_1(lg, monkeypatch, capsys):
+    """The line names the prefix it looked for, because the usual cause is a
+    typo in the slug and the prefix is what shows it."""
+    client = FakeClient(listed=[("run-other-ab12cd", at(1))])
+    code = run_status(lg, monkeypatch, client, "runs/toy/")
+    out, err = capsys.readouterr()
+    assert (code, out) == (1, "")
+    assert err == "no workflow for toy; looked for ids starting run-toy-\n"
+
+
+def test_a_closed_run_whose_ledger_query_fails_uses_the_result(lg, monkeypatch, capsys):
+    """Query-by-replay fails to decode on closed runs in this SDK, and the
+    ledger of a finished run IS its return value — the same fallback the
+    dashboard makes."""
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": UNDECODABLE}, result=LEDGER)
+    assert run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}),
+                      "run-toy-ab12cd") == 0
+    assert capsys.readouterr().out == lg.format_status(LEDGER)
+    assert handle.awaited_result is True
+
+
+def test_a_running_run_whose_ledger_query_fails_does_not_wait_on_result(lg, monkeypatch, capsys):
+    """result() blocks until the workflow ends, so on a run that is waiting on
+    its card this would hold the owner's terminal for as long as the card is up."""
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": UNDECODABLE},
+                        status=WorkflowExecutionStatus.RUNNING, result=LEDGER)
+    code = run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}), "run-toy-ab12cd")
+    out, err = capsys.readouterr()
+    assert (code, out, err) == (1, "", "failed to decode query result\n")
+    assert handle.awaited_result is False
+
+
+def test_an_unknown_status_is_treated_as_running(lg, monkeypatch, capsys):
+    """temporalio types the status as optional and leaves it None when Temporal
+    reports none. Unknown counts as running, the way ui.TemporalFeed reads it:
+    a skipped fallback prints one line, a wrong one hangs the terminal."""
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": UNDECODABLE}, status=None, result=LEDGER)
+    code = run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}), "run-toy-ab12cd")
+    out, err = capsys.readouterr()
+    assert (code, out, err) == (1, "", "failed to decode query result\n")
+    assert handle.awaited_result is False
+
+
+def test_an_unanswerable_positional_query_prints_one_line_and_exits_1(lg, monkeypatch, capsys):
+    """`lg status <id> status` on a LoopGraphRun, which declares only `ledger`.
+    The help text teaches `status`, so this is reached by typing, and the answer
+    is one line — not the traceback it used to be."""
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": LEDGER}, result=LEDGER)
+    code = run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}),
+                      "run-toy-ab12cd", "status")
+    out, err = capsys.readouterr()
+    assert (code, out, err) == (1, "", NO_HANDLER + "\n")
+    assert handle.awaited_result is False

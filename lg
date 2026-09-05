@@ -16,7 +16,8 @@ import sys
 import uuid
 from datetime import datetime
 
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.service import RPCError, RPCStatusCode
 
 from envfile import read_env
 
@@ -167,18 +168,94 @@ def format_status(ledger: dict) -> str:
     return "\n\n".join("\n".join(s) for s in sections) + "\n"
 
 
-async def cmd_status(args: argparse.Namespace) -> int:
-    client = await _client()
-    handle = client.get_workflow_handle(args.workflow_id)
-    queries = [args.query] if args.query else ["status", "ledger"]
+def _first_line(e: Exception) -> str:
+    """One line for the terminal. A traceback is not an answer to a plain question."""
+    lines = str(e).splitlines()
+    return lines[0] if lines and lines[0].strip() else type(e).__name__
+
+
+async def _still_running(handle) -> bool:
+    """Whether waiting on this workflow's result would block.
+
+    temporalio types WorkflowExecution.status as optional and leaves it None when
+    Temporal reports no status, so unknown has to fall one way. It falls the way
+    ui.TemporalFeed._runs falls it — unknown counts as running — because the two
+    mistakes are not equal: skipping the fallback prints one line, and taking it
+    on a run that is waiting for its owner holds the terminal for as long as the
+    card is up.
+    """
+    status = (await handle.describe()).status
+    return status is None or status is WorkflowExecutionStatus.RUNNING
+
+
+async def _answer(handle, queries: list[str]) -> tuple[str, object]:
+    """The first query that answers, as (query name, result).
+
+    A NOT_FOUND is not a query failure — it says the id does not exist — so it
+    comes straight back out and the caller reads the argument as a run directory
+    instead. Anything else just moves to the next query. When `ledger` was among
+    the queries that failed, a finished run still has its ledger: it is the value
+    the workflow returned, and query-by-replay on a closed run can fail to decode
+    in this SDK. That is the fallback the dashboard already makes.
+    """
+    failure: Exception = RuntimeError("no query to ask")
     for q in queries:
         try:
-            print(json.dumps(await handle.query(q), indent=2))
-            return 0
-        except Exception:
-            if q == queries[-1]:
+            return q, await handle.query(q)
+        except RPCError as e:
+            if e.status is RPCStatusCode.NOT_FOUND:
                 raise
-    return 1
+            failure = e
+        except Exception as e:
+            failure = e
+    if "ledger" in queries and not await _still_running(handle):
+        return "result", await handle.result()
+    raise failure
+
+
+async def _resolve_id(client, arg: str) -> str | None:
+    """The workflow a run-directory argument names, saying out loud when it chose."""
+    candidates = [(wf.id, wf.start_time)
+                  async for wf in client.list_workflows('WorkflowType = "LoopGraphRun"')]
+    wf_id, count = resolve_run_arg(arg, candidates)
+    slug = run_slug(arg)
+    if wf_id is None:
+        print(f"no workflow for {slug}; looked for ids starting run-{slug}-", file=sys.stderr)
+        return None
+    if count > 1:
+        print(f"using {wf_id} (newest of {count} for {slug})", file=sys.stderr)
+    return wf_id
+
+
+async def cmd_status(args: argparse.Namespace) -> int:
+    """What a run is doing, named by workflow id or by run directory.
+
+    The argument is a workflow id first, exactly as before; only Temporal saying
+    no such workflow exists turns it into a run-directory slug. stdout carries
+    the summary or the JSON and nothing else — every notice goes to stderr.
+    """
+    client = await _client()
+    queries = [args.query] if args.query else ["status", "ledger"]
+    try:
+        try:
+            name, result = await _answer(client.get_workflow_handle(args.workflow_id), queries)
+        except RPCError as e:
+            if e.status is not RPCStatusCode.NOT_FOUND:
+                raise
+            wf_id = await _resolve_id(client, args.workflow_id)
+            if wf_id is None:
+                return 1
+            # A miss on the id just chosen is a plain failure, not a second lookup.
+            name, result = await _answer(client.get_workflow_handle(wf_id), queries)
+    except Exception as e:
+        print(_first_line(e), file=sys.stderr)
+        return 1
+    # GateCheckRun and RoundRun answer `status` and have no ledger to summarise.
+    if args.json or args.query or name == "status":
+        print(json.dumps(result, indent=2))
+    else:
+        print(format_status(result), end="")
+    return 0
 
 
 async def cmd_round(args: argparse.Namespace) -> int:
@@ -303,6 +380,7 @@ def main() -> int:
     s = sub.add_parser("status", help="query a workflow (tries status, then ledger)")
     s.add_argument("workflow_id")
     s.add_argument("query", nargs="?", default=None)
+    s.add_argument("--json", action="store_true", help="print the raw query result as JSON")
     s.set_defaults(fn=cmd_status)
     r = sub.add_parser("round", help="run one executor round on a work item")
     r.add_argument("run_dir", help="run dir with brief.md/constraints.md/gates.yaml (container path)")
