@@ -223,6 +223,13 @@ function patchRunRow(row, entry) {
   state.className = 'pill ' + pill(entry.state);
   setText(state, entry.state);
   setText(detail, entry.detail || '');
+  // Whether the run is still open, stamped where a poll can read it back rather
+  // than inferred from the words above. All three shapes are in these two
+  // fields: a start and no close is running, both is finished, and neither is a
+  // directory of log files with no workflow behind it at all. patchRoundCard
+  // reads it to tell a round being worked on right now from one that was simply
+  // never recorded, which nothing else on the board can tell apart.
+  row.dataset.live = entry.start_time && !entry.close_time ? '1' : '';
   // Both times null is a run known only from its log files: it shows no time at
   // all rather than a wrong one. The two live in separate elements because only
   // one of them moves — the duration of a running run counts up on every poll,
@@ -473,7 +480,7 @@ function patchField(field, text) {
   field.hidden = !text;
   setText(field.lastElementChild, text);
 }
-function patchRoundCard(card, row) {
+function patchRoundCard(card, row, live) {
   // No ledger entry is a state, not a gap: _run_item appends the round only
   // after execute_round returns, so a round the executor is working in right now
   // has a log file growing and no row at all. An empty entry reads every field
@@ -486,7 +493,15 @@ function patchRoundCard(card, row) {
   // the audit still out, which lasts up to 30 minutes — a card that knew only
   // the first would go quiet for half an hour on a round that is still running.
   // The suffix goes when the verdict arrives.
-  const running = !row.entry || word === 'audit running';
+  //
+  // And neither half means anything on a run that has closed. Both are read off
+  // a ledger the page could not get, so on the logs-only view every round of a
+  // run that ended yesterday claimed to be running, three lines under a rail
+  // saying `logs only` and a banner saying the page knows nothing. `live` is the
+  // run's own start and close times, which say which of the two it is, so the
+  // suffix stays on exactly the case it was written for: a workflow still open
+  // whose ledger cannot be read.
+  const running = live && (!row.entry || word === 'audit running');
   const [item, round] = card.dataset.key.split('-');
   setText(head, `item ${item} · round ${round}` + (running ? ' · in progress' : ''));
   verdict.hidden = !word;
@@ -516,7 +531,16 @@ function buildLogPane(dir, name, label) {
   pane.addEventListener('toggle', () => { if (pane.open) patchOpenPanes(); });
   return pane;
 }
-function patchRounds(dir, rounds, names) {
+// Whether the run behind `id` is still open, off the row the run list keeps up
+// to date. Read here and not off `sel`, which holds the reply its row was first
+// built from: a run that was running when the reader clicked it closes while
+// they watch, and a card must not go on claiming otherwise for as long as the
+// tab is open.
+function runIsLive(id) {
+  const row = [...document.getElementById('runs').children].find(r => r.dataset.id === id);
+  return !!row && row.dataset.live === '1';
+}
+function patchRounds(dir, rounds, names, live) {
   // `dir` is passed in, never read off `sel`: these names were fetched for one
   // run and the panes built from them have to be stamped with that same run,
   // whatever the reader has clicked since.
@@ -532,6 +556,15 @@ function patchRounds(dir, rounds, names) {
     if (m) slot(roundKey(m[1], m[2])).logs[m[3]] = name;
   }
   const keys = Object.keys(rows).sort(newerFirst);
+  // Cards the reply no longer carries go first, before the empty line goes up or
+  // a new card is placed. Done last, the empty branch returned before ever
+  // reaching it, so a run whose ledger went unreadable and whose directory went
+  // away kept its old cards and had `no rounds yet` appended underneath them —
+  // a line denying what was sitting above it. Only keyed cards: the empty line
+  // is not a round, and the branch below is what puts it up and takes it down.
+  const wanted = new Set(keys);
+  for (const card of [...box.children])
+    if (card.dataset.key && !wanted.has(card.dataset.key)) card.remove();
   const empty = box.querySelector('.empty');
   if (!keys.length) {
     if (empty) { setText(empty, 'no rounds yet'); return; }
@@ -552,7 +585,7 @@ function patchRounds(dir, rounds, names) {
       box.insertBefore(card,
         [...box.children].find(c => newerFirst(c.dataset.key, key) > 0) || null);
     }
-    patchRoundCard(card, rows[key]);
+    patchRoundCard(card, rows[key], live);
     // A pane never moves between cards: its key chose its card when it was built
     // and it is added once, so a reader mid-log keeps the log they were reading.
     const panels = card.lastElementChild;
@@ -562,10 +595,6 @@ function patchRounds(dir, rounds, names) {
         panels.append(buildLogPane(dir, name, label));
     }
   }
-  // A card whose key the reply no longer carries. Choosing another run rebuilds
-  // the board, so this is a ledger that changed under a run already on screen.
-  const wanted = new Set(keys);
-  for (const card of [...box.children]) if (!wanted.has(card.dataset.key)) card.remove();
 }
 // A pane's next offset is only written when its own reply lands. A second pass
 // starting before the first has finished would read the offset the first pass
@@ -659,11 +688,13 @@ async function poll() {
     ]);
     // The ledger's rounds and the log names reach the same patch, because one
     // round is both: a row saying what the supervisor decided, and the two files
-    // the round wrote while deciding it.
+    // the round wrote while deciding it. Whether the run is still open goes with
+    // them, because a round with no verdict means one thing on a workflow that
+    // is running and nothing at all on one that closed yesterday.
     if (run === sel) {
       patchBoard(state);
       patchRounds(run.dir, (state && state.ledger && state.ledger.rounds) || [],
-                  logs.logs || []);
+                  logs.logs || [], runIsLive(run.id));
     }
   } catch(e) { /* the board keeps what it has until the next poll */ }
   patchOpenPanes();

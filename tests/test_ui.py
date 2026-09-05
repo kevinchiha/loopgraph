@@ -1351,13 +1351,38 @@ def test_a_log_with_no_ledger_row_still_gets_a_card():
 
 
 def test_rounds_are_ordered_by_number_and_not_as_strings():
-    """`1-10` sorts under `1-2` as a string, so `item 1 · round 10` sat above
-    `item 1 · round 2` — and cards are inserted rather than re-sorted, so no
-    later poll ever moves it back. The comparison has to read numbers, and the
-    same comparison has to place a new card as sorts the list."""
+    """`1-10` sorts under `1-2` as a string, so `item 1 · round 10` sat below
+    `item 1 · round 2` — and cards are put in place rather than re-sorted, so no
+    later poll ever moves one back.
+
+    The page's own comparison is pulled out and run over a list of keys rather
+    than searched for the word `Number`: `ai - bi` carries that word too, passes
+    every shape check in this file, and puts the OLDEST round on top, which is
+    the bug this test is named after.
+    """
+    import functools
     html = ui.page_html()
     order = function_source(html, "newerFirst")
-    assert "Number" in order, "the keys are compared as text, so round 10 sits above round 2"
+    args = re.search(r"function newerFirst\((\w+), (\w+)\)", order)
+    binds = re.findall(r"\[(\w+), (\w+)\] = (\w+)\.split\('-'\)\.map\(Number\)", order)
+    expr = re.search(r"return ([^;]+);", order)
+    assert args and len(binds) == 2 and expr, \
+        "newerFirst is no longer two splits and one expression, so this cannot run it"
+
+    def compare(x, y):
+        held = {args.group(1): x, args.group(2): y}
+        env = {}
+        for item, rnd, arg in binds:
+            env[item], env[rnd] = (int(n) for n in held[arg].split("-"))
+        # `||` is Python's `or` over these integers exactly: 0 falls through to
+        # the round, anything else is the answer.
+        return eval(expr.group(1).replace("||", "or"), {"__builtins__": {}}, env)
+
+    keys = ["1-1", "1-2", "1-10", "2-1", "10-1", "1-9"]
+    assert sorted(keys, key=functools.cmp_to_key(compare)) == \
+        ["10-1", "2-1", "1-10", "1-9", "1-2", "1-1"], \
+        "the page's own comparison does not put the newest round first"
+
     src = function_source(html, "patchRounds")
     assert "sort(newerFirst)" in src, "the keys are sorted by something else"
     assert re.search(r"newerFirst\(\w+\.dataset\.key", src), \
@@ -1365,6 +1390,63 @@ def test_rounds_are_ordered_by_number_and_not_as_strings():
     assert not re.search(r"dataset\.key\s*<", src), \
         "the old string comparison is still deciding where a card goes"
     assert "insertBefore" in src, "a new card cannot arrive without moving the ones on screen"
+
+
+def test_an_empty_reply_takes_the_old_cards_with_it():
+    """The early return in the empty branch skipped the removal that used to sit
+    below it, so a run whose ledger went unreadable and whose log directory went
+    away kept every card it had and got `no rounds yet` appended underneath them
+    — one line denying the cards above it. The removal runs first now.
+
+    The empty line itself is left out of the removal. Taken away and made again
+    every 2 seconds it would be a new node each poll, which is the churn setText
+    exists to avoid.
+    """
+    src = function_source(ui.page_html(), "patchRounds")
+    removal = re.search(r"if \(\w+\.dataset\.key && ![^\n]*\)\s*\w+\.remove\(\);", src)
+    assert removal, "a card whose key the reply no longer carries stays on screen for ever"
+    assert removal.start() < src.index("if (!keys.length)"), \
+        "the removal sits after the empty branch, which returns before reaching it"
+    assert removal.start() < src.index("'no rounds yet'"), \
+        "the empty line goes up while the cards it denies are still on screen"
+
+
+def test_only_a_run_that_is_still_open_claims_a_round_is_in_progress():
+    """Measured on the logs-only view: `2026-09-05-macweb-metadata` closed
+    yesterday after three rounds, and every one of them said ` · in progress` —
+    three lines under a rail reading `logs only` and a banner reading `temporal
+    unreachable — logs only`. Both halves of the suffix are read off a ledger the
+    page could not get, so with no ledger at all both fired on every round there
+    has ever been.
+
+    The run's own times settle it, and they are already on the wire (AC-3): a
+    start and no close is a workflow still running, both is one that finished,
+    and neither is a directory of log files with no workflow behind it. So the
+    suffix stays on the case it was written for — a running workflow whose
+    ledger query fails, which is nondeterminism on 7 of the 15 histories on this
+    machine — and comes off every run that has closed.
+
+    Read off the row and not off `sel`, which holds the reply its row was first
+    built from: a run that was running when the reader clicked it closes while
+    they are watching, and the card has to stop claiming otherwise.
+    """
+    html = ui.page_html()
+    row = function_source(html, "patchRunRow")
+    assert re.search(r"dataset\.live\s*=\s*\w+\.start_time\s*&&\s*!\w+\.close_time", row), \
+        "the row does not stamp whether its run is still open"
+    live = function_source(html, "runIsLive")
+    assert "dataset.live" in live, "the liveness is read from somewhere other than the row"
+    assert "sel" not in live, "the liveness comes off the click's own reply, which never moves"
+    assert re.search(r"runIsLive\(\w+\.id\)", function_source(html, "poll")), \
+        "the poll never asks whether the run it is patching is still open"
+    assert re.match(r"function patchRounds\(\w+, \w+, \w+, \w+\)",
+                    function_source(html, "patchRounds")), \
+        "patchRounds is not told whether the run is still open"
+    guard = re.search(r"const \w+ = (\w+) && \(!\w+\.entry",
+                      function_source(html, "patchRoundCard"))
+    assert guard, "the in-progress suffix is not gated on the run being open"
+    assert guard.group(1) == "live", \
+        f"the suffix is gated on {guard.group(1)!r} rather than the run's own liveness"
 
 
 def test_a_round_card_carries_what_ac8_asks_for():
