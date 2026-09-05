@@ -53,3 +53,17 @@ def test_runs_endpoint_without_temporal(server):
     assert d["temporal"] is False
     assert d["runs"][0]["dir"] == "2026-01-01-demo"
     assert d["runs"][0]["state"] == "unknown"
+
+
+def test_the_injected_pattern_survives_javascript():
+    """A JS string literal eats an unknown escape, so a pasted pattern reached
+    RegExp with its \\d turned into a bare d and matched no log file, ever."""
+    import json
+    import re
+
+    from activities.stream import LOG_RE
+    html = ui.page_html()
+    assert f"new RegExp({json.dumps(LOG_RE)})" in html
+    assert "new RegExp('^" not in html, "pattern pasted raw into a JS string"
+    # The pattern itself still has to match what stream.py writes.
+    assert re.match(LOG_RE, "i2-r1-audit.log")

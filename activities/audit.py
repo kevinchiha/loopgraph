@@ -73,7 +73,8 @@ def declared_vs_actual(round_result: dict) -> tuple[list[str], list[str]]:
 
 
 def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str,
-                          owner_answers: str = "") -> str:
+                          owner_answers: str = "", work_item: str = "",
+                          item_no: int = 1, item_total: int = 1) -> str:
     contract = (PROMPTS / "supervisor.md").read_text()
     claims = "\n".join(f"- {flatten_claim(c)}" for c in round_result.get("claims", [])) or "(no claims)"
     # Flattened for the same reason as claims: a path can contain a newline, and
@@ -110,8 +111,22 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
                     "The executor's contract requires these to agree. Treat a "
                     "mismatch as a finding, not a formatting quirk.")
     truncated = "\n[diff truncated by engine]" if len(diff) >= DIFF_CAP else ""
+    # Which item this round covers. Without it the supervisor judged every round
+    # against the WHOLE brief, so in a multi-item run it found the other items
+    # missing and issued a redo that pushed the executor into another item's
+    # scope. That round then reset to the checkpoint, and the work the redo
+    # displaced was lost.
+    scope = ""
+    if item_total > 1:
+        scope = (f"# The work item under audit ({item_no} of {item_total})\n\n"
+                 f"{work_item.strip() or '(unnamed item)'}\n\n"
+                 "Judge THIS item only. The brief lists others; each gets its own\n"
+                 "round, its own audit and its own commit, and some are already\n"
+                 "committed or still to come. Another item missing from this diff is\n"
+                 "not a finding. Work outside this item is still drift.\n\n")
     return (
         f"{contract}\n\n# Feature brief\n\n{brief.strip()}\n\n"
+        f"{scope}"
         f"# Constraints (binding)\n\n{constraints.strip() or '(none)'}\n\n"
         # The owner's own words, written by the engine when they answered a card.
         # Without this the auditor had no way to tell an owner-authorised value
@@ -188,7 +203,8 @@ async def diff_including_new_files(worktree: str) -> str:
 
 
 @activity.defn
-async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: int = 1) -> dict:
+async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: int = 1,
+                work_item: str = "", item_total: int = 1) -> dict:
     """Audit one round's output. Returns the verdict packet."""
     run = Path(run_dir)
     brief = (run / "brief.md").read_text()
@@ -196,7 +212,7 @@ async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: in
     worktree = round_result["worktree"]
     diff = (await diff_including_new_files(worktree))[:DIFF_CAP]
     prompt = assemble_audit_prompt(brief, constraints, round_result, diff,
-                                   read_answers(run_dir))
+                                   read_answers(run_dir), work_item, item_no, item_total)
     verdict = await run_supervisor(prompt, worktree, str(run / "logs" / log_name(item_no, round_no, "audit")))
     verdict["diff_chars"] = len(diff)
     return verdict

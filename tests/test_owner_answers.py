@@ -69,3 +69,24 @@ def test_questions_do_not_spend_the_correction_budget():
 def test_each_budget_stops_the_item_on_its_own():
     assert budget_spent(spent=MAX_ROUNDS, asks=0) == "redo cap reached"
     assert budget_spent(spent=0, asks=MAX_ASKS) == "owner-question cap reached"
+
+
+def test_a_multi_item_audit_is_told_which_item_it_judges():
+    """The supervisor judged every round against the whole brief, so in a
+    multi-item run it found the other items missing, issued a redo, and pushed the
+    executor into another item's scope. That round reset to the checkpoint and the
+    displaced work was lost."""
+    rr = {"claims": [], "files": [], "gate_results": [], "worktree": "/wt"}
+    p = assemble_audit_prompt("BRIEF", "", rr, "d", "", "fix the lint script", 2, 3)
+    assert "The work item under audit (2 of 3)" in p
+    assert "fix the lint script" in p
+    assert "not a finding" in p, "must say another item's absence is not a defect"
+    assert "still drift" in p, "must still catch work outside the item"
+
+
+def test_a_single_item_run_judges_the_whole_brief():
+    """One item is the whole brief. Naming it would only invite the supervisor to
+    audit a restatement of the brief instead of the brief."""
+    rr = {"claims": [], "files": [], "gate_results": [], "worktree": "/wt"}
+    p = assemble_audit_prompt("BRIEF", "", rr, "d", "", "the only item", 1, 1)
+    assert "The work item under audit" not in p

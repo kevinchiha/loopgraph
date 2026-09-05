@@ -125,7 +125,9 @@ def test_the_dashboard_ships_a_real_pattern():
     import ui
     html = ui.page_html()
     assert "__LOG_RE__" not in html, "the placeholder was never substituted"
-    assert re.search(r"new RegExp\('(.+?)'\)", html)
+    # json.dumps, not quotes: a JS string literal ate the backslashes and the
+    # browser built a pattern that matched no log file.
+    assert re.search(r'new RegExp\("(.+?)"\)', html)
 
 
 # ---------- every gate example in the docs must actually parse ----------

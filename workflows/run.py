@@ -249,7 +249,8 @@ class LoopGraphRun:
 
             verdict = await workflow.execute_activity(
                 audit,
-                args=[run_dir, result, round_no, item_no],
+                args=[run_dir, result, round_no, item_no, work_item,
+                      len(self._ledger["items"])],
                 start_to_close_timeout=timedelta(minutes=30),
                 heartbeat_timeout=timedelta(minutes=3),
                 retry_policy=RetryPolicy(maximum_attempts=2),

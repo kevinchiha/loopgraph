@@ -95,7 +95,7 @@ async function runs() {
 async function poll() {
   if (!sel) return;
   const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(sel))).json();
-  const LOG_RE = new RegExp('__LOG_RE__');
+  const LOG_RE = new RegExp(__LOG_RE__);
   const rounds = {};
   for (const [name, text] of Object.entries(d.logs)) {
     // Pattern comes from activities/stream.py so it cannot drift from the writers.
@@ -194,8 +194,15 @@ class TemporalFeed:
 # ---------- server ----------
 
 def page_html() -> str:
-    """The dashboard, with the log-name pattern injected from its one owner."""
-    return PAGE.replace("__LOG_RE__", LOG_RE)
+    """The dashboard, with the log-name pattern injected from its one owner.
+
+    json.dumps writes the JS string literal, backslashes and all. Pasting the
+    pattern between quotes instead looked right and was not: a JS string eats an
+    unknown escape, so `\\d` reached RegExp as a bare `d`, the browser built
+    /^(?:i(d+)-)?r(d+)-(executor|audit).log$/, every filename failed to match, and
+    the log pane said "no logs yet for this run" for every run there has ever
+    been."""
+    return PAGE.replace("__LOG_RE__", json.dumps(LOG_RE))
 
 
 def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhost:7233"):
