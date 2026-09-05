@@ -713,9 +713,13 @@ def test_a_large_patch_is_cut_at_the_cap(diffing):
 
     d = getjson(f"{diffing.url}/api/diff?id={DIFF_ID}")
     assert d["truncated"] is True
-    # errors="replace" turns the one or two bytes of a character the cut landed
-    # inside into a single U+FFFD, which re-encodes to three, so the decoded patch
-    # can measure two bytes over the cut. Two, not two hundred thousand.
+    # For a patch body that is otherwise valid UTF-8, errors="replace" turns the
+    # one or two bytes of the character the cut landed inside into a single
+    # U+FFFD, which re-encodes to three, so the decoded patch can measure two
+    # bytes over the cut. Two, not two hundred thousand. It is not a general
+    # bound and does not claim to be: a latin-1 file, which git diffs as text,
+    # makes every invalid byte its own U+FFFD and can treble the decoded length.
+    # AC-18 caps the raw bytes, and the raw bytes are capped exactly.
     assert len(d["patch"].encode()) <= ui.DIFF_CAP + 2
     assert ui.DIFF_CAP == 204_800 and ui.STAT_CAP == 20_480
 
@@ -743,12 +747,17 @@ def test_a_git_command_past_its_deadline_answers_instead_of_hanging(diffing, tmp
                                                                     monkeypatch):
     """gate.py carries the scar: a deadline that governed the drain instead of the
     process was silently not enforced. A hang is not an exception, so nothing else
-    catches it and the browser's fetch never fills."""
+    catches it and the browser's fetch never fills.
+
+    The slow thing is an external-diff driver rather than a textconv one, because
+    --no-textconv means a repository's textconv never runs here at all — and a
+    test that hangs git through a path the endpoint has closed would prove
+    nothing."""
     assert ui.DIFF_TIMEOUT == 20, "the line the owner reads says 20s"
-    slow = tmp_path / "slow-textconv"
+    slow = tmp_path / "slow-external-diff"
     slow.write_text("#!/bin/sh\nsleep 5\n")
     slow.chmod(0o755)
-    git(diffing.repo, "config", "diff.slow.textconv", str(slow))
+    git(diffing.repo, "config", "diff.slow.command", str(slow))
     (diffing.repo / ".gitattributes").write_text("feature.txt diff=slow\n")
     monkeypatch.setattr(ui, "DIFF_TIMEOUT", 1)
 
@@ -757,6 +766,68 @@ def test_a_git_command_past_its_deadline_answers_instead_of_hanging(diffing, tmp
     assert time.monotonic() - t0 < 4, "the deadline did not govern git itself"
     assert d == {"stat": "git took longer than 1s; nothing to show",
                  "patch": "", "truncated": False}
+
+
+def test_the_process_group_is_captured_before_the_pid_can_be_reused():
+    """The timer thread can fire after proc.wait() has reaped the pid, and the
+    kernel may already have handed that pid to someone else. os.getpgid on it then
+    names a stranger's process group, and killpg — unlike kill — takes that whole
+    group down.
+
+    There is no reaching that window from a test: it is microseconds wide and
+    needs PID wraparound inside it. So pin the shape, the way this file pins
+    LOG_GLOB and HEAD_MARK. The group id is read once, before anything can wait on
+    the process, and nothing is signalled after the wait."""
+    # Code only: the docstring and the comments beside it say `proc.wait()` too.
+    code = "\n".join(ln for ln in inspect.getsource(ui._git_read_only).split('"""')[2].splitlines()
+                     if not ln.strip().startswith("#"))
+    assert "os.killpg(os.getpgid(" not in code, "the kill looks up a pid that may be reused"
+    assert code.index("os.getpgid(") < code.index("os.killpg("), "looked up at kill time"
+    assert code.index("os.getpgid(") < code.index(".wait()"), "looked up after the reap"
+    assert "if reaped:" in code, "a signal can still land after proc.wait()"
+
+
+def git_dir_state(repo):
+    """Every path under .git with its size and mtime, measured without git.
+
+    Running git to find out whether git wrote something is not a measurement: a
+    plain `git status` refreshes the index and writes it back.
+    """
+    return sorted((str(p.relative_to(repo)), p.lstat().st_size, p.lstat().st_mtime_ns)
+                  for p in (repo / ".git").rglob("*"))
+
+
+def test_a_repository_that_caches_its_text_conversion_is_still_not_written_to(
+        diffing, tmp_path):
+    """git diff is not unconditionally read-only, and the owner's repositories are
+    not ours to configure.
+
+    A repository whose config sets diff.<driver>.cachetextconv stores each
+    conversion in git notes on the first diff that needs one: new objects,
+    refs/notes/textconv/<driver>, its reflog, and a ref lock taken to write them.
+    --no-optional-locks does not stop it and neither does --no-ext-diff.
+    --no-textconv does, and the dashboard shows a raw patch, so it has no use for
+    a repository's text conversion in the first place.
+    """
+    conv = tmp_path / "textconv"
+    conv.write_text('#!/bin/sh\ncat "$1"\n')
+    conv.chmod(0o755)
+    git(diffing.repo, "config", "diff.tc.textconv", str(conv))
+    git(diffing.repo, "config", "diff.tc.cachetextconv", "true")
+    (diffing.repo / ".gitattributes").write_text("feature.txt diff=tc\n")
+
+    before = git_dir_state(diffing.repo)
+    d = getjson(f"{diffing.url}/api/diff?id={DIFF_ID}")
+    assert "feature.txt" in d["stat"], "the diff still has to work"
+    assert git_dir_state(diffing.repo) == before, "the diff wrote to the repository"
+
+    # Both commands carry the flag, and only the patch command can be shown to
+    # need it: today's git does not convert text to count lines for --stat, so
+    # dropping the flag there breaks nothing this test can see. Which commands
+    # convert is git's business, it has changed before, and the flag costs
+    # nothing — so pin it rather than let it be tidied off the half that looks
+    # unused.
+    assert inspect.getsource(ui.branch_diff).count('"--no-textconv"') == 2
 
 
 def test_a_helper_git_left_behind_cannot_pin_the_request(diffing, tmp_path, monkeypatch):

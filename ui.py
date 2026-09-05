@@ -320,13 +320,25 @@ def _git_read_only(repo: Path, argv: list[str], cap: int) -> tuple[int, bytes, b
     proc = subprocess.Popen(argv, cwd=repo, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
+    # Captured now, while the pid is certainly still ours to ask about. Looked up
+    # at kill time instead, os.getpgid would be asking about a pid that proc.wait()
+    # may already have reaped and the kernel handed to someone else, and killpg —
+    # unlike kill — takes that stranger's whole process group down with it.
+    # `reaped` closes the rest of the same window: once waited on, the pid is not
+    # signalled at all, whichever thread gets there.
+    pgid = os.getpgid(proc.pid)
     expired = threading.Event()
+    alive = threading.Lock()
+    reaped = False
 
     def _stop() -> None:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass  # already gone, or reaped between the getpgid and the kill
+        with alive:
+            if reaped:
+                return
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass  # already gone, or not ours to signal
 
     def _expire() -> None:
         expired.set()
@@ -343,7 +355,9 @@ def _git_read_only(repo: Path, argv: list[str], cap: int) -> tuple[int, bytes, b
         _stop()  # a no-op once it has exited; the cut's stop button otherwise
         proc.stdout.close()
         proc.stderr.close()
-        proc.wait()
+        with alive:
+            proc.wait()
+            reaped = True
     if expired.is_set():
         raise _GitTimeout(" ".join(argv))
     return proc.returncode, out[:cap], truncated, err.decode(errors="replace")
@@ -374,6 +388,16 @@ def branch_diff(repo: Path, base_branch: str, branch: str) -> dict:
     write, no gc. The owner may be working in this repository at the moment a poll
     arrives, and a command that took the index lock would block their own git.
 
+    --no-textconv is what makes that a guarantee rather than a habit. `git diff`
+    is not unconditionally read-only: a repository whose config sets
+    diff.<driver>.cachetextconv stores each text conversion in git notes the
+    first time it makes one, so a plain diff creates objects, writes
+    refs/notes/textconv/<driver> and its reflog, and takes a ref lock to do it.
+    --no-optional-locks does not stop that and neither does --no-ext-diff. These
+    are the owner's repositories and their configuration is not ours to predict,
+    so the flag goes on rather than the claim coming off. It costs nothing here:
+    the dashboard renders a raw patch and has no use for a conversion.
+
     The cut is made on bytes and the decode comes after, exactly as log_slice does
     it for /api/log. Cutting the decoded text would measure characters, so a diff
     of files written in Greek or Japanese would arrive at up to four times the
@@ -402,8 +426,8 @@ def branch_diff(repo: Path, base_branch: str, branch: str) -> dict:
                 return _reason(f"branch not found: {ref}")
 
         span = f"{base_branch}...{branch}"
-        stat, _ = _checked(repo, ["git", "diff", "--stat", span], STAT_CAP)
-        patch, cut = _checked(repo, ["git", "diff", span], DIFF_CAP)
+        stat, _ = _checked(repo, ["git", "diff", "--no-textconv", "--stat", span], STAT_CAP)
+        patch, cut = _checked(repo, ["git", "diff", "--no-textconv", span], DIFF_CAP)
     except _GitTimeout:
         return _reason(f"git took longer than {DIFF_TIMEOUT}s; nothing to show")
     return {"stat": stat.decode(errors="replace"),
