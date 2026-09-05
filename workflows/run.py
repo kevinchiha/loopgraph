@@ -360,9 +360,23 @@ class LoopGraphRun:
         # signals the run the update names. Waiting on workflow state rather than
         # on a long-polling activity is also what makes this wait genuinely
         # durable — there is nothing to retry, restart or re-skip.
-        await workflow.wait_condition(lambda: self._peek(allowed) is not None)
+        while True:
+            await workflow.wait_condition(lambda: bool(self._decisions))
+            i = self._peek(allowed)
+            if i is not None:
+                break
+            # Something arrived and this card cannot take it. Saying so beats
+            # leaving it in the queue: the owner replied, nothing happened, and
+            # the run went on waiting with no way to tell why.
+            rejected = self._drain_decisions()
+            self._ledger.setdefault("ignored_answers", []).extend(rejected)
+            await self._note(
+                run_dir, "not an answer",
+                f"I could not use that: this card takes {' or '.join(sorted(options))} "
+                f"and nothing else.\n\nYou sent: {rejected[0][:200]}\n\n"
+                f"Tap a button, or run: {hint}", expect_reply=True)
         self._ledger.pop("awaiting", None)
-        value = self._decisions.pop(self._peek(allowed)).strip()
+        value = self._decisions.pop(i).strip()
         return value.upper() if allowed else value
 
     async def _ask_owner(self, run_dir: str, question: str, options: dict) -> str:
@@ -399,8 +413,12 @@ class LoopGraphRun:
             lines.extend(f"- parked item {e['n']}: {e.get('reason', '')}" for e in parked)
         await self._note(run_dir, "run stopped", "\n".join(lines))
 
-    async def _note(self, run_dir: str, kind: str, text: str) -> None:
-        """A card with no buttons. Does not wait for anything."""
+    async def _note(self, run_dir: str, kind: str, text: str,
+                    expect_reply: bool = False) -> None:
+        """A card with no buttons. Does not wait for anything.
+
+        expect_reply drives force_reply. A stopped-run note used to open a reply
+        box on the owner's phone for a run that no longer exists."""
         telegram = await workflow.execute_activity(
             telegram_configured,
             start_to_close_timeout=timedelta(seconds=30),
@@ -411,7 +429,7 @@ class LoopGraphRun:
             return
         await workflow.execute_activity(
             send_card,
-            args=[kind, workflow.info().workflow_id, run_dir, text, None, {}],
+            args=[kind, workflow.info().workflow_id, run_dir, text, None, {}, expect_reply],
             start_to_close_timeout=timedelta(minutes=5),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
@@ -441,13 +459,24 @@ class LoopGraphRun:
             if not merged["merged"]:
                 self._ledger["reason"] = merged["reason"]
         elif letter == "C":
-            self._ledger["discard"] = await workflow.execute_activity(
+            gone = await workflow.execute_activity(
                 discard,
                 args=[self._target_repo, result["branch"], result.get("worktree", "")],
                 start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )
-            self._ledger.update(status="discarded")
+            self._ledger["discard"] = gone
+            # Do not report a discard that did not happen. That is the same "the
+            # label is a lie" problem C had before it deleted anything at all.
+            if gone.get("discarded"):
+                self._ledger.update(status="discarded")
+            else:
+                self._ledger.update(status="discard-failed", reason=gone.get("reason", ""))
+                await self._note(
+                    run_dir, "discard failed",
+                    f"You chose C, but the branch is still there.\n\n"
+                    f"branch: {result['branch']}\nwhy: {gone.get('reason', '')}\n\n"
+                    f"Nothing was merged. Delete it by hand when you can.")
         else:
             self._ledger.update(status="held")
 

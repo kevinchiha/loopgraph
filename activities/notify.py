@@ -89,7 +89,8 @@ async def telegram_configured() -> bool:
 
 @activity.defn
 async def send_card(kind: str, wf_id: str, run_dir: str, summary: str,
-                    commit: str | None, options: dict[str, str]) -> dict:
+                    commit: str | None, options: dict[str, str],
+                    expect_reply: bool = True) -> dict:
     token, chat = _creds()
     body = {
         "chat_id": chat,
@@ -97,11 +98,12 @@ async def send_card(kind: str, wf_id: str, run_dir: str, summary: str,
     }
     if options:  # no options = free-text reply expected, no buttons
         body["reply_markup"] = build_keyboard(wf_id, options)
-    else:
+    elif expect_reply:
         # force_reply makes the answer quote this card, and the card names its own
         # workflow, so the dispatcher can route a typed reply with no bookkeeping.
         # Mutually exclusive with an inline keyboard, which is fine: buttons carry
-        # the run id themselves.
+        # the run id themselves. Off for a note that ends a run: opening a reply
+        # box for a workflow that no longer exists only wastes the owner's time.
         body["reply_markup"] = {"force_reply": True}
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(f"{API}/bot{token}/sendMessage", json=body)

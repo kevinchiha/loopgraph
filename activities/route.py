@@ -36,7 +36,7 @@ def resolve_by_suffix(key: str, open_ids: list[str]) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
-def route_update(update: dict, chat_id: str, open_ids: list[str]) -> dict | None:
+def route_update(update: dict, chat_id: str, open_ids: list[str] | None) -> dict | None:
     """Where one update should go.
 
     Returns {"wf_id", "value", "callback_id"} to signal a run, or a dict with
@@ -49,7 +49,7 @@ def route_update(update: dict, chat_id: str, open_ids: list[str]) -> dict | None
         if not m:
             return None
         card = (cb.get("message") or {}).get("text")
-        wf = wf_from_card(card) or resolve_by_suffix(m.group("key"), open_ids)
+        wf = wf_from_card(card) or resolve_by_suffix(m.group("key"), open_ids or [])
         if not wf:
             return {"problem": "tapped a card whose run I could not identify",
                     "callback_id": cb.get("id")}
@@ -68,6 +68,13 @@ def route_update(update: dict, chat_id: str, open_ids: list[str]) -> dict | None
     wf = wf_from_card(quoted)
     if wf:
         return {"wf_id": wf, "value": text[:2000], "callback_id": None}
+    if open_ids is None:
+        # Not the same as "nothing is running". Saying so, rather than guessing or
+        # claiming nothing is waiting, is the difference between a lost answer and
+        # an owner who knows to try again.
+        return {"problem": "I could not check which runs are open, so I cannot place "
+                           "that. Try again in a moment, or answer with "
+                           "`lg approve <workflow-id> <letter>`."}
     if len(open_ids) == 1:
         # Unambiguous: only one run could possibly be asking.
         return {"wf_id": open_ids[0], "value": text[:2000], "callback_id": None}

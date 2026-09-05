@@ -29,13 +29,16 @@ API = "https://api.telegram.org"
 OPEN_RUNS = 'WorkflowType = "LoopGraphRun" AND ExecutionStatus = "Running"'
 
 
-async def open_run_ids(client: Client) -> list[str]:
-    """Runs that could be waiting on an answer. Only used when an update cannot
-    identify its own run."""
+async def open_run_ids(client: Client) -> list[str] | None:
+    """Runs that could be waiting on an answer, or None when that could not be
+    determined. The difference matters: returning an empty list on an outage made
+    the bot tell the owner "no run is waiting" while one was, and drop the
+    message. Routing degrades, it does not lie."""
     try:
         return [w.id async for w in client.list_workflows(OPEN_RUNS)]
-    except Exception:  # visibility can lag or be unavailable; routing degrades, not dies
-        return []
+    except Exception as e:
+        print(f"dispatcher: could not list open runs: {e}", flush=True)
+        return None
 
 
 async def deliver(client: Client, hit: dict) -> str:
@@ -115,9 +118,20 @@ async def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat = os.environ["TELEGRAM_CHAT_ID"]
     client = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"))
-    print("dispatcher up, listening for replies", flush=True)
     offset = 0
     async with httpx.AsyncClient(timeout=40) as http:
+        # Say nothing until Telegram has actually answered. Printing the ready
+        # line first meant a dead bot token still passed the installer's health
+        # check, and the owner was told the stack was fine when no reply could
+        # ever reach a run.
+        me = await http.post(f"{API}/bot{token}/getMe")
+        if me.status_code >= 300:
+            raise SystemExit(
+                f"Telegram rejected the bot token ({me.status_code}). No reply could "
+                f"ever reach a run. Check LOOPGRAPH_TELEGRAM_ENV, or rotate the token "
+                f"with @BotFather and re-run ./install.sh.")
+        who = me.json().get("result", {}).get("username", "?")
+        print(f"dispatcher up, listening for replies on @{who}", flush=True)
         # Start past whatever is already queued: messages sent before this started
         # cannot be answers to a card it has not seen.
         r = await http.post(f"{API}/bot{token}/getUpdates", json={"timeout": 0, "offset": -1})

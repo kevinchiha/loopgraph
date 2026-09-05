@@ -119,7 +119,7 @@ def _container(path: str) -> str:
 # overwrites "merge-ready" with the owner's answer before it returns, so treating
 # that one status as the only success meant every finished run, including a clean
 # merge, reported failure to whatever was scripting it.
-FAILED_STATES = ("stopped", "merge-failed")
+FAILED_STATES = ("stopped", "merge-failed", "discard-failed")
 
 
 def exit_code_for(status: str) -> int:

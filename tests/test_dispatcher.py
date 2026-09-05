@@ -178,3 +178,25 @@ def test_a_visibility_outage_degrades_rather_than_dies():
     http, client = FakeHttp([[tap()]]), Blind()
     run_pump(http, client)
     assert client.signals == [("run-x-ab12cd", "decide", "A")]
+
+
+def test_an_outage_says_so_rather_than_claiming_nothing_is_running():
+    """Returning [] on a visibility outage made the bot tell the owner "no run is
+    waiting" while one was, and drop the answer. Not knowing is a third state."""
+    class Blind(FakeClient):
+        def list_workflows(self, query):
+            raise RuntimeError("visibility is down")
+
+    http, client = FakeHttp([[typed(quote=None)]]), Blind()
+    run_pump(http, client)
+    assert client.signals == []
+    said = [c[1]["text"] for c in http.calls if c[0] == "sendMessage"]
+    assert said and "could not check which runs are open" in said[0]
+    assert "no run is waiting" not in said[0]
+
+
+def test_no_open_runs_still_says_no_open_runs():
+    http, client = FakeHttp([[typed(quote=None)]]), FakeClient(open_ids=[])
+    run_pump(http, client)
+    said = [c[1]["text"] for c in http.calls if c[0] == "sendMessage"]
+    assert said and "no run is waiting" in said[0]

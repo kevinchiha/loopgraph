@@ -74,7 +74,9 @@ def declared_vs_actual(round_result: dict) -> tuple[list[str], list[str]]:
 def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str) -> str:
     contract = (PROMPTS / "supervisor.md").read_text()
     claims = "\n".join(f"- {flatten_claim(c)}" for c in round_result.get("claims", [])) or "(no claims)"
-    files = "\n".join(f"- {f}" for f in round_result.get("files", [])) or "(no files)"
+    # Flattened for the same reason as claims: a path can contain a newline, and
+    # the write set is pasted into the same prompt the forging fix was hardening.
+    files = "\n".join(f"- {flatten_claim(f)}" for f in round_result.get("files", [])) or "(no files)"
     # The gate's command and its output, not just a name and an exit code: the
     # contract asks the auditor to judge whether a gate exercises the claim, which
     # it cannot do without seeing what the gate ran.
@@ -170,7 +172,11 @@ async def diff_including_new_files(worktree: str) -> str:
     try:
         return await _git(*diff, cwd=worktree)
     finally:
-        await _git("reset", "-q", "--", *untracked, cwd=worktree)
+        # --force-remove, not reset. These paths had NO index entry before this
+        # ran, and `git reset -- path` restores the entry from HEAD, so for a file
+        # that was `git rm --cached`-ed it un-staged the deletion instead of
+        # putting the index back as it was found.
+        await _git("update-index", "--force-remove", "--", *untracked, cwd=worktree)
 
 
 @activity.defn
