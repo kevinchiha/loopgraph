@@ -459,6 +459,186 @@ def test_the_injected_pattern_survives_javascript():
     assert re.match(LOG_RE, "i2-r1-audit.log")
 
 
+# ---------- what a poll is allowed to touch ----------
+#
+# AC-14 is "a poll replaces no DOM node": text stays selected, an open pane stays
+# open, a scroll position survives. Half of that can only be seen in a browser, and
+# these tests do not pretend otherwise. What they hold is the structure underneath
+# it — the page is written so a poll path and a first-render path can be told apart
+# by reading the source, and every function that builds markup says so in its name.
+# What each test cannot see is written in its own docstring.
+
+DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
+
+
+def script_of(html):
+    """The dashboard's JavaScript: the document stripped off, and the comments too.
+
+    The rules below are about code. The page explains them in a comment that names
+    innerHTML, and saying what the rule is must not read as breaking it — the same
+    reason test_the_process_group_is_captured_before_the_pid_can_be_reused reads
+    _git_read_only with its comments cut out.
+    """
+    src = html.split("<script>", 1)[1].split("</script>", 1)[0]
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("//"))
+
+
+def regions(html):
+    """(name, start, end) per `function NAME(` in the script, each running to the next.
+
+    Not a JavaScript parser, and it does not need to be: this is exactly the
+    "nearest preceding declaration" rule the page is written to obey. An arrow or
+    a function expression that assigned innerHTML would be charged to whichever
+    declaration happens to sit above it, which is the hole
+    test_innerhtml_is_only_set_on_a_node_the_same_function_just_created closes
+    from the other side, by looking at what is assigned to rather than where.
+    """
+    src = script_of(html)
+    marks = [(m.start(), m.group(1)) for m in DECLARED.finditer(src)]
+    ends = [start for start, _ in marks[1:]] + [len(src)]
+    return src, [(name, start, end) for (start, name), end in zip(marks, ends)]
+
+
+def function_source(html, name):
+    src, regs = regions(html)
+    found = [src[s:e] for n, s, e in regs if n == name]
+    assert len(found) == 1, f"expected one `function {name}(`, found {len(found)}"
+    return found[0]
+
+
+def test_innerhtml_lives_only_in_build_functions():
+    """The naming contract the rest of the page is written against.
+
+    An assignment to innerHTML throws away every node under the element and makes
+    new ones, so a selection inside it dies, an open pane closes and a scroll
+    position resets. Doing that once, when the element is created, is how the page
+    is drawn; doing it every 2 seconds is the bug AC-14 names. The two are told
+    apart here by the name of the function they are in: `build…` runs once per
+    element, `patch…` runs on every poll and changes what is already there.
+
+    This proves nothing about how often a build function is called. It proves that
+    a poll path which redrew the board would have to be written under a name that
+    says it is not one.
+    """
+    src, regs = regions(ui.page_html())
+    assert [n for n, _, _ in regs if n.startswith("build")], "no builder owns the markup"
+    for i in (m.start() for m in re.finditer("innerHTML", src)):
+        owner = next((n for n, s, e in regs if s <= i < e), None)
+        assert owner and owner.startswith("build"), \
+            f"innerHTML belongs to {owner}, which is not a build… function"
+    for name, s, e in regs:
+        if name in ("runs", "poll") or name.startswith("patch"):
+            assert "innerHTML" not in src[s:e], f"{name} runs on every poll and assigns innerHTML"
+    assert "outerHTML" not in src, "outerHTML is innerHTML with the element thrown in"
+
+
+def test_innerhtml_is_only_set_on_a_node_the_same_function_just_created():
+    """The hole the naming rule leaves, closed from the other side.
+
+    `function buildBoard() { document.getElementById('board').innerHTML = ... }`
+    passes the name check and is exactly the redraw AC-14 forbids, once it is
+    called from a poll. So the target has to be a node the function made itself:
+    markup can be poured into an element that does not exist yet, never into one
+    the reader may have a selection in.
+    """
+    src, regs = regions(ui.page_html())
+    setter = re.compile(r"([A-Za-z_$][\w$]*)\.innerHTML\s*=")
+    assert len(setter.findall(src)) == src.count("innerHTML"), \
+        "an innerHTML that is not a plain `<name>.innerHTML =` assignment"
+    for name, s, e in regs:
+        body = src[s:e]
+        for target in setter.findall(body):
+            assert re.search(rf"\b{target}\s*=\s*document\.createElement\(", body), \
+                f"{name} sets innerHTML on {target}, which it did not create"
+
+
+def test_the_page_clears_children_but_never_swaps_them():
+    """replaceChildren() with no argument empties an element, which is what a pane
+    that has to start again needs. With arguments it is innerHTML by another name:
+    every node goes, including the one holding the reader's selection, and no
+    check on innerHTML would see it."""
+    src = script_of(ui.page_html())
+    assert src.count("replaceChildren()") == src.count("replaceChildren("), \
+        "replaceChildren(<nodes>) throws away what is already on the page"
+
+
+def test_the_intervals_are_unchanged():
+    """The saving comes from sending less per poll, not from polling less often."""
+    html = ui.page_html()
+    assert "setInterval(runs, 4000)" in html
+    assert "setInterval(poll, 2000)" in html
+
+
+def test_the_page_polls_log_slices():
+    html = ui.page_html()
+    assert "/api/log?" in html, "the page still asks for whole log files"
+    assert "offset=" in html
+
+
+def test_the_page_declares_the_names_the_later_panes_bind_to():
+    src = script_of(ui.page_html())
+    for name in ("buildRoundCard", "buildLogPane", "patchRounds", "patchOpenPanes"):
+        assert f"function {name}(" in src, f"{name} is the name other panes call"
+
+
+def test_only_an_open_pane_is_polled():
+    """AC-9: a collapsed pane sends no request. <details> carries `open` itself, so
+    the selector is the whole of the rule and there is no toggle state to drift."""
+    src = function_source(ui.page_html(), "patchOpenPanes")
+    assert "[open]" in src, "every pane is polled, collapsed or not"
+    assert "createElement('details')" in function_source(ui.page_html(), "buildLogPane")
+
+
+def test_the_page_replaces_a_pane_on_either_truncation_signal():
+    """AC-11's two signals, and the pane needs both.
+
+    A reply offset below the one sent means the stored offset was past the end of
+    the file. head_truncated turning true means append_log cut the head *below*
+    the stored offset — it keeps the last 500 KB of a 1 MB file — so the offset
+    still looks valid while every byte position behind it has moved, and no size
+    check can catch it. Either one on its own has to be enough to start again.
+    """
+    src = function_source(ui.page_html(), "patchOpenPanes")
+    line = next((ln for ln in src.splitlines()
+                 if "replaceChildren()" in ln and ln.strip().startswith("if (")), "")
+    assert line, "replaceChildren() in patchOpenPanes is not guarded by one if"
+    assert re.search(r"\.offset\s*<\s*offset", line), \
+        "the reply's offset is never compared with the one that was sent"
+    assert "head_truncated" in line, "the head-truncation signal does not restart the pane"
+    assert "||" in line, "the two signals are not each enough on their own"
+
+
+def test_a_pane_stores_the_byte_size_as_its_next_offset():
+    """`size` counts bytes and `text` is a decoded string. They differ on any log
+    holding a non-ASCII character — 24,847 against 24,778 on a real one on this
+    machine — and only `size` is an offset. Sending text.length back would ask for
+    a position inside a line and the reader would see part of it twice."""
+    src = function_source(ui.page_html(), "patchOpenPanes")
+    assert re.search(r"\.offset\s*=\s*d\.size\b", src), "the pane stores something else"
+    assert "text.length" not in script_of(ui.page_html()), "a character count used as an offset"
+
+
+def test_two_passes_cannot_append_the_same_bytes_twice():
+    """A pane's next offset is written only when its own reply lands. A second
+    pass starting before the first has finished — the 2-second interval on top of
+    the pass that opening a pane kicks off — reads the offset the first was still
+    working from, asks for the same bytes and appends them again, and the reader
+    watches the same lines arrive twice."""
+    src = function_source(ui.page_html(), "patchOpenPanes")
+    assert re.search(r"if \(\w+\) return;", src), "two passes can run at once"
+    assert "finally" in src, "the guard is never cleared if a pane's poll throws"
+
+
+def test_a_pane_follows_the_bottom_only_from_the_bottom():
+    """AC-13. Someone who scrolled up is reading; do not yank them back."""
+    src = function_source(ui.page_html(), "patchOpenPanes")
+    assert re.search(r"scrollHeight\s*-\s*\w+\.scrollTop\s*-\s*\w+\.clientHeight\s*<=\s*4", src), \
+        "no 4-pixel test of whether the reader was at the bottom"
+    line = next(ln for ln in src.splitlines() if "scrollTop =" in ln)
+    assert line.strip().startswith("if ("), "the pane scrolls to the bottom unconditionally"
+
+
 # ---------- the host repository behind a run's worktree ----------
 
 

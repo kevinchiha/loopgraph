@@ -2,8 +2,10 @@
 """lg ui — tiny local dashboard for watching loopgraph runs live.
 
 Stdlib HTTP server + the venv's temporalio. Left: runs (from Temporal, plus any
-run dir that has logs). Right: the selected run's stream logs, polled and
-auto-scrolled. If Temporal is down the page still tails log files.
+run dir that has logs). Right: the selected run's stream logs, one collapsed pane
+per round and role. An open pane asks for the bytes past the ones it already has
+every 2 seconds and appends them; a collapsed one asks for nothing. If Temporal
+is down the page still tails log files.
 
 Run: lg ui [--port 8400]  →  http://localhost:8400
 """
@@ -60,22 +62,43 @@ PAGE = """<!doctype html>
   .round { margin-bottom:22px; }
   .round > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px; color:var(--dim);
                 text-transform:uppercase; margin-bottom:8px; }
-  .panels { display:flex; gap:14px; align-items:stretch; }
+  .panels { display:flex; gap:14px; align-items:flex-start; }
   .panel { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:10px;
-           display:flex; flex-direction:column; overflow:hidden; }
-  .panel > header { padding:8px 14px; border-bottom:1px solid var(--line); font:700 11px/1.4 ui-monospace,monospace;
-                    letter-spacing:1px; text-transform:uppercase; }
-  .panel.exec > header { color:var(--accent); } .panel.audit > header { color:var(--purple); }
+           overflow:hidden; }
+  .panel > summary { padding:8px 14px; cursor:pointer; user-select:none;
+                     font:700 11px/1.4 ui-monospace,monospace; letter-spacing:1px; text-transform:uppercase; }
+  .panel[open] > summary { border-bottom:1px solid var(--line); }
+  .panel.exec > summary { color:var(--accent); } .panel.audit > summary { color:var(--purple); }
   .panel .body { padding:10px 14px; height:44vh; overflow-y:auto;
                  font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; word-break:break-word; }
   .body .t { color:var(--dim); } .body .tool { color:var(--purple); }
   .body .res { color:var(--dim); } .body .asst { color:var(--fg); }
-  @media (max-width:900px) { .panels { flex-direction:column; } #runs { width:240px; } }
+  /* Stacked, the cross axis is the width, so a collapsed pane must stretch to it
+     or it shrinks to the width of its own label. */
+  @media (max-width:900px) { .panels { flex-direction:column; align-items:stretch; }
+                             #runs { width:240px; } }
 </style></head><body>
 <header><b>loopgraph</b><span id="hdr">engine dashboard</span></header>
 <main><div id="runs"></div><div id="board"><div class="empty">select a run</div></div></main>
 <script>
+// Two kinds of function on this page, and the names are the contract.
+//
+//   build…  makes an element and pours markup into it, once, before anything is
+//           on screen. It is the only place innerHTML may appear, and the only
+//           element it may be set on is the one the function just created.
+//   patch…  runs on every poll. It changes text, attributes and classes, adds
+//           and removes children, and appends with insertAdjacentHTML. It never
+//           assigns innerHTML, because that would throw away every node under
+//           the element — including the one holding the reader's selection, and
+//           the open pane they were reading — and build them all again.
+//
+// tests/test_ui.py holds the rule. It cannot see a browser, so it checks the
+// shape: what the reader actually keeps is checked by hand.
 let sel = null;
+// Injected from activities/stream.py, so the page cannot drift from the writers.
+const LOG_RE = new RegExp(__LOG_RE__);
+// The role in the filename, and the word the reader sees for it.
+const ROLES = [['executor', 'executor'], ['audit', 'supervisor']];
 const pill = s => ({green:'green',running:'yellow',stopped:'red',failed:'red','merge-ready':'green',
   merged:'green',held:'gray',discarded:'gray',unknown:'gray'}[s]||'gray');
 const esc = t => t.replaceAll('&','&amp;').replaceAll('<','&lt;');
@@ -86,44 +109,136 @@ function colorize(t) {
     return l.replace(/^(\\[[0-9:]+) /, '<span class="t">$1</span> ');
   }).join('\\n');
 }
+function buildRunRow(r) {
+  const div = document.createElement('div');
+  div.className = 'run' + (sel === r.dir ? ' sel' : '');
+  div.innerHTML = `<div class="dir">${esc(r.dir)}</div><div class="meta">
+    <span class="pill ${pill(r.state)}">${esc(r.state)}</span><span>${esc(r.detail||'')}</span></div>`;
+  // The board is emptied here rather than in poll(), so a card from the run just
+  // left can never sit under the run just chosen, not even for one interval.
+  div.onclick = () => { sel = r.dir; document.getElementById('board').replaceChildren(); runs(); poll(); };
+  return div;
+}
+function buildRoundCard(key) {
+  const card = document.createElement('div');
+  card.className = 'round';
+  card.dataset.key = key;
+  card.innerHTML = '<h2></h2><div class="panels"></div>';
+  card.firstElementChild.textContent = key;  // a heading is text, never markup
+  return card;
+}
+function buildLogPane(dir, name, label) {
+  // <details> carries "open" itself and fires toggle, so there is no collapse
+  // state of ours to get out of step with what the reader can see.
+  const pane = document.createElement('details');
+  pane.className = 'panel ' + (label === 'executor' ? 'exec' : 'audit');
+  // Everything the pane needs to poll itself: which file, how far into it this
+  // pane has read, and whether the last reply said its head had been cut.
+  pane.dataset.dir = dir;
+  pane.dataset.name = name;
+  pane.dataset.offset = '0';
+  pane.dataset.cut = '';
+  pane.innerHTML = '<summary></summary><div class="body"></div>';
+  pane.firstElementChild.textContent = label;
+  pane.addEventListener('toggle', () => { if (pane.open) patchOpenPanes(); });
+  return pane;
+}
+function patchRounds(names) {
+  const board = document.getElementById('board');
+  const rounds = {};
+  for (const name of names) {
+    const m = name.match(LOG_RE);
+    if (!m) continue;
+    const key = m[1] ? `item ${m[1]} · round ${m[2]}` : `round ${m[2]}`;
+    (rounds[key] ||= {})[m[3]] = name;
+  }
+  const keys = Object.keys(rounds).sort().reverse();
+  const empty = board.querySelector('.empty');
+  if (!keys.length) {
+    if (empty) { empty.textContent = 'no logs yet for this run'; return; }
+    const line = document.createElement('div');
+    line.className = 'empty';
+    line.textContent = 'no logs yet for this run';
+    board.append(line);
+    return;
+  }
+  if (empty) empty.remove();
+  for (const key of keys) {
+    let card = [...board.children].find(c => c.dataset.key === key);
+    if (!card) {
+      card = buildRoundCard(key);
+      // Newest first, and inserted rather than re-sorted: the cards already on
+      // the board are in order, so putting each new one in front of the first
+      // older card moves nothing the reader is looking at.
+      board.insertBefore(card, [...board.children].find(c => c.dataset.key < key) || null);
+    }
+    const panels = card.lastElementChild;
+    for (const [role, label] of ROLES) {
+      const name = rounds[key][role];
+      if (name && ![...panels.children].some(p => p.dataset.name === name))
+        panels.append(buildLogPane(sel, name, label));
+    }
+  }
+}
+// A pane's next offset is only written when its own reply lands. A second pass
+// starting before the first has finished would read the offset the first pass
+// was still working from, ask for the same bytes and append them a second time,
+// and the reader would watch the same lines arrive twice.
+let panePoll = false;
+async function patchOpenPanes() {
+  if (panePoll) return;
+  panePoll = true;
+  try {
+    for (const pane of document.querySelectorAll('.panel[open]')) {
+      const body = pane.lastElementChild;
+      const offset = Number(pane.dataset.offset);
+      const cut = pane.dataset.cut === '1';
+      // Measured before anything lands: a reader sitting at the bottom is carried
+      // along, a reader who scrolled up to read is left exactly where they are.
+      const stick = body.scrollHeight - body.scrollTop - body.clientHeight <= 4;
+      let d;
+      try {
+        const r = await fetch('/api/log?dir=' + encodeURIComponent(pane.dataset.dir)
+          + '&name=' + encodeURIComponent(pane.dataset.name) + '&offset=' + offset);
+        if (!r.ok) continue;  // a file the run has not written yet
+        d = await r.json();
+      } catch (e) { continue; }  // one pane's bad poll is not the board's problem
+      // Two signals say "start again", and the pane needs both. A reply offset
+      // below the one sent means the stored offset was past the end of the file.
+      // head_truncated turning true means append_log cut the head BELOW the stored
+      // offset — it keeps the last 500 KB of a 1 MB file — so the offset still
+      // looks valid while every byte behind it has moved, and appending would
+      // splice the middle of one line onto the end of another.
+      if (d.offset < offset || (d.head_truncated && !cut)) body.replaceChildren();
+      // Appending adds nodes and touches none that exist, so a selection survives.
+      if (d.text) body.insertAdjacentHTML('beforeend', colorize(d.text));
+      // `size` counts bytes; `text` is those bytes decoded, and the two differ on
+      // any log holding a non-ASCII character. Only `size` is an offset.
+      pane.dataset.offset = d.size;
+      pane.dataset.cut = d.head_truncated ? '1' : '';
+      if (stick) body.scrollTop = body.scrollHeight;
+    }
+  } finally { panePoll = false; }
+}
 async function runs() {
   try {
     const d = await (await fetch('/api/runs')).json();
-    const el = document.getElementById('runs'); el.innerHTML = '';
-    for (const r of d.runs) {
-      const div = document.createElement('div');
-      div.className = 'run' + (sel === r.dir ? ' sel' : '');
-      div.innerHTML = `<div class="dir">${r.dir}</div><div class="meta">
-        <span class="pill ${pill(r.state)}">${r.state}</span><span>${r.detail||''}</span></div>`;
-      div.onclick = () => { sel = r.dir; runs(); poll(); };
-      el.appendChild(div);
-    }
+    const el = document.getElementById('runs');
+    // The run list is still rebuilt row by row. The log panes below it are not,
+    // and they are where the reader's selection and scroll position live.
+    el.replaceChildren();
+    for (const r of d.runs) el.append(buildRunRow(r));
     if (!sel && d.runs.length) { sel = d.runs[0].dir; poll(); }
     document.getElementById('hdr').textContent = d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only';
   } catch(e) { document.getElementById('hdr').textContent = 'server error'; }
 }
 async function poll() {
   if (!sel) return;
-  const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(sel))).json();
-  const LOG_RE = new RegExp(__LOG_RE__);
-  const rounds = {};
-  for (const [name, text] of Object.entries(d.logs)) {
-    // Pattern comes from activities/stream.py so it cannot drift from the writers.
-    const m = name.match(LOG_RE);
-    if (!m) continue;
-    const key = m[1] ? `item ${m[1]} · round ${m[2]}` : `round ${m[2]}`;
-    (rounds[key] ||= {})[m[3]] = text;
-  }
-  const board = document.getElementById('board');
-  const keys = Object.keys(rounds).sort().reverse();
-  board.innerHTML = keys.length ? keys.map(n => `
-    <div class="round"><h2>${n}</h2><div class="panels">
-      ${rounds[n].executor !== undefined ? `<div class="panel exec"><header>executor</header>
-        <div class="body" data-stick>${colorize(rounds[n].executor)}</div></div>` : ''}
-      ${rounds[n].audit !== undefined ? `<div class="panel audit"><header>supervisor</header>
-        <div class="body" data-stick>${colorize(rounds[n].audit)}</div></div>` : ''}
-    </div></div>`).join('') : '<div class="empty">no logs yet for this run</div>';
-  document.querySelectorAll('[data-stick]').forEach(el => el.scrollTop = el.scrollHeight);
+  try {
+    const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(sel))).json();
+    patchRounds(d.logs || []);
+  } catch(e) { /* the board keeps what it has until the next poll */ }
+  patchOpenPanes();
 }
 runs(); setInterval(runs, 4000); setInterval(poll, 2000);
 </script></body></html>"""
