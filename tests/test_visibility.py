@@ -1,4 +1,4 @@
-from activities.notify import build_card_text, build_keyboard, cb_key
+from activities.notify import build_card_text, build_keyboard, cb_key, location_line
 from activities.route import route_update, wf_from_card
 from activities.stream import append_log, summarize_tool
 
@@ -57,6 +57,24 @@ def test_keyboard_callback_data():
     row = kb["inline_keyboard"][0]
     assert row[0] == {"text": "A", "callback_data": "lg:run-x-123:A"}
     assert row[1]["callback_data"] == "lg:run-x-123:B"
+
+
+# --- where in a run a card speaks from ---
+
+def test_location_line_with_a_round():
+    assert location_line(2, 3, 2) == "item 2 of 3 · round 2"  # U+00B7 between
+
+
+def test_location_line_between_items():
+    assert location_line(2, 3) == "item 2 of 3"
+
+
+def test_a_card_whose_summary_starts_with_a_location_still_routes():
+    """The line goes in the summary, under the headers, so routing still reads
+    the id back out of the card."""
+    text = build_card_text("decision", "run-y-ab12cd", "runs/y",
+                           location_line(2, 3, 2) + "\n\nq", None, {"A": "yes"})
+    assert wf_from_card(text) == "run-y-ab12cd"
 
 
 # --- stream log ---

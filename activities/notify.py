@@ -40,6 +40,18 @@ def build_card_text(kind: str, wf_id: str, run_dir: str, summary: str,
     return "\n".join(lines)[:4000]  # telegram message cap is 4096
 
 
+def location_line(item_no: int, total: int, round_no: int | None = None) -> str:
+    """Where in a run a card speaks from, e.g. `item 2 of 3 · round 2`.
+
+    A multi-item run sends several cards that otherwise read alike, and the
+    owner cannot tell which item is asking. Cards sent between items or at the
+    end have no round to name, so they get the short form. The one place this
+    format lives, so every card reads the same.
+    """
+    where = f"item {item_no} of {total}"
+    return f"{where} · round {round_no}" if round_no is not None else where
+
+
 CB_ID_CAP = 48  # Telegram caps callback_data at 64 bytes; "lg::" plus a letter is 5
 
 
