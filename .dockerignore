@@ -1,0 +1,13 @@
+# The build context is tarred and sent to the Docker daemon. Without this it
+# included your credentials, the whole git history, the host venv and every run's
+# worktree checkout: slow, and secrets end up in build cache layers.
+.env
+.env.backup.*
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc
+runs/
+docs/
+tests/

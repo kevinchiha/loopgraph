@@ -138,14 +138,29 @@ async def merge(target_repo: str, base_branch: str, branch: str) -> dict:
 
 
 @activity.defn
-async def discard(target_repo: str, branch: str) -> dict:
-    """Delete the run's branch after the owner chooses C.
+async def discard(target_repo: str, branch: str, worktree: str = "") -> dict:
+    """Delete the run's branch and its worktree after the owner chooses C.
 
     "C — discard the run" used to delete nothing, so the label was a lie and the
-    commits stayed reachable. Uses -D, not -d: the whole point is that this work
-    was refused, so git refusing to drop unmerged commits is not helpful here."""
+    commits stayed reachable. The worktree has to go first: git refuses to delete
+    a branch that is checked out anywhere, so deleting the branch alone failed
+    with "used by worktree at ..." and the run stayed on disk regardless.
+
+    Uses -D, not -d. The whole point is that this work was refused, so git
+    declining to drop unmerged commits is not helpful here."""
+    removed = None
+    if worktree:
+        try:
+            await _git("worktree", "remove", "--force", worktree, cwd=target_repo)
+            removed = worktree
+        except RuntimeError:
+            pass  # already gone, or never created
+    try:
+        await _git("worktree", "prune", cwd=target_repo)
+    except RuntimeError:
+        pass
     try:
         await _git("branch", "-D", branch, cwd=target_repo)
-        return {"discarded": True, "branch": branch}
+        return {"discarded": True, "branch": branch, "worktree_removed": removed}
     except RuntimeError as e:
-        return {"discarded": False, "branch": branch, "reason": str(e)[:200]}
+        return {"discarded": False, "branch": branch, "reason": str(e)[:300]}

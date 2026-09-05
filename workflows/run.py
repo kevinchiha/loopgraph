@@ -354,7 +354,7 @@ class LoopGraphRun:
         if telegram:
             poll = asyncio.create_task(workflow.execute_activity(
                 wait_decision,
-                args=[wf_id, accept_text],
+                args=[wf_id, accept_text, sorted(options)],
                 start_to_close_timeout=timedelta(days=2),
                 heartbeat_timeout=timedelta(minutes=2),
                 retry_policy=RetryPolicy(maximum_attempts=100),  # durable indefinite wait
@@ -450,7 +450,7 @@ class LoopGraphRun:
         elif letter == "C":
             self._ledger["discard"] = await workflow.execute_activity(
                 discard,
-                args=[self._target_repo, result["branch"]],
+                args=[self._target_repo, result["branch"], result.get("worktree", "")],
                 start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )

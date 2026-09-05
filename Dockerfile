@@ -7,9 +7,14 @@ RUN npm install -g @anthropic-ai/claude-code
 
 WORKDIR /app
 COPY pyproject.toml ./
-# Deps installed from pyproject (no package build; source is volume-mounted).
-# pytest: gate commands run `python -m pytest` inside this container.
-RUN pip install --no-cache-dir temporalio pyyaml httpx pytest langgraph claude-agent-sdk
+# Install exactly what pyproject declares, version floors included. A second
+# hardcoded list here meant those floors were enforced nowhere in the container,
+# and the two drifted the moment a dependency was added. pytest is extra because
+# gate commands run `python -m pytest` inside this image.
+RUN python -c "\
+import tomllib, subprocess, sys; \
+deps = tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; \
+subprocess.check_call([sys.executable,'-m','pip','install','--no-cache-dir','pytest',*deps])"
 
 # The claude CLI refuses bypassPermissions as root, and the container writes into
 # your repos through a bind mount, so this user must share your host uid.

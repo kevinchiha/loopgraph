@@ -29,6 +29,7 @@ def parse_work_items(brief: str) -> list[str]:
     Items are usually a sentence or two, and a parser that silently cut them at
     the first line would hand the executor half an instruction."""
     items: list[str] = []
+    top_indent: int | None = None
     in_section = False
     for line in brief.splitlines():
         if HEADING.match(line):
@@ -40,7 +41,14 @@ def parse_work_items(brief: str) -> list[str]:
             break  # the next heading ends the list
         m = BULLET.match(line)
         if m:
-            items.append(m.group(1).strip())
+            indent = len(line) - len(line.lstrip())
+            if items and top_indent is not None and indent > top_indent:
+                # A sub-bullet detailing the item above it. Promoting it to its own
+                # work item handed the executor a fragment with no context.
+                items[-1] = f"{items[-1]} {line.strip()}"
+            else:
+                top_indent = indent if top_indent is None else min(top_indent, indent)
+                items.append(m.group(1).strip())
         elif not line.strip():
             continue  # blank lines inside a list mean nothing
         elif line[:1].isspace() and items:

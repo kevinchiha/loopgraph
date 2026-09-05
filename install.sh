@@ -43,6 +43,14 @@ need docker; need git; need python3
 [ -n "$MISSING" ] && die "missing:$MISSING — install those first, then re-run."
 docker compose version >/dev/null 2>&1 \
   || die "'docker compose' not available. Install the Compose v2 plugin."
+# This compose file uses long-form env_file entries (path:/required:), which
+# Compose only understands from 2.24. Older versions fail with a parse error that
+# says nothing about the version, so check it here instead.
+COMPOSE_V="$(docker compose version --short 2>/dev/null | tr -d 'v')"
+if [ -n "$COMPOSE_V" ]; then
+  printf '2.24\n%s\n' "$COMPOSE_V" | sort -V -C \
+    || die "Docker Compose $COMPOSE_V is too old; this needs 2.24 or newer (long-form env_file)."
+fi
 python3 - <<'PY' || die "python 3.13+ required for the host venv (the container brings its own)."
 import sys; sys.exit(0 if sys.version_info >= (3, 13) else 1)
 PY
@@ -332,4 +340,6 @@ cat <<EOF
   lg start runs/example-hello /projects/loopgraph-example
 EOF
 echo "  Cards land in $BOT_NAME on Telegram. From a terminal: lg approve <workflow-id> A"
-echo "  Dashboard: http://localhost:8400   Temporal: http://localhost:8233"
+echo "  Watch a run: lg ui   (dashboard on http://localhost:8400; it is not a"
+echo "               compose service, so nothing has started it yet)"
+echo "  Temporal's own UI: http://localhost:8233"

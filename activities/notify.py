@@ -57,29 +57,39 @@ def build_keyboard(wf_id: str, options: dict[str, str]) -> dict:
     ]]}
 
 
-def extract_reply(updates: list[dict], wf_id: str, chat_id: str) -> tuple[str, str, str | None] | None:
+def extract_reply(updates: list[dict], wf_id: str, chat_id: str,
+                  allowed: set[str] | None = None) -> tuple[str, str, str | None, int] | None:
     """Find the owner's reply: a button tap on THIS run's card, or a free-text
     message from the owner chat (answers a supervisor `ask` card).
-    Returns (kind, value, callback_id). A tap is always a deliberate answer to
-    the current card, so buttons win over stray text within a batch; free text
-    from any other chat, and /commands, are ignored."""
+
+    Returns (kind, value, callback_id, update_id). A tap is always a deliberate
+    answer, so buttons win over stray text within a batch; free text from any
+    other chat, and /commands, are ignored.
+
+    `allowed` is the set of letters the CURRENT card offers. Without it, a tap on
+    an older card of the same run — still sitting in the chat, still tappable —
+    answered whatever card happened to be waiting. The update_id lets the caller
+    confirm exactly what it consumed and nothing more.
+    """
     prefix = f"lg:{cb_key(wf_id)}:"
     for u in updates:
         cb = u.get("callback_query")
         if cb and str(cb.get("data", "")).startswith(prefix):
             letter = cb["data"][len(prefix):][:1].upper()
-            if letter:
-                return ("button", letter, cb["id"])
+            if letter and (allowed is None or letter in allowed):
+                return ("button", letter, cb["id"], u["update_id"])
     for u in updates:
         m = u.get("message")
         if (m and m.get("text") and not m["text"].startswith("/")
                 and str(m.get("chat", {}).get("id")) == str(chat_id)):
-            return ("text", m["text"][:2000], None)
+            return ("text", m["text"][:2000], None, u["update_id"])
     return None
 
 
 def configured() -> bool:
-    """Telegram is optional. Without it a run is answered with `lg approve`."""
+    """Whether cards can be sent. Required: worker.py refuses to start without it,
+    because a run stops and asks questions and one nobody is told about just waits.
+    `lg approve` answers a waiting run from a terminal, but cannot announce one."""
     return bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
 
 
@@ -88,9 +98,9 @@ def _creds() -> tuple[str, str]:
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set. Either point "
-            "LOOPGRAPH_TELEGRAM_ENV at a credentials file (see .env.example) or "
-            "answer runs with `lg approve <workflow-id> <letter>`.")
+            "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set. Point "
+            "LOOPGRAPH_TELEGRAM_ENV at a credentials file (see .env.example); "
+            "./install.sh sets this up.")
     return token, chat
 
 
@@ -146,15 +156,21 @@ async def poll_reply(wf_id: str) -> dict:
         updates = r.json().get("result", [])
         if not updates:
             return {}
-        # Acknowledge everything we just read, so the next poll starts clean.
+        hit = extract_reply(updates, wf_id, chat)
+        # Confirm only up to what was actually used. Acknowledging everything read
+        # while returning at most one deleted the rest: a second owner message, or
+        # a tap still waiting for another card, was silently destroyed.
+        through = hit[3] if hit else None
+        if through is None:
+            return {}
         await client.post(f"{API}/bot{token}/getUpdates",
-                          json={"timeout": 0, "offset": updates[-1]["update_id"] + 1})
-    hit = extract_reply(updates, wf_id, chat)
-    return {"kind": hit[0], "value": hit[1]} if hit else {}
+                          json={"timeout": 0, "offset": through + 1})
+    return {"kind": hit[0], "value": hit[1]}
 
 
 @activity.defn
-async def wait_decision(wf_id: str, accept_text: bool = True) -> dict:
+async def wait_decision(wf_id: str, accept_text: bool = True,
+                        options: list[str] | None = None) -> dict:
     """Long-poll getUpdates until the owner taps a button (or replies by text, if allowed).
 
     Starts from the current high-water mark: backlog messages (anything sent
@@ -183,9 +199,10 @@ async def wait_decision(wf_id: str, accept_text: bool = True) -> dict:
                 offset = max(offset, u["update_id"] + 1)
             if activity.in_activity():
                 activity.heartbeat(f"polling, {len(updates)} updates")
-            hit = extract_reply(updates, wf_id, chat)
+            hit = extract_reply(updates, wf_id, chat,
+                                None if accept_text else set(options or []))
             if accept_hit(hit, accept_text):
-                kind, value, cb_id = hit
+                kind, value, cb_id, _ = hit
                 if cb_id:
                     await client.post(f"{API}/bot{token}/answerCallbackQuery",
                                       json={"callback_query_id": cb_id, "text": f"{value} recorded"})

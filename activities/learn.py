@@ -9,6 +9,7 @@ block the run. append_constraint is pure file logic and tested.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from temporalio import activity
@@ -17,22 +18,43 @@ CONSTRAINT_CAP = 50    # lines kept in constraints.md
 LINE_CAP = 200         # chars per constraint
 
 
+# "Here is the constraint:", "The lesson is:" and friends. A line that is only a
+# lead-in is never the constraint itself.
+_PREAMBLE = re.compile(
+    r"^(here('s| is)|the (constraint|lesson|rule)|based on|i would|sure[,!.]|okay[,!.])\b.*:\s*$",
+    re.IGNORECASE)
+
+
 def append_constraint(path: str, line: str, cap: int = CONSTRAINT_CAP) -> list[str]:
     line = " ".join(line.split())[:LINE_CAP]
     p = Path(path)
     lines = p.read_text().splitlines() if p.exists() else []
     lines = [l for l in lines if l.strip()]
-    lines.append(f"- {line.lstrip('- ')}")
+    # removeprefix, not lstrip: lstrip strips a CHARACTER SET, so a constraint
+    # that starts with a command-line flag ("--no-cache is required here") lost
+    # its dashes and its meaning before being written as a binding rule.
+    lines.append(f"- {line.removeprefix('- ')}")
     kept = lines[-cap:]
     p.write_text("\n".join(kept) + "\n")
     return kept
 
 
 def clean_distilled(text: str) -> str | None:
-    line = " ".join(text.strip().splitlines()[0].split()) if text.strip() else ""
-    if not line or line.upper() == "NONE" or len(line) < 12:
-        return None
-    return line[:LINE_CAP]
+    """The one constraint sentence out of the model's reply, or None.
+
+    Taking the first line meant any preamble the model wrote ("Here is the
+    constraint:") became the stored rule while the real lesson was thrown away,
+    and the 12-character floor was far too low to catch it. Take the last
+    substantial line instead: a preamble comes first, the answer comes last.
+    """
+    lines = [" ".join(l.split()) for l in text.strip().splitlines()]
+    lines = [l for l in lines if l and not l.startswith(("```", "#"))]
+    for line in reversed(lines):
+        if line.upper().rstrip(".") == "NONE":
+            return None
+        if len(line) >= 12 and not _PREAMBLE.match(line):
+            return line[:LINE_CAP]
+    return None
 
 
 async def distil_constraint(brief: str, claims: list[str], reasons: list[str]) -> str | None:

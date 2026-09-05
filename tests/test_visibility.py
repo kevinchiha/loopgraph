@@ -6,12 +6,12 @@ from activities.stream import append_log, summarize_tool
 
 def test_extract_reply_button():
     updates = [{"update_id": 1, "callback_query": {"id": "cb1", "data": "lg:run-x:A"}}]
-    assert extract_reply(updates, "run-x", "42") == ("button", "A", "cb1")
+    assert extract_reply(updates, "run-x", "42") == ("button", "A", "cb1", 1)
 
 
 def test_extract_reply_free_text_from_owner_chat():
     updates = [{"update_id": 1, "message": {"text": "yes, use postgres", "chat": {"id": 42}}}]
-    assert extract_reply(updates, "run-x", "42") == ("text", "yes, use postgres", None)
+    assert extract_reply(updates, "run-x", "42") == ("text", "yes, use postgres", None, 1)
 
 
 def test_extract_reply_ignores_other_chats_and_commands():
@@ -27,12 +27,12 @@ def test_extract_reply_button_beats_text():
         {"update_id": 1, "message": {"text": "hello", "chat": {"id": 42}}},
         {"update_id": 2, "callback_query": {"id": "cb9", "data": "lg:run-x:B"}},
     ]
-    assert extract_reply(updates, "run-x", "42") == ("button", "B", "cb9")
+    assert extract_reply(updates, "run-x", "42") == ("button", "B", "cb9", 2)
 
 
 def test_accept_hit_stray_text_never_decides_merge():
-    text_hit = ("text", "Blue", None)
-    btn_hit = ("button", "A", "cb1")
+    text_hit = ("text", "Blue", None, 1)
+    btn_hit = ("button", "A", "cb1", 2)
     assert accept_hit(text_hit, accept_text=True)
     assert not accept_hit(text_hit, accept_text=False)   # merge cards ignore free text
     assert accept_hit(btn_hit, accept_text=False)

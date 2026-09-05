@@ -1,0 +1,2 @@
+- Add each CLI flag in cli.py mirroring --version: independent `if` block printing the exact literal, plus a subprocess-based test in test_cli.py styled on test_version.
+- In cli.py, give each flag its own independent `if args.<flag>:` block — never elif or shared branches — so flags compose and print only their own line.

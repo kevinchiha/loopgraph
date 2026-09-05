@@ -499,3 +499,110 @@ def test_a_timed_out_gate_tells_the_executor_something_useful():
     assert "timeout after 1800s" in correction, "the only diagnostic a timeout has"
     assert "npm run build" in correction, "which gate, and what it ran"
     assert "optimized production build" in correction, "what it managed to print"
+
+
+def test_discard_removes_the_worktree_that_holds_the_branch(tmp_path):
+    """The failure this pins, found by running it: git refuses to delete a branch
+    that is checked out anywhere, and the run's own worktree still had it, so
+    "C — discard" reported failure and left the branch and the worktree on disk."""
+    from activities.checkpoint import discard
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "a.py").write_text("x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", "-b", "lg-run-ab12", str(wt))
+    assert wt.exists()
+
+    r = asyncio.run(discard(str(repo), "lg-run-ab12", str(wt)))
+    assert r["discarded"] is True, r
+    assert not wt.exists(), "the worktree is still on disk"
+    branches = subprocess.run(["git", "branch"], cwd=repo, capture_output=True,
+                              text=True).stdout
+    assert "lg-run-ab12" not in branches
+
+
+# ---------- taps land on the card that is actually up ----------
+
+def test_a_tap_on_an_old_card_does_not_answer_the_current_one():
+    """The failure: an earlier card is still sitting in the chat and still
+    tappable, and any tap for the run was accepted, so a letter that is not even
+    on the current card decided it."""
+    from activities.notify import cb_key, extract_reply
+    wf = "run-demo-ab12cd"
+    updates = [{"update_id": 7,
+                "callback_query": {"id": "cb1", "data": f"lg:{cb_key(wf)}:D"}}]
+    assert extract_reply(updates, wf, "42", allowed={"A", "B", "C"}) is None
+    assert extract_reply(updates, wf, "42", allowed={"D", "E"})[1] == "D"
+
+
+def test_a_reply_carries_the_update_it_came_from():
+    """poll_reply must confirm exactly what it consumed. Acknowledging everything
+    it read while returning one answer destroyed the rest."""
+    from activities.notify import extract_reply
+    updates = [
+        {"update_id": 11, "message": {"text": "first", "chat": {"id": 42}}},
+        {"update_id": 12, "message": {"text": "second", "chat": {"id": 42}}},
+    ]
+    hit = extract_reply(updates, "run-x", "42")
+    assert hit[1] == "first" and hit[3] == 11, "confirming past 11 would drop 'second'"
+
+
+# ---------- sub-bullets belong to their item ----------
+
+def test_a_sub_bullet_stays_with_its_parent_item():
+    """The failure: an indented sub-bullet was promoted to its own work item, so
+    the executor got a fragment with no context and the run did an extra round on
+    a detail of the item above it."""
+    from activities.items import parse_work_items
+    brief = ("## Work items\n\n"
+             "- Redesign the settings page\n"
+             "  - keep the existing save behaviour\n"
+             "- Redesign the profile page\n")
+    items = parse_work_items(brief)
+    assert len(items) == 2, items
+    assert "keep the existing save behaviour" in items[0]
+
+
+# ---------- lg's exit code has to mean something ----------
+
+def _lg():
+    """`lg` has no .py extension, so it loads by path."""
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    loader = SourceFileLoader("lg_cli_fixes", str(ROOT / "lg"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("lg_cli_fixes", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("merged", 0), ("held", 0), ("discarded", 0), ("merge-ready", 0),
+    ("stopped", 1), ("merge-failed", 1),
+])
+def test_lg_start_exit_code(status, expected):
+    """The failure: it treated merge-ready as the only success, but the workflow
+    always overwrites that before returning, so every finished run, including a
+    clean merge, reported failure to whatever was scripting it. Non-zero now means
+    the engine could not finish, not that the owner said no."""
+    assert _lg().exit_code_for(status) == expected
+
+
+# ---------- .env has to mean the same thing to lg and to compose ----------
+
+@pytest.mark.parametrize("line,key,value", [
+    ('LOOPGRAPH_PROJECTS_DIR="/srv/code"', "LOOPGRAPH_PROJECTS_DIR", "/srv/code"),
+    ("LOOPGRAPH_DOCKER='sudo docker'", "LOOPGRAPH_DOCKER", "sudo docker"),
+    ("export LOOPGRAPH_UID=1001", "LOOPGRAPH_UID", "1001"),
+    ("ANTHROPIC_MODEL=claude-opus-5  # the dated id", "ANTHROPIC_MODEL", "claude-opus-5"),
+])
+def test_lg_reads_env_the_way_compose_does(tmp_path, monkeypatch, line, key, value):
+    """The failure: lg kept quotes, inline comments and the `export` keyword while
+    compose strips them, so the same file gave lg a different value than the
+    container got, and `lg where` handed the skill an unusable path."""
+    lg = _lg()
+    (tmp_path / ".env").write_text(line + "\n")
+    monkeypatch.setattr(lg, "ROOT", str(tmp_path))
+    assert lg._dotenv()[key] == value

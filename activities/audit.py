@@ -89,6 +89,14 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
             f"  output:\n```\n{tail[-1500:] or '(no output)'}\n```"
         )
     gates = "\n".join(gate_blocks) or "(no gates)"
+    violation = ""
+    if round_result.get("self_committed"):
+        violation = ("\n\n# Executor red line broken (engine check)\n\n"
+                     "This executor committed its own work, which its contract "
+                     "forbids. The engine put the changes back in the working tree "
+                     "so this round could be judged at all. Treat it as a signal "
+                     "about how closely the rest of the contract was followed, and "
+                     "check the claims harder than usual.")
     invented, undeclared = declared_vs_actual(round_result)
     mismatch = ""
     if invented or undeclared:
@@ -102,7 +110,7 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
         f"{contract}\n\n# Feature brief\n\n{brief.strip()}\n\n"
         f"# Constraints (binding)\n\n{constraints.strip() or '(none)'}\n\n"
         f"# Executor claims\n\n{claims}\n\n"
-        f"# Write set (from git status)\n\n{files}{mismatch}\n\n"
+        f"# Write set (from git status)\n\n{files}{mismatch}{violation}\n\n"
         f"# Gate results\n\n{gates}\n\n"
         f"# Unified diff (capped at {DIFF_CAP} chars)\n\n```diff\n{diff}{truncated}\n```\n\n"
         f"# Worktree (read-only spot checks)\n\n{round_result.get('worktree', '')}\n"

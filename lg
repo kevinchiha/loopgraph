@@ -31,9 +31,19 @@ def _dotenv() -> dict[str, str]:
     with open(path) as fh:
         for line in fh:
             line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                out[k.strip()] = v.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().removeprefix("export ").strip()
+            v = v.strip()
+            # Match what compose does with the same file, or `lg where` hands the
+            # skill a path with quotes still on it while the container gets the
+            # real one, and the mismatch is horrible to track down.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            elif " #" in v:
+                v = v.split(" #", 1)[0].strip()
+            out[k] = v
     return out
 
 
@@ -53,10 +63,19 @@ async def cmd_gate(args: argparse.Namespace) -> int:
     print(f"workflow {wf_id} started")
     try:
         result = await handle.result()
-    except Exception:
-        status = await handle.query("status")
+    except Exception as e:
+        try:
+            status = await handle.query("status")
+        except Exception:  # the workflow died before it recorded anything
+            print(f"FAILED: {e}", file=sys.stderr)
+            return 1
         print(json.dumps(status, indent=2))
-        print(f"BLOCKED: red gates -> {', '.join(status['red'])}", file=sys.stderr)
+        # Only say "red gates" when gates actually went red. Saying it for every
+        # failure named zero gates and hid whatever really went wrong.
+        if status.get("red"):
+            print(f"BLOCKED: red gates -> {', '.join(status['red'])}", file=sys.stderr)
+        else:
+            print(f"FAILED (no gate went red): {e}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))
     return 0
@@ -96,6 +115,17 @@ def _container(path: str) -> str:
     return "/app/" + path if path.startswith("runs/") else path
 
 
+# The engine could not finish. NOT the same as the owner saying no: the workflow
+# overwrites "merge-ready" with the owner's answer before it returns, so treating
+# that one status as the only success meant every finished run, including a clean
+# merge, reported failure to whatever was scripting it.
+FAILED_STATES = ("stopped", "merge-failed")
+
+
+def exit_code_for(status: str) -> int:
+    return 1 if status in FAILED_STATES else 0
+
+
 async def cmd_start(args: argparse.Namespace) -> int:
     client = await _client()
     run_dir = _container(args.run_dir)
@@ -110,7 +140,7 @@ async def cmd_start(args: argparse.Namespace) -> int:
     print(f"workflow {wf_id} started", flush=True)
     ledger = await handle.result()
     print(json.dumps(ledger, indent=2))
-    return 0 if ledger["status"] == "merge-ready" else 1
+    return exit_code_for(ledger.get("status", ""))
 
 
 async def cmd_prompt(args: argparse.Namespace) -> int:
