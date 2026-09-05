@@ -140,11 +140,11 @@ def test_one_failed_send_does_not_replay_the_whole_batch():
 
 def test_a_signal_that_cannot_be_delivered_tells_the_owner():
     """A typed answer has no toast, so without this the reply vanished leaving
-    only a line in a container log."""
+    only a line in a container log. It says why, not just that it failed."""
     http, client = FakeHttp([[typed()]]), FakeClient(explode=True)
     run_pump(http, client)
     said = [c[1]["text"] for c in http.calls if c[0] == "sendMessage"]
-    assert said and "could not deliver" in said[0]
+    assert said and "that run already finished" in said[0]
 
 
 def test_an_update_with_no_id_does_not_wedge_the_pump():
@@ -200,3 +200,16 @@ def test_no_open_runs_still_says_no_open_runs():
     run_pump(http, client)
     said = [c[1]["text"] for c in http.calls if c[0] == "sendMessage"]
     assert said and "no run is waiting" in said[0]
+
+
+def test_a_second_tap_says_the_run_finished():
+    """A button stays tappable after the run it decided has ended. The old toast,
+    "that run is not accepting answers", read like a broken engine."""
+    err = "workflow execution already completed"
+    assert dispatcher.explain_signal_failure(err, "discarded") == "that run already finished (discarded)"
+    assert dispatcher.explain_signal_failure(err, None) == "that run already finished"
+
+
+def test_other_signal_failures_ask_for_a_retry():
+    note = dispatcher.explain_signal_failure("connection refused", None)
+    assert "try again" in note and "finished" not in note

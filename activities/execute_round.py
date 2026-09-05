@@ -22,6 +22,7 @@ from pathlib import Path
 from temporalio import activity
 
 from activities.gate import _run_one, load_gates
+from activities.owner import read_answers
 from activities.stream import log_name, stream_query
 from graphs.round_graph import run_round
 
@@ -38,12 +39,17 @@ _OUTPUT_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 
 # ---------- pure helpers (tested without Claude) ----------
 
-def assemble_prompt(brief: str, constraints: str, work_item: str, directive: str | None = None) -> str:
+def assemble_prompt(brief: str, constraints: str, work_item: str, directive: str | None = None,
+                    owner_answers: str = "") -> str:
     contract = (PROMPTS / "executor.md").read_text()
     d = f"\n\n# Supervisor directive (binding — this unit only)\n\n{directive.strip()}\n" if directive else ""
     return (
         f"{contract}\n\n# Feature brief\n\n{brief.strip()}\n\n"
         f"# Constraints (learned — binding)\n\n{constraints.strip() or '(none yet)'}\n\n"
+        # Quote these rather than reconstructing them: a directive carries a
+        # button tap as the bare letter, and an executor guessing what the
+        # letter meant is an executor making the owner's answer up.
+        f"# Owner answers (recorded by the engine)\n\n{owner_answers.strip() or '(none)'}\n\n"
         f"# Work item for this round\n\n{work_item.strip()}\n{d}"
     )
 
@@ -204,7 +210,8 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
     run = Path(run_dir)
     brief = (run / "brief.md").read_text()
     constraints = (run / "constraints.md").read_text() if (run / "constraints.md").exists() else ""
-    prompt = assemble_prompt(brief, constraints, work_item or brief, directive)
+    prompt = assemble_prompt(brief, constraints, work_item or brief, directive,
+                             read_answers(run_dir))
 
     token = run_token or "run"
     worktree = str(run / "worktrees" / token)

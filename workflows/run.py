@@ -21,6 +21,7 @@ with workflow.unsafe.imports_passed_through():
     from activities.items import load_work_items
     from activities.learn import learn
     from activities.notify import send_card, telegram_configured
+    from activities.owner import record_owner_answer
 
 
 @workflow.defn
@@ -77,6 +78,21 @@ class RoundRun:
 
 
 MAX_ROUNDS = 3  # initial round + 2 supervisor redos: cap-3 doctrine, then escalate
+MAX_ASKS = 3    # owner questions per item. Separate budget, see budget_spent.
+
+
+def budget_spent(spent: int, asks: int) -> str | None:
+    """Why this item must stop, or None to carry on.
+
+    Questions and corrections have separate budgets. A question is the engine
+    waiting on the owner, not a failed attempt, and charging it as a round meant
+    three questions consumed the whole correction budget: the first live `ask`
+    run asked the same thing three times and parked with nothing committed."""
+    if asks >= MAX_ASKS:
+        return "owner-question cap reached"
+    if spent >= MAX_ROUNDS:
+        return "redo cap reached"
+    return None
 
 
 def build_merge_summary(summary: str, total: int, parked: list[dict]) -> str:
@@ -193,7 +209,15 @@ class LoopGraphRun:
         carries on to the next item), or halt (the supervisor said stop, which is
         the one verdict that ends the whole run)."""
         directive = carried
-        for round_no in range(1, MAX_ROUNDS + 1):
+        spent = 0       # executor passes charged to the correction budget
+        asks = 0        # owner questions, which are not charged to it
+        round_no = 0    # every pass, for the ledger and the log file names
+        answered = False  # this pass carries an owner answer, so it is not a redo
+        while True:
+            round_no += 1
+            if not answered:
+                spent += 1
+            answered = False
             result = await workflow.execute_activity(
                 execute_round,
                 args=[run_dir, target_repo, work_item, round_no, directive, item_no,
@@ -270,23 +294,40 @@ class LoopGraphRun:
                 return {"status": "parked",
                         "reason": f"supervisor asked to replan: {'; '.join(verdict['reasons'])[:300]}"}
             if verdict["verdict"] == "ask":
+                if asks >= MAX_ASKS:
+                    return {"status": "parked", "reason": "owner-question cap reached"}
+                asks += 1
                 d = verdict["directive"]
                 question = d.get("action", "Supervisor needs an owner decision")
-                reply = await self._ask_owner(run_dir, question, verdict.get("options") or {})
+                options = verdict.get("options") or {}
+                reply = await self._ask_owner(run_dir, question, options)
                 entry["owner_question"] = question
                 entry["owner_reply"] = reply
+                # Write it where the AUDITOR can read it. The supervisor never sees
+                # the executor's transcript or its directive, so an answer that went
+                # only into the directive left every owner-authorised value looking
+                # invented, and the same question came back every round.
+                await workflow.execute_activity(
+                    record_owner_answer,
+                    args=[run_dir, question, reply, options, item_no, round_no],
+                    start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
                 directive = (
                     f"Context: {d.get('context', '')}\n"
                     f"Owner was asked: {question}\nOwner replied: {reply}\n"
                     f"Verify: {d.get('verify', '')}\nStop: {d.get('stop', '')}"
                 )
+                answered = True
                 continue
+            over = budget_spent(spent, asks)
+            if over:
+                return {"status": "parked", "reason": over}
             d = verdict["directive"]
             directive = (
                 f"Context: {d.get('context', '')}\nAction: {d.get('action', '')}\n"
                 f"Verify: {d.get('verify', '')}\nStop: {d.get('stop', '')}"
             )
-        return {"status": "parked", "reason": "redo cap reached"}
 
     @workflow.signal
     def decide(self, value: str) -> None:

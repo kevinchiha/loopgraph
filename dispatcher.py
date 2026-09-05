@@ -26,6 +26,7 @@ from activities.notify import configured
 from activities.route import route_update
 
 API = "https://api.telegram.org"
+COMPLETED = "already completed"
 OPEN_RUNS = 'WorkflowType = "LoopGraphRun" AND ExecutionStatus = "Running"'
 
 
@@ -46,6 +47,29 @@ async def deliver(client: Client, hit: dict) -> str:
     handle = client.get_workflow_handle(hit["wf_id"])
     await handle.signal("decide", hit["value"])
     return f"{hit['value'][:40]} -> {hit['wf_id']}"
+
+
+def explain_signal_failure(error: str, status: str | None) -> str:
+    """The toast for an answer that could not be delivered.
+
+    "that run is not accepting answers" reads like a broken engine. The usual
+    cause is a second tap on a card whose run finished on the first one: a button
+    stays tappable forever, and Telegram gives no sign the card is spent. Say the
+    run is over, and how it ended, so the owner knows their first tap worked."""
+    if COMPLETED in error:
+        return f"that run already finished ({status})" if status else "that run already finished"
+    return "could not reach that run just now, try again"
+
+
+async def final_status(client: Client, wf_id: str) -> str | None:
+    """How a finished run ended, for the toast. Best effort: querying a workflow
+    whose history predates a code change raises, and a clearer message is not
+    worth turning into a second failure."""
+    try:
+        ledger = await client.get_workflow_handle(wf_id).query("ledger")
+        return str(ledger.get("status") or "") or None
+    except Exception:
+        return None
 
 
 async def pump(client: Client, http: httpx.AsyncClient, token: str, chat: str,
@@ -97,16 +121,17 @@ async def handle(client: Client, http: httpx.AsyncClient, token: str, chat: str,
         problem = None
     except Exception as e:
         print(f"dispatcher: could not signal {hit['wf_id']}: {e}", flush=True)
-        note, problem = "that run is not accepting answers", str(e)[:200]
+        problem = str(e)[:200]
+        note = explain_signal_failure(problem, await final_status(client, hit["wf_id"]))
     if hit.get("callback_id"):
         await http.post(f"{API}/bot{token}/answerCallbackQuery",
                         json={"callback_query_id": hit["callback_id"], "text": note})
     elif problem:
         # A typed answer has no toast, so without this the owner's reply would
         # vanish leaving only a line in a container log.
+        # The raw exception stays in the log. The owner gets the reason.
         await http.post(f"{API}/bot{token}/sendMessage",
-                        json={"chat_id": chat,
-                              "text": f"loopgraph: could not deliver that answer: {problem}"})
+                        json={"chat_id": chat, "text": f"loopgraph: {note}"})
 
 
 async def main() -> None:

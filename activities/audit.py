@@ -1,7 +1,7 @@
 """Supervisor activity: clean-context audit, read-only tools, verdict packet.
 
-Never sees the executor's transcript — only the brief, constraints, claims,
-write set, diff, and gate results. Gate re-runs happen in CODE (checkpoint.py),
+Never sees the executor's transcript — only the brief, constraints, any answers
+the owner gave, claims, write set, diff, and gate results. Gate re-runs happen in CODE (checkpoint.py),
 never by the model. Read/Glob/Grep only: the auditor cannot modify anything.
 
 Pure parsing helpers are tested without Claude; the SDK call is thin.
@@ -15,6 +15,7 @@ from pathlib import Path
 from temporalio import activity
 
 from activities.execute_round import _git, parse_final_json
+from activities.owner import read_answers
 from activities.stream import log_name, stream_query
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
@@ -71,7 +72,8 @@ def declared_vs_actual(round_result: dict) -> tuple[list[str], list[str]]:
     return sorted(declared - actual), sorted(actual - declared)
 
 
-def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str) -> str:
+def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str,
+                          owner_answers: str = "") -> str:
     contract = (PROMPTS / "supervisor.md").read_text()
     claims = "\n".join(f"- {flatten_claim(c)}" for c in round_result.get("claims", [])) or "(no claims)"
     # Flattened for the same reason as claims: a path can contain a newline, and
@@ -111,6 +113,12 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
     return (
         f"{contract}\n\n# Feature brief\n\n{brief.strip()}\n\n"
         f"# Constraints (binding)\n\n{constraints.strip() or '(none)'}\n\n"
+        # The owner's own words, written by the engine when they answered a card.
+        # Without this the auditor had no way to tell an owner-authorised value
+        # from one the executor invented, so it re-asked the same question every
+        # round until the cap and the run died with nothing committed.
+        f"# Owner answers (recorded by the engine, never by the executor)\n\n"
+        f"{owner_answers.strip() or '(none)'}\n\n"
         f"# Executor claims\n\n{claims}\n\n"
         f"# Write set (from git status)\n\n{files}{mismatch}{violation}\n\n"
         f"# Gate results\n\n{gates}\n\n"
@@ -187,7 +195,8 @@ async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: in
     constraints = (run / "constraints.md").read_text() if (run / "constraints.md").exists() else ""
     worktree = round_result["worktree"]
     diff = (await diff_including_new_files(worktree))[:DIFF_CAP]
-    prompt = assemble_audit_prompt(brief, constraints, round_result, diff)
+    prompt = assemble_audit_prompt(brief, constraints, round_result, diff,
+                                   read_answers(run_dir))
     verdict = await run_supervisor(prompt, worktree, str(run / "logs" / log_name(item_no, round_no, "audit")))
     verdict["diff_chars"] = len(diff)
     return verdict
