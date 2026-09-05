@@ -18,7 +18,9 @@ activity is idempotent (it only reads files and runs check commands).
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import signal
 from pathlib import Path
 
 import yaml
@@ -28,6 +30,18 @@ DEFAULT_TIMEOUT = 600
 OUTPUT_TAIL = 4000  # chars kept per gate, ledger stays bounded
 
 _GREEN_RE = re.compile(r"^exit (\d+)$")
+
+
+def _kill_group(proc) -> None:
+    """Kill the gate and everything it started. proc.kill() signals only the
+    shell, so a build's child processes survived the timeout and kept running."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 def load_gates(gates_path: str) -> list[dict]:
@@ -46,35 +60,64 @@ def load_gates(gates_path: str) -> list[dict]:
     return entries
 
 
+async def _drain(stream, keep: int) -> bytearray:
+    """Read a gate's output keeping only the last `keep` bytes.
+
+    Buffering the whole thing grew the worker's heap without bound: a gate that
+    prints continuously (a watch mode, a chatty build) would eventually take the
+    worker down, and only the tail is ever used anyway."""
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return buf
+        buf.extend(chunk)
+        if len(buf) > keep * 2:
+            del buf[:-keep]
+
+
 async def _run_one(gate: dict, workdir: str, heartbeat=None) -> dict:
     proc = await asyncio.create_subprocess_shell(
         gate["cmd"],
         cwd=workdir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        # Own process group, so a timeout can kill what the gate forked. Killing
+        # the shell alone left `npm run build`'s children running after the gate
+        # was declared timed out.
+        start_new_session=True,
     )
     # Poll instead of a bare wait_for so long gates (next build, npm ci) keep
     # heartbeating — a silent 10-minute gate would be declared dead by Temporal.
     # asyncio.wait returns the instant the task finishes, so fast gates stay fast.
-    task = asyncio.create_task(proc.communicate())
+    task = asyncio.create_task(_drain(proc.stdout, OUTPUT_TAIL * 4))
     step = min(20, gate["timeout"])
     elapsed = 0
+    timed_out = False
     while True:
         done, _ = await asyncio.wait({task}, timeout=step)
         if done:
-            out, _ = task.result()
+            await proc.wait()
             exit_code, note = proc.returncode, ""
             break
         elapsed += step
         if heartbeat:
             heartbeat(f"gate {gate['name']} running ({elapsed}s)")
         if elapsed >= gate["timeout"]:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            out, note, exit_code = b"", f"timeout after {gate['timeout']}s", None
+            _kill_group(proc)
+            timed_out = True
+            exit_code, note = None, f"timeout after {gate['timeout']}s"
             break
+    if timed_out:
+        # Keep whatever it printed before it hung. Throwing the output away left
+        # the owner no diagnostics for the failure that most needs them.
+        try:
+            out = await asyncio.wait_for(task, timeout=10)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
+            out = bytearray()
+    else:
+        out = task.result()
     green = exit_code == gate["green_exit"]
     return {
         "name": gate["name"],
@@ -82,7 +125,7 @@ async def _run_one(gate: dict, workdir: str, heartbeat=None) -> dict:
         "status": "green" if green else "red",
         "exit_code": exit_code,
         "note": note,
-        "output_tail": out.decode(errors="replace")[-OUTPUT_TAIL:],
+        "output_tail": bytes(out).decode(errors="replace")[-OUTPUT_TAIL:],
     }
 
 

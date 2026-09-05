@@ -29,8 +29,16 @@ def test_parse_final_json_bad_json():
 
 
 def test_parse_porcelain():
-    assert parse_porcelain(" M cli.py\nA  new.py\n?? untracked.py\n") == ["cli.py", "new.py", "untracked.py"]
+    """Records are NUL-terminated: `git status --porcelain -z`."""
+    assert parse_porcelain(" M cli.py\0A  new.py\0?? untracked.py\0") == \
+        ["cli.py", "new.py", "untracked.py"]
 
 
 def test_parse_porcelain_rename():
-    assert parse_porcelain('R  old.py -> new.py\n') == ["new.py"]
+    """A rename is two records, new name first, then the source. Only the new
+    name is part of the write set; the source record must not be read as a path."""
+    assert parse_porcelain("R  new.py\0old.py\0 M other.py\0") == ["new.py", "other.py"]
+
+
+def test_parse_porcelain_keeps_paths_with_spaces_and_arrows_intact():
+    assert parse_porcelain("?? my file.py\0?? a -> b.py\0") == ["a -> b.py", "my file.py"]

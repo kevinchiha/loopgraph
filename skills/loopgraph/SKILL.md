@@ -130,7 +130,8 @@ finish `merge-ready` with some items missing: read `items` in the ledger, and
 report which ones were parked and why. Do not describe such a run as done.
 
 Runs end as `merge-ready` (waiting on the user, your job is done), `merged`,
-`held` or `discarded` (their answer), or `stopped`. `stopped` means either every
+`merge-failed` (the merge was refused or rolled back — read `merge.reason`),
+`held` or `discarded` (their answer; a discard deletes the branch), or `stopped`. `stopped` means either every
 item was parked or the supervisor said stop, which is the one verdict that ends a
 whole run. Read `reason` in the ledger and report it with the red gate's output
 tail, verbatim.

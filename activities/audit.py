@@ -44,19 +44,65 @@ def parse_verdict(text: str) -> dict:
     return pkt
 
 
+CLAIM_CAP = 1200  # chars per claim
+
+
+def flatten_claim(claim) -> str:
+    """One claim, on one line, unable to impersonate the engine.
+
+    Claims come straight out of the executor's JSON with no validation and land in
+    the middle of the audit prompt. A claim containing newlines could open its own
+    "# Gate results" section, and the auditor has no way to tell engine text from
+    executor text. Collapsing the whitespace removes the trick.
+    """
+    return " ".join(str(claim).split())[:CLAIM_CAP]
+
+
+def declared_vs_actual(round_result: dict) -> tuple[list[str], list[str]]:
+    """(files the executor claimed but git did not see, files git saw but the
+    executor never declared).
+
+    executor.md tells the executor its `files_changed` is checked against git
+    status. Nothing checked it: the declared list was stored and read by nobody,
+    and the auditor was shown only the git-status side, so neither code nor the
+    auditor could spot an omission or an invention."""
+    declared = {str(f) for f in round_result.get("executor_files", []) or []}
+    actual = {str(f) for f in round_result.get("files", []) or []}
+    return sorted(declared - actual), sorted(actual - declared)
+
+
 def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str) -> str:
     contract = (PROMPTS / "supervisor.md").read_text()
-    claims = "\n".join(f"- {c}" for c in round_result.get("claims", [])) or "(no claims)"
+    claims = "\n".join(f"- {flatten_claim(c)}" for c in round_result.get("claims", [])) or "(no claims)"
     files = "\n".join(f"- {f}" for f in round_result.get("files", [])) or "(no files)"
-    gates = "\n".join(
-        f"- {g['name']}: {g['status']} (exit {g['exit_code']})" for g in round_result.get("gate_results", [])
-    ) or "(no gates)"
+    # The gate's command and its output, not just a name and an exit code: the
+    # contract asks the auditor to judge whether a gate exercises the claim, which
+    # it cannot do without seeing what the gate ran.
+    gate_blocks = []
+    for g in round_result.get("gate_results", []):
+        head = f"- {g['name']}: {g['status']} (exit {g['exit_code']})"
+        if g.get("note"):
+            head += f" [{g['note']}]"
+        tail = (g.get("output_tail") or "").strip()
+        gate_blocks.append(
+            f"{head}\n  command: {g.get('cmd', '(not recorded)')}\n"
+            f"  output:\n```\n{tail[-1500:] or '(no output)'}\n```"
+        )
+    gates = "\n".join(gate_blocks) or "(no gates)"
+    invented, undeclared = declared_vs_actual(round_result)
+    mismatch = ""
+    if invented or undeclared:
+        mismatch = ("\n\n# Write-set mismatch (engine check)\n\n"
+                    f"Claimed changed but git did not see: {invented or 'none'}\n"
+                    f"Changed but never declared: {undeclared or 'none'}\n"
+                    "The executor's contract requires these to agree. Treat a "
+                    "mismatch as a finding, not a formatting quirk.")
     truncated = "\n[diff truncated by engine]" if len(diff) >= DIFF_CAP else ""
     return (
         f"{contract}\n\n# Feature brief\n\n{brief.strip()}\n\n"
         f"# Constraints (binding)\n\n{constraints.strip() or '(none)'}\n\n"
         f"# Executor claims\n\n{claims}\n\n"
-        f"# Write set (from git status)\n\n{files}\n\n"
+        f"# Write set (from git status)\n\n{files}{mismatch}\n\n"
         f"# Gate results\n\n{gates}\n\n"
         f"# Unified diff (capped at {DIFF_CAP} chars)\n\n```diff\n{diff}{truncated}\n```\n\n"
         f"# Worktree (read-only spot checks)\n\n{round_result.get('worktree', '')}\n"

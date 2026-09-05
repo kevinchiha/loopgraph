@@ -16,7 +16,7 @@ from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from activities.audit import audit
-    from activities.checkpoint import checkpoint, merge
+    from activities.checkpoint import checkpoint, discard, merge
     from activities.execute_round import execute_round
     from activities.gate import run_gates
     from activities.items import load_work_items
@@ -113,6 +113,10 @@ class LoopGraphRun:
         self._ledger: dict = {"status": "running", "items": [], "rounds": [], "checkpoint": None}
         self._target_repo: str = ""
         self._decisions: list[str] = []
+        # The last checkpoint this run committed. Rounds reset to it rather than to
+        # HEAD, so a commit the executor made during a failed attempt can never
+        # become the baseline.
+        self._base_commit: str | None = None
 
     @workflow.run
     async def run(self, run_dir: str, target_repo: str, work_item: str = "") -> dict:
@@ -150,6 +154,7 @@ class LoopGraphRun:
             elif outcome["status"] == "halt":
                 entry.update(status="parked", reason=outcome["reason"])
                 self._ledger.update(status="stopped", reason=outcome["reason"])
+                await self._stopped_note(run_dir, outcome["reason"])
                 return self._ledger
             else:
                 entry.update(status="parked", reason=outcome["reason"])
@@ -168,10 +173,18 @@ class LoopGraphRun:
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
         if accepted is None:
             self._ledger.update(status="stopped", reason="every work item was parked")
+            await self._stopped_note(run_dir, "every work item was parked")
             return self._ledger
         self._ledger.update(status="merge-ready")
         await self._owner_card(run_dir, accepted, checkpoint_result, parked)
         return self._ledger
+
+    def _run_token(self) -> str:
+        """The tail of the workflow id, e.g. "ab12cd". It makes this run's branch
+        and worktree its own: deriving them from the run-dir name alone meant a
+        re-run inherited the previous run's branch, so work the owner discarded
+        came back and was merged by the next one."""
+        return workflow.info().workflow_id.rsplit("-", 1)[-1][:12]
 
     async def _run_item(self, run_dir: str, target_repo: str, work_item: str,
                         item_no: int, carried: str | None) -> dict:
@@ -184,7 +197,8 @@ class LoopGraphRun:
         for round_no in range(1, MAX_ROUNDS + 1):
             result = await workflow.execute_activity(
                 execute_round,
-                args=[run_dir, target_repo, work_item, round_no, directive, item_no],
+                args=[run_dir, target_repo, work_item, round_no, directive, item_no,
+                      self._run_token(), self._base_commit],
                 start_to_close_timeout=timedelta(hours=2),  # correction loop may re-run slow gates
                 heartbeat_timeout=timedelta(minutes=3),
                 retry_policy=RetryPolicy(maximum_attempts=2),
@@ -230,15 +244,24 @@ class LoopGraphRun:
                     retry_policy=RetryPolicy(maximum_attempts=2),
                 )
                 self._ledger["checkpoint"] = cp
+                if cp.get("commit"):
+                    self._base_commit = cp["commit"]
                 if not cp["committed"]:
                     return {"status": "parked",
                             "reason": f"checkpoint refused: {cp['reason']}"}
-                self._ledger["learn"] = await workflow.execute_activity(
-                    learn,
-                    args=[run_dir, result, verdict],
-                    start_to_close_timeout=timedelta(minutes=10),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                )
+                # Best effort, and it runs AFTER the commit. Letting it raise
+                # failed the whole workflow over a distilled sentence, throwing
+                # away a run whose work was already safely on the branch.
+                try:
+                    self._ledger["learn"] = await workflow.execute_activity(
+                        learn,
+                        args=[run_dir, result, verdict],
+                        start_to_close_timeout=timedelta(minutes=10),
+                        heartbeat_timeout=timedelta(minutes=3),
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
+                except Exception as e:  # noqa: BLE001 - never block on the learning edge
+                    self._ledger["learn"] = {"skipped": str(e)[:200]}
                 return {"status": "accepted", "result": result, "checkpoint": cp}
 
             if verdict["verdict"] == "stop":
@@ -358,23 +381,44 @@ class LoopGraphRun:
                          item: str, reason: str) -> None:
         """Tell the owner an item was parked. Does not wait: the run has already
         moved on to the next item, and their reply is picked up between items."""
-        wf_id = workflow.info().workflow_id
         text = (f"item {item_no} of {total} parked\n\n{item[:600]}\n\n"
                 f"why: {reason}\n\nThe run is carrying on with the rest. Reply here "
                 f"with anything the next item should know, or wait for the "
                 f"merge-ready card at the end.")
         self._ledger.setdefault("parked_notes", []).append({"item_no": item_no, "reason": reason})
+        await self._note(run_dir, "parked", text)
+
+    async def _stopped_note(self, run_dir: str, reason: str) -> None:
+        """Tell the owner a run ended. A stop used to return silently, so nobody
+        was told the run was over, and any items already committed sat on a branch
+        nobody knew about."""
+        done = [e for e in self._ledger["items"] if e["status"] == "done"]
+        parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
+        lines = [f"why: {reason}", "",
+                 f"{len(done)} item(s) committed, {len(parked)} parked."]
+        if done:
+            lines.append("")
+            lines.append("Committed work is on the branch and was NOT merged. "
+                         "Review it, or start a fresh run.")
+            lines.extend(f"- item {e['n']}: {str(e['item'])[:100]}" for e in done)
+        if parked:
+            lines.append("")
+            lines.extend(f"- parked item {e['n']}: {e.get('reason', '')}" for e in parked)
+        await self._note(run_dir, "run stopped", "\n".join(lines))
+
+    async def _note(self, run_dir: str, kind: str, text: str) -> None:
+        """A card with no buttons. Does not wait for anything."""
         telegram = await workflow.execute_activity(
             telegram_configured,
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
         if not telegram:
-            workflow.logger.warning("item %d parked: %s", item_no, reason)
+            workflow.logger.warning("%s: %s", kind, text)
             return
         await workflow.execute_activity(
             send_card,
-            args=["parked", wf_id, run_dir, text, None, {}],
+            args=[kind, workflow.info().workflow_id, run_dir, text, None, {}],
             start_to_close_timeout=timedelta(minutes=5),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
@@ -403,8 +447,16 @@ class LoopGraphRun:
             self._ledger.update(status="merged" if merged["merged"] else "merge-failed")
             if not merged["merged"]:
                 self._ledger["reason"] = merged["reason"]
+        elif letter == "C":
+            self._ledger["discard"] = await workflow.execute_activity(
+                discard,
+                args=[self._target_repo, result["branch"]],
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+            self._ledger.update(status="discarded")
         else:
-            self._ledger.update(status="held" if letter == "B" else "discarded")
+            self._ledger.update(status="held")
 
     @workflow.query
     def ledger(self) -> dict:

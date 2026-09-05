@@ -37,9 +37,23 @@ def build_card_text(kind: str, wf_id: str, run_dir: str, summary: str,
     return "\n".join(lines)[:4000]  # telegram message cap is 4096
 
 
+CB_ID_CAP = 48  # Telegram caps callback_data at 64 bytes; "lg::" plus a letter is 5
+
+
+def cb_key(wf_id: str) -> str:
+    """The part of the workflow id that goes in a button.
+
+    callback_data has a hard 64-byte limit, and a run directory named after a real
+    feature blows past it: every card with buttons then failed with a 400 and the
+    owner got nothing. The tail of the id is the random part, so trimming from the
+    left keeps what actually distinguishes one run from another.
+    """
+    return wf_id[-CB_ID_CAP:]
+
+
 def build_keyboard(wf_id: str, options: dict[str, str]) -> dict:
     return {"inline_keyboard": [[
-        {"text": letter, "callback_data": f"lg:{wf_id}:{letter}"} for letter in options
+        {"text": letter, "callback_data": f"lg:{cb_key(wf_id)}:{letter}"} for letter in options
     ]]}
 
 
@@ -49,7 +63,7 @@ def extract_reply(updates: list[dict], wf_id: str, chat_id: str) -> tuple[str, s
     Returns (kind, value, callback_id). A tap is always a deliberate answer to
     the current card, so buttons win over stray text within a batch; free text
     from any other chat, and /commands, are ignored."""
-    prefix = f"lg:{wf_id}:"
+    prefix = f"lg:{cb_key(wf_id)}:"
     for u in updates:
         cb = u.get("callback_query")
         if cb and str(cb.get("data", "")).startswith(prefix):

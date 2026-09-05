@@ -36,11 +36,24 @@ def build_round_graph(exec_fn: ExecFn, gate_fn: GateFn, max_attempts: int = MAX_
         green = all(g["status"] == "green" for g in results)
         return {"gate_results": results, "status": "green" if green else "running"}
 
+    def _why(g: dict) -> str:
+        """What the executor is told about one red gate.
+
+        A timed-out gate has exit_code None and (before the tail was kept) nothing
+        in output_tail; its only diagnostic lives in `note`. Leaving that out sent
+        back "FAILED (exit None):" with an empty body and burned the whole
+        three-attempt cap on a message that said nothing."""
+        head = f"GATE {g['name']} FAILED"
+        head += f" (exit {g['exit_code']})" if g.get("exit_code") is not None else ""
+        if g.get("note"):
+            head += f" [{g['note']}]"
+        head += f"\ncommand: {g.get('cmd', '')}"
+        body = g.get("output_tail") or "(the gate produced no output)"
+        return f"{head}\n{body}"
+
     async def correct(state: RoundState) -> dict:
         feedback = "\n\n".join(
-            f"GATE {g['name']} FAILED (exit {g['exit_code']}):\n{g['output_tail']}"
-            for g in state["gate_results"]
-            if g["status"] == "red"
+            _why(g) for g in state["gate_results"] if g["status"] == "red"
         )
         return {"feedback": feedback}
 

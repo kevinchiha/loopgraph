@@ -57,15 +57,31 @@ def parse_final_json(text: str) -> dict:
 
 
 def parse_porcelain(porcelain: str) -> list[str]:
-    """git status --porcelain → list of paths (handles renames, quotes)."""
+    """`git status --porcelain -z --untracked-files=all` → the paths that changed.
+
+    Two things force the flags. Without `-z`, git C-quotes any path that is not
+    plain ASCII ("caf\303\251.txt"), and stripping the quotes leaves the escapes
+    behind, so the path names no file on disk and the checkpoint dies on it.
+    Without `--untracked-files=all`, a new directory collapses to one `dir/` entry,
+    so the write set, the commit message and the audit all say one path while
+    `git add -- dir/` commits everything underneath it.
+
+    Records are NUL-terminated. A rename is two records, new name then old; only
+    the new name is part of the write set.
+    """
     files = []
-    for line in porcelain.splitlines():
-        if not line:
+    parts = [p for p in porcelain.split("\0") if p]
+    i = 0
+    while i < len(parts):
+        rec = parts[i]
+        if len(rec) < 4:
+            i += 1
             continue
-        path = line[3:]
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        files.append(path.strip('"'))
+        files.append(rec[3:])
+        # R and C records are followed by the source path in its own record.
+        if rec[0] in ("R", "C") or rec[1] in ("R", "C"):
+            i += 1
+        i += 1
     return sorted(files)
 
 
@@ -93,7 +109,7 @@ async def ensure_worktree(target_repo: str, worktree: str, branch: str) -> None:
         await _git("worktree", "add", "-b", branch, worktree, cwd=target_repo)
 
 
-async def reset_to_checkpoint(worktree: str) -> None:
+async def reset_to_checkpoint(worktree: str, base_commit: str | None = None) -> None:
     """Start a round from the last checkpoint, dropping anything uncommitted.
 
     Rounds restart at 1 for each work item, so resetting only on a redo left a
@@ -101,8 +117,13 @@ async def reset_to_checkpoint(worktree: str) -> None:
     item swept them into its write set, its audit diff and its commit. Committed
     checkpoints are untouched, and `clean -fd` leaves ignored files alone, so a
     node_modules or a venv survives.
+
+    `base_commit` is the checkpoint the workflow recorded. Passing it matters on a
+    Temporal retry: the executor may have committed during the attempt that
+    failed, and resetting to HEAD would adopt that commit as the new baseline,
+    where nothing would ever undo it and no auditor would ever see it.
     """
-    await _git("reset", "-q", "--hard", "HEAD", cwd=worktree)
+    await _git("reset", "-q", "--hard", base_commit or "HEAD", cwd=worktree)
     await _git("clean", "-qfd", cwd=worktree)
 
 
@@ -144,24 +165,32 @@ async def run_executor(prompt: str, feedback: str | None, worktree: str, log_pat
 
 @activity.defn
 async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no: int = 1,
-                        directive: str | None = None, item_no: int = 1) -> dict:
+                        directive: str | None = None, item_no: int = 1,
+                        run_token: str = "", base_commit: str | None = None) -> dict:
     """One round on one work item.
 
     All items in a run share one branch and one worktree, so item 2 starts from
     item 1's checkpoint and the owner gets a single branch to merge at the end.
-    A supervisor redo resets the worktree to the last checkpoint: the failed
-    attempt is dropped, everything already accepted survives.
+
+    `run_token` makes that branch unique to this run. Deriving it from the run-dir
+    name alone meant re-running the same run dir inherited the old branch, so work
+    the owner had explicitly discarded came back and was merged by the next run.
+
+    `base_commit` is the last checkpoint the WORKFLOW recorded. Resetting to
+    whatever HEAD happened to be re-baselined onto a commit the executor made
+    during a failed attempt, which then never got undone and never got audited.
     """
     run = Path(run_dir)
     brief = (run / "brief.md").read_text()
     constraints = (run / "constraints.md").read_text() if (run / "constraints.md").exists() else ""
     prompt = assemble_prompt(brief, constraints, work_item or brief, directive)
 
-    worktree = str(run / "worktrees" / "run")
-    branch = f"lg-{run.name}"
+    token = run_token or "run"
+    worktree = str(run / "worktrees" / token)
+    branch = f"lg-{run.name}" if not run_token else f"lg-{run.name}-{run_token}"
     base_branch = (await _git("branch", "--show-current", cwd=target_repo)).strip()
     await ensure_worktree(target_repo, worktree, branch)
-    await reset_to_checkpoint(worktree)
+    await reset_to_checkpoint(worktree, base_commit)
     (run / "logs").mkdir(parents=True, exist_ok=True)
     log_path = str(run / "logs" / log_name(item_no, round_no, "executor"))
 
@@ -183,7 +212,8 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
     self_committed = await undo_self_commit(worktree, start_head)
 
     diff_stat = await _git("diff", "--stat", "HEAD", cwd=worktree)
-    files = parse_porcelain(await _git("status", "--porcelain", cwd=worktree))
+    files = parse_porcelain(await _git(
+        "status", "--porcelain", "-z", "--untracked-files=all", cwd=worktree))
     return {
         "status": final["status"],           # green | escalated
         "attempts": final["attempt"],

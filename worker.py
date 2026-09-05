@@ -9,7 +9,7 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from activities.audit import audit
-from activities.checkpoint import checkpoint, merge
+from activities.checkpoint import checkpoint, discard, merge
 from activities.execute_round import execute_round
 from activities.gate import run_gates
 from activities.items import load_work_items
@@ -45,7 +45,7 @@ async def main() -> None:
         client,
         task_queue=TASK_QUEUE,
         workflows=[GateCheckRun, RoundRun, LoopGraphRun],
-        activities=[run_gates, execute_round, audit, checkpoint, merge, learn,
+        activities=[run_gates, execute_round, audit, checkpoint, merge, discard, learn,
                     load_work_items, send_card, wait_decision, telegram_configured,
                     poll_reply],
     )

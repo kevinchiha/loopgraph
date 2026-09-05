@@ -233,16 +233,21 @@ waits however long you take. Your answer goes into the next round for that item.
 The auditor is told never to ask what it could verify itself, so this should be
 rare; if it starts asking often, your brief is leaving something undecided.
 
-**An item got parked.** No question, no waiting. You are told and the run carries
-on with the rest. Anything you reply reaches the executor before the next item
-starts, which is how you steer a long run without restarting it.
+**An item got parked, or the run stopped.** No question, no waiting. You are told
+and, for a park, the run carries on with the rest. Anything you reply reaches the
+executor before the next item starts, which is how you steer a long run without
+restarting it. A run that stops early still messages you, and says how many items
+were already committed on the branch, because that work is real and unmerged.
 
 **Merge-ready at the end.** The work is committed on a branch and nothing has been
 merged.
 
 ```bash
-lg approve <workflow-id> A     # A merge, B keep the branch, C discard
+lg approve <workflow-id> A     # A merge, B keep the branch, C delete the branch
 ```
+
+A merge is local and is never pushed. C deletes the run's branch, so the work is
+gone; B is the one to pick if you want to look at it later.
 
 The same question is already on your phone with buttons, and a tap does the same
 thing. `lg approve` is for when you are at the machine anyway; it is not a

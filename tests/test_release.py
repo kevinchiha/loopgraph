@@ -20,7 +20,10 @@ EXAMPLE_RUNS = {"m1-demo", "m2-toy", "m3-accept", "m3-planted-lie", "m4-cards",
 
 SECRET_SHAPES = [
     re.compile(rb"[0-9]{8,12}:[A-Za-z0-9_-]{30,}"),      # telegram bot token
-    re.compile(rb"sk-[A-Za-z0-9-]{20,}"),                 # anthropic / openai key
+    # URL-safe base64, so underscores belong in the character class. Without it a
+    # real key whose first underscore landed early enough slipped straight past
+    # the test that exists to stop a secret shipping.
+    re.compile(rb"sk-[A-Za-z0-9_-]{20,}"),                # anthropic / openai key
     re.compile(rb"discord(?:app)?\.com/api/webhooks/"),   # webhook url
 ]
 # /home/worker is the container user; /home/you is the placeholder in .env.example.

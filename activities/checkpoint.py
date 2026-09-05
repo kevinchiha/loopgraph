@@ -33,9 +33,28 @@ async def _ignored(worktree: str, files: list[str]) -> set[str]:
         return set()
 
 
+async def _already_committed(worktree: str, message: str) -> str | None:
+    """The sha if HEAD is this exact checkpoint, else None.
+
+    Temporal retries this activity, and it is not idempotent after the commit: on
+    a second attempt the tree is clean, so every declared file looks missing and
+    the old code reported committed:false. The workflow then parked an item whose
+    commit was already on the branch, and the merge card lied about what was in it.
+    """
+    head_msg = await _git("log", "-1", "--format=%B", cwd=worktree)
+    if head_msg.strip() != message.strip():
+        return None
+    return (await _git("rev-parse", "HEAD", cwd=worktree)).strip()
+
+
 async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict], message: str) -> dict:
     if not files:
         return {"committed": False, "reason": "empty write set"}
+
+    done = await _already_committed(worktree, message)
+    if done:
+        return {"committed": True, "commit": done, "files": files, "leftovers": [],
+                "dropped_ignored": [], "note": "already committed by an earlier attempt"}
 
     hb = activity.heartbeat if activity.in_activity() else None
     gate_results = [await _run_one(g, worktree, heartbeat=hb) for g in gates]
@@ -50,7 +69,8 @@ async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict
         return {"committed": False, "reason": "write set entirely ignored paths",
                 "dropped_ignored": sorted(ignored)}
 
-    status_files = parse_porcelain(await _git("status", "--porcelain", cwd=worktree))
+    status_files = parse_porcelain(await _git(
+        "status", "--porcelain", "-z", "--untracked-files=all", cwd=worktree))
     missing = [f for f in files if f not in status_files]
     if missing:
         return {"committed": False, "reason": f"declared files not in git status: {missing}"}
@@ -60,6 +80,10 @@ async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict
     check = await _run_one({"name": "cached-check", "cmd": "git diff --cached --check",
                             "green_exit": 0, "timeout": 60}, worktree)
     if check["status"] == "red":
+        # Unstage before giving up. `git commit` takes the whole index, so one bad
+        # file left staged by item 1 made every later item's checkpoint fail on a
+        # file that item never touched.
+        await _git("reset", "-q", cwd=worktree)
         return {"committed": False, "reason": "git diff --cached --check failed",
                 "detail": check["output_tail"]}
 
@@ -86,10 +110,24 @@ async def merge_branch(target_repo: str, base_branch: str, branch: str) -> dict:
     dirty = (await _git("status", "--porcelain", cwd=target_repo)).strip()
     if dirty:
         return {"merged": False, "reason": "target repo has uncommitted changes"}
+    was_on = (await _git("branch", "--show-current", cwd=target_repo)).strip()
     await _git("checkout", "-q", base_branch, cwd=target_repo)
-    await _git("-c", "user.email=engine@loopgraph.local", "-c", "user.name=loopgraph",
-               "merge", "--no-ff", "-m", f"loopgraph: merge {branch} (owner-approved)", branch,
-               cwd=target_repo)
+    try:
+        await _git("-c", "user.email=engine@loopgraph.local", "-c", "user.name=loopgraph",
+                   "merge", "--no-ff", "-m", f"loopgraph: merge {branch} (owner-approved)",
+                   branch, cwd=target_repo)
+    except RuntimeError as e:
+        # A conflict used to raise straight out of the activity, leaving the owner's
+        # repo checked out on base with conflict markers in their files and
+        # MERGE_HEAD set, while the ledger still said merge-ready. Put it back.
+        for undo in (("merge", "--abort"), ("checkout", "-q", was_on or base_branch)):
+            try:
+                await _git(*undo, cwd=target_repo)
+            except RuntimeError:
+                pass
+        return {"merged": False, "base": base_branch,
+                "reason": f"merge failed and was rolled back: {str(e)[:300]}",
+                "restored_branch": was_on or base_branch}
     commit = (await _git("rev-parse", "HEAD", cwd=target_repo)).strip()
     return {"merged": True, "base": base_branch, "commit": commit, "pushed": False}
 
@@ -97,3 +135,17 @@ async def merge_branch(target_repo: str, base_branch: str, branch: str) -> dict:
 @activity.defn
 async def merge(target_repo: str, base_branch: str, branch: str) -> dict:
     return await merge_branch(target_repo, base_branch, branch)
+
+
+@activity.defn
+async def discard(target_repo: str, branch: str) -> dict:
+    """Delete the run's branch after the owner chooses C.
+
+    "C — discard the run" used to delete nothing, so the label was a lie and the
+    commits stayed reachable. Uses -D, not -d: the whole point is that this work
+    was refused, so git refusing to drop unmerged commits is not helpful here."""
+    try:
+        await _git("branch", "-D", branch, cwd=target_repo)
+        return {"discarded": True, "branch": branch}
+    except RuntimeError as e:
+        return {"discarded": False, "branch": branch, "reason": str(e)[:200]}

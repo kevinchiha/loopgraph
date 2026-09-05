@@ -21,6 +21,13 @@ ask(){  # ask <prompt> <default>
   read -r -p "$1 [$2]: " ans </dev/tty || true
   printf '%s' "${ans:-$2}"
 }
+ask_secret(){  # ask_secret <prompt> <current>   — never echoes the current value
+  local ans="" hint="blank to skip"
+  [ -n "$2" ] && hint="Enter keeps the one already in .env"
+  if [ "$YES" = 1 ] || [ ! -t 0 ]; then printf '%s' "$2"; return; fi
+  read -r -s -p "$1 ($hint): " ans </dev/tty; echo >/dev/tty
+  printf '%s' "${ans:-$2}"
+}
 confirm(){  # confirm <prompt>   (default no)
   local ans=""
   if [ "$YES" = 1 ] || [ ! -t 0 ]; then return 1; fi
@@ -52,12 +59,24 @@ else
 fi
 
 # ------------------------------------------------------------- 2. questions ---
+# Re-running must not wipe a working setup. Read what is already in .env and use
+# it as the default for every question, so pressing Enter keeps what you had.
+# Before this, the credential questions defaulted to empty and a re-run that
+# accepted the defaults blanked the model credential, then restarted the stack.
+old_env(){ [ -f "$ROOT/.env" ] && sed -n "s/^$1=//p" "$ROOT/.env" | head -1 || true; }
+PREV_BASE="$(old_env ANTHROPIC_BASE_URL)"
+PREV_TOK="$(old_env ANTHROPIC_AUTH_TOKEN)"
+PREV_KEY="$(old_env ANTHROPIC_API_KEY)"
+PREV_MODEL="$(old_env ANTHROPIC_MODEL)"
+PREV_PROJECTS="$(old_env LOOPGRAPH_PROJECTS_DIR)"
+[ -f "$ROOT/.env" ] && say "Found an existing .env — press Enter at any prompt to keep what it has"
+
 say "Where your code lives"
 cat <<'TXT'
 The worker can only reach ONE directory tree, mounted into the container as
 /projects. Every repo you want the engine to work on has to live under it.
 TXT
-PROJECTS="$(ask "Your projects directory" "$HOME/projects")"
+PROJECTS="$(ask "Your projects directory" "${PREV_PROJECTS:-$HOME/projects}")"
 PROJECTS="${PROJECTS/#\~/$HOME}"
 [ -d "$PROJECTS" ] || { mkdir -p "$PROJECTS"; echo "  created $PROJECTS"; }
 
@@ -70,15 +89,15 @@ cat <<'TXT'
   2) A plain Anthropic API key
      Simpler to start, billed per token.
 TXT
-ROUTE="$(ask "Route (1 or 2)" "1")"
-MODEL="$(ask "Model id" "claude-opus-5")"
+ROUTE="$(ask "Route (1 or 2)" "$([ -n "$PREV_KEY" ] && echo 2 || echo 1)")"
+MODEL="$(ask "Model id" "${PREV_MODEL:-claude-opus-5}")"
 AUTH_LINES=""
 if [ "$ROUTE" = "2" ]; then
-  KEY="$(ask "Anthropic API key (leave blank to fill in .env yourself)" "")"
+  KEY="$(ask_secret "  Anthropic API key" "$PREV_KEY")"
   AUTH_LINES="ANTHROPIC_API_KEY=$KEY"
 else
-  BASE="$(ask "CLIProxyAPI base url" "http://127.0.0.1:8317")"
-  TOK="$(ask "CLIProxyAPI local api-key (leave blank to fill in .env yourself)" "")"
+  BASE="$(ask "CLIProxyAPI base url" "${PREV_BASE:-http://127.0.0.1:8317}")"
+  TOK="$(ask_secret "  CLIProxyAPI local api-key" "$PREV_TOK")"
   AUTH_LINES="ANTHROPIC_BASE_URL=$BASE
 ANTHROPIC_AUTH_TOKEN=$TOK"
 fi
@@ -175,8 +194,10 @@ fi
 # ------------------------------------------------------------------ 4. .env ---
 say "Writing .env"
 if [ -f "$ROOT/.env" ]; then
-  cp -p "$ROOT/.env" "$ROOT/.env.backup.$(date +%Y%m%d%H%M%S)"
-  echo "  backed up your existing .env"
+  BACKUP="$ROOT/.env.backup.$(date +%Y%m%d%H%M%S)"
+  ( umask 077; cp "$ROOT/.env" "$BACKUP" )
+  chmod 600 "$BACKUP"
+  echo "  backed up your existing .env (mode 600)"
 fi
 ( umask 077
   cat > "$ROOT/.env" <<EOF
