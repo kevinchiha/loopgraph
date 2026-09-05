@@ -582,6 +582,41 @@ def test_the_page_declares_the_names_the_later_panes_bind_to():
         assert f"function {name}(" in src, f"{name} is the name other panes call"
 
 
+def test_a_poll_drops_names_that_came_back_for_a_run_the_reader_has_left():
+    """The board is cleared when a run is chosen, and a poll already in flight
+    fills it back up with the run it was chosen over.
+
+    poll() awaits /api/logs and then patches whatever `sel` says by the time the
+    reply lands. Click another run inside that window and the old run's log names
+    arrive on the freshly cleared board, where the panes get stamped with the new
+    run's directory. The window is 1.4 ms of every 2,000 on this machine, so it
+    is rare — and it never heals, because patchRounds only ever adds cards. The
+    phantom rounds sit there until the reader reselects or reloads, and opening
+    one asks /api/log for a file that is not in that directory: a 404 every 2
+    seconds, for ever, behind a pane that can never fill.
+
+    So the run has to be held before the await and carried down, and `sel` may be
+    read after the await for one thing only — to ask whether it still says the
+    same run.
+    """
+    src = function_source(ui.page_html(), "poll")
+    held = re.search(r"const (\w+) = sel;", src)
+    assert held, "poll() reads the global `sel` after its await instead of holding it"
+    dir_ = held.group(1)
+    after = src[src.index("await"):]
+    assert re.findall(r"\bsel\b", after) == ["sel"], \
+        "`sel` is read after the await for something other than the run-changed check"
+    assert re.search(rf"\b{dir_}\s*[!=]==\s*sel\b|\bsel\s*[!=]==\s*{dir_}\b", after), \
+        "nothing checks whether the reader moved on while the names were in flight"
+    assert re.search(rf"patchRounds\({dir_}\b", src), "the names are patched in without their run"
+
+    rounds = function_source(ui.page_html(), "patchRounds")
+    assert re.match(r"function patchRounds\(\w+,", rounds), \
+        "patchRounds is not told which run the names it is given came from"
+    assert not re.search(r"\bsel\b", rounds), \
+        "patchRounds reads the global instead of the run it was handed"
+
+
 def test_only_an_open_pane_is_polled():
     """AC-9: a collapsed pane sends no request. <details> carries `open` itself, so
     the selector is the whole of the rule and there is no toggle state to drift."""
@@ -590,23 +625,58 @@ def test_only_an_open_pane_is_polled():
     assert "createElement('details')" in function_source(ui.page_html(), "buildLogPane")
 
 
+def guarded_block(src, signal):
+    """The `if (…)` naming `signal`, and exactly the statement or block it governs.
+
+    Counted out by braces rather than by a fixed number of lines. A window of a
+    few lines reaches past a short block into whatever follows it, so a branch
+    that had lost its replaceChildren() borrowed the next branch's and the test
+    stayed green.
+    """
+    lines = src.splitlines()
+    i = next((n for n, ln in enumerate(lines)
+              if ln.strip().startswith("if (") and re.search(signal, ln)), None)
+    assert i is not None, f"nothing in patchOpenPanes tests {signal}"
+    out, depth = [], 0
+    for ln in lines[i:]:
+        out.append(ln)
+        depth += ln.count("{") - ln.count("}")
+        # A condition with nothing after it governs the line below instead.
+        if depth <= 0 and not ln.rstrip().endswith(")"):
+            break
+    return "\n".join(out)
+
+
 def test_the_page_replaces_a_pane_on_either_truncation_signal():
-    """AC-11's two signals, and the pane needs both.
+    """AC-11's two signals, and the pane needs both, each on its own.
 
     A reply offset below the one sent means the stored offset was past the end of
     the file. head_truncated turning true means append_log cut the head *below*
     the stored offset — it keeps the last 500 KB of a 1 MB file — so the offset
     still looks valid while every byte position behind it has moved, and no size
-    check can catch it. Either one on its own has to be enough to start again.
+    check can catch it.
     """
     src = function_source(ui.page_html(), "patchOpenPanes")
-    line = next((ln for ln in src.splitlines()
-                 if "replaceChildren()" in ln and ln.strip().startswith("if (")), "")
-    assert line, "replaceChildren() in patchOpenPanes is not guarded by one if"
-    assert re.search(r"\.offset\s*<\s*offset", line), \
-        "the reply's offset is never compared with the one that was sent"
-    assert "head_truncated" in line, "the head-truncation signal does not restart the pane"
-    assert "||" in line, "the two signals are not each enough on their own"
+    assert "replaceChildren()" in guarded_block(src, "head_truncated"), \
+        "the head-truncation signal does not empty the pane"
+    assert "replaceChildren()" in guarded_block(src, r"\.offset\s*<\s*offset"), \
+        "a reply offset below the one sent does not empty the pane"
+
+
+def test_a_head_truncated_pane_asks_again_from_the_start_of_the_new_file():
+    """The reply that carries the signal cannot be rendered.
+
+    It begins at the stored offset, which was a line ending in the old file and
+    is an arbitrary byte in the rewritten one, so the pane would open on half a
+    word with nothing above it and no way for the reader to tell why. The pane
+    goes back to 0 instead and pays one 2-second round trip for a file it can
+    show whole. The stored flag has to go true in the same breath, or the next
+    reply fires the same signal and the pane never renders anything at all.
+    """
+    block = guarded_block(function_source(ui.page_html(), "patchOpenPanes"), "head_truncated")
+    assert re.search(r"\.offset\s*=\s*'0'", block), "the pane keeps an offset into a file that moved"
+    assert re.search(r"\.cut\s*=\s*'1'", block), "the signal fires again on the next reply, for ever"
+    assert "continue" in block, "this reply's text is rendered from the wrong place anyway"
 
 
 def test_a_pane_stores_the_byte_size_as_its_next_offset():
@@ -624,10 +694,26 @@ def test_two_passes_cannot_append_the_same_bytes_twice():
     pass starting before the first has finished — the 2-second interval on top of
     the pass that opening a pane kicks off — reads the offset the first was still
     working from, asks for the same bytes and appends them again, and the reader
-    watches the same lines arrive twice."""
-    src = function_source(ui.page_html(), "patchOpenPanes")
-    assert re.search(r"if \(\w+\) return;", src), "two passes can run at once"
-    assert "finally" in src, "the guard is never cleared if a pane's poll throws"
+    watches the same lines arrive twice.
+
+    Every clause below is one way the guard is written and does nothing. A flag
+    declared inside the function is false on every call. One raised after the
+    first await is raised too late, because that await is where the second pass
+    gets in. One cleared anywhere but a finally stays raised for ever the first
+    time a pane's poll throws, and no pane is ever polled again.
+    """
+    src = script_of(ui.page_html())
+    fn = function_source(ui.page_html(), "patchOpenPanes")
+    held = re.search(r"if \((\w+)\) return;", fn)
+    assert held, "two passes can run at once"
+    flag = held.group(1)
+    top_level = "\n".join(ln for ln in src.splitlines() if not ln.startswith(" "))
+    assert re.search(rf"^let {flag} = false;$", top_level, re.M), \
+        f"{flag} does not outlive the call, so every pass gets its own false one"
+    assert fn.index(f"{flag} = true;") < fn.index("await"), \
+        f"{flag} is raised after the await a second pass would arrive during"
+    assert re.search(rf"finally \{{\s*{flag} = false;", fn), \
+        f"{flag} is not cleared in a finally, so one throw stops every later poll"
 
 
 def test_a_pane_follows_the_bottom_only_from_the_bottom():

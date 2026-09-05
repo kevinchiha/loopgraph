@@ -143,7 +143,10 @@ function buildLogPane(dir, name, label) {
   pane.addEventListener('toggle', () => { if (pane.open) patchOpenPanes(); });
   return pane;
 }
-function patchRounds(names) {
+function patchRounds(dir, names) {
+  // `dir` is passed in, never read off `sel`: these names were fetched for one
+  // run and the panes built from them have to be stamped with that same run,
+  // whatever the reader has clicked since.
   const board = document.getElementById('board');
   const rounds = {};
   for (const name of names) {
@@ -176,7 +179,7 @@ function patchRounds(names) {
     for (const [role, label] of ROLES) {
       const name = rounds[key][role];
       if (name && ![...panels.children].some(p => p.dataset.name === name))
-        panels.append(buildLogPane(sel, name, label));
+        panels.append(buildLogPane(dir, name, label));
     }
   }
 }
@@ -203,13 +206,25 @@ async function patchOpenPanes() {
         if (!r.ok) continue;  // a file the run has not written yet
         d = await r.json();
       } catch (e) { continue; }  // one pane's bad poll is not the board's problem
-      // Two signals say "start again", and the pane needs both. A reply offset
-      // below the one sent means the stored offset was past the end of the file.
-      // head_truncated turning true means append_log cut the head BELOW the stored
-      // offset — it keeps the last 500 KB of a 1 MB file — so the offset still
-      // looks valid while every byte behind it has moved, and appending would
-      // splice the middle of one line onto the end of another.
-      if (d.offset < offset || (d.head_truncated && !cut)) body.replaceChildren();
+      // Two signals say "start again", and the pane needs both.
+      //
+      // head_truncated turning true means append_log cut the head BELOW the
+      // stored offset — it keeps the last 500 KB of a 1 MB file — so the offset
+      // still looks valid while every byte behind it has moved. This reply's text
+      // is thrown away with the pane's: the offset it starts at was a line ending
+      // in the old file and is an arbitrary byte in the new one, so rendering it
+      // would open the pane on half a word with nothing above it and no way for
+      // the reader to tell why. Asking again from 0 costs one 2-second round trip
+      // and shows the rewritten file from its start.
+      if (d.head_truncated && !cut) {
+        body.replaceChildren();
+        pane.dataset.offset = '0';
+        pane.dataset.cut = '1';
+        continue;
+      }
+      // The other signal: a reply offset below the one sent means the stored
+      // offset was past the end of the file, and the reply already starts at 0.
+      if (d.offset < offset) body.replaceChildren();
       // Appending adds nodes and touches none that exist, so a selection survives.
       if (d.text) body.insertAdjacentHTML('beforeend', colorize(d.text));
       // `size` counts bytes; `text` is those bytes decoded, and the two differ on
@@ -233,10 +248,19 @@ async function runs() {
   } catch(e) { document.getElementById('hdr').textContent = 'server error'; }
 }
 async function poll() {
-  if (!sel) return;
+  // The run this poll is about, held before the await rather than read after it.
+  // A reader who picks another run while these names are in flight has already
+  // had the board cleared under them, and the names that land belong to the run
+  // they left. Putting them on the new board is not a flicker that the next poll
+  // clears up: patchRounds only ever adds cards, so a phantom round stays until
+  // the reader reselects or reloads, and opening one asks /api/log for a file
+  // that is not in this run's directory — a 404 every 2 seconds, for good,
+  // behind a pane that can never fill.
+  const dir = sel;
+  if (!dir) return;
   try {
-    const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(sel))).json();
-    patchRounds(d.logs || []);
+    const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(dir))).json();
+    if (dir === sel) patchRounds(dir, d.logs || []);
   } catch(e) { /* the board keeps what it has until the next poll */ }
   patchOpenPanes();
 }
