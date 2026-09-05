@@ -116,6 +116,51 @@ def test_a_head_truncated_file_is_flagged(server, logs):
     assert d["head_truncated"] is True
 
 
+class AppendsAtTheSeam:
+    """The real file, except that one more line lands in it between log_slice's
+    size measurement and its read — which is where a live log actually grows."""
+
+    def __init__(self, path, extra):
+        self._path, self._extra, self._f = path, extra, None
+
+    def open(self, mode):
+        self._f = self._path.open(mode)
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()
+
+    def read(self, *a):
+        return self._f.read(*a)
+
+    def seek(self, *a):
+        pos = self._f.seek(*a)
+        if a == (0, 2) and self._extra:  # the seek that measures the file
+            with self._path.open("ab") as w:
+                w.write(self._extra)
+            self._extra = b""
+        return pos
+
+
+def test_log_sends_no_more_than_the_size_it_reports(tmp_path):
+    """Measuring and reading are two instants, and an executor is appending to
+    the log in between. The page stores `size` as its next offset, so bytes past
+    that size come round again on the next poll and the reader sees the same
+    lines twice."""
+    from activities.stream import log_name
+    p = tmp_path / log_name(1, 1, "executor")
+    p.write_bytes(b"[10:00:00 assistant] first\n")
+
+    d = ui.log_slice(AppendsAtTheSeam(p, b"[10:00:01 assistant] second\n"), 0)
+    assert len(d["text"].encode()) == d["size"] - d["offset"], "text ran past the reported size"
+    assert "second" not in d["text"], "a line that landed after the measurement went out early"
+    # and it is not lost: the next poll starts exactly where `size` said it would
+    assert ui.log_slice(p, d["size"])["text"] == "[10:00:01 assistant] second\n"
+
+
 def test_an_untruncated_file_is_not_flagged(server):
     from activities.stream import log_name
     name = log_name(1, 1, "executor")
@@ -131,6 +176,26 @@ def test_the_truncation_marker_matches_the_writer():
     src = inspect.getsource(activities.stream.append_log)
     escaped = ui.HEAD_MARK.decode().replace("\n", "\\n")  # source writes the newline escaped
     assert escaped in src, f"append_log no longer writes {ui.HEAD_MARK!r}"
+
+
+def test_the_writer_leaves_the_marker_the_reader_looks_for(tmp_path, monkeypatch):
+    """The pin above says the literal still reads the same. This says the bytes
+    append_log puts on disk are the bytes log_slice matches, with no fixture
+    built out of HEAD_MARK in between. Cap shrunk the way test_visibility does."""
+    import activities.stream as s
+    from activities.stream import log_name
+    monkeypatch.setattr(s, "LOG_CAP", 200)
+    p = tmp_path / log_name(1, 1, "executor")
+    for i in range(30):
+        s.append_log(str(p), f"[10:00:00 assistant] line {i} " + "x" * 30)
+    assert ui.log_slice(p, 0)["head_truncated"] is True
+
+
+def test_log_survives_a_name_longer_than_the_filesystem_allows(server):
+    """LOG_RE bounds neither digit run, so is_file() raised ENAMETOOLONG, the
+    handler died mid-reply and `lg ui` printed a traceback at a hand-made URL."""
+    name = f"i1-r{'9' * 400}-audit.log"
+    assert status_of(f"{server}/api/log?dir=2026-01-01-demo&name={name}") == 404
 
 
 def test_log_rejects_a_name_outside_the_pattern_with_400(server):

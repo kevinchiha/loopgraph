@@ -139,6 +139,18 @@ def log_names(runs_dir: Path, slug: str) -> list[str]:
 def log_slice(path: Path, offset: int) -> dict:
     """The bytes past `offset`, plus the two signals that say "start again".
 
+    `size` is a count of bytes, and it is the number the caller sends back as its
+    next `offset`. `text` is those bytes decoded, so its length is not an offset
+    and must never be used as one: a log holding any non-ASCII character decodes
+    to fewer characters than it measures in bytes, and a slice that starts
+    mid-character comes out longer again, because errors="replace" turns each
+    stray byte at the seam into a replacement character.
+
+    `text` is exactly `size - offset` bytes, not "the rest of the file". A live
+    log grows between the measurement and the read, and bytes past the `size` we
+    reported would be sent again on the next poll, under the reader's eyes, as
+    duplicate lines.
+
     `offset` comes back lower than it went in when the stored offset was past the
     end of the file. That misses the other half: append_log rewrites an over-cap
     file as HEAD_MARK plus its last 500 KB, so an offset under 500 KB still looks
@@ -152,7 +164,7 @@ def log_slice(path: Path, offset: int) -> dict:
         if offset > size:
             offset = 0
         f.seek(offset)
-        text = f.read().decode(errors="replace")
+        text = f.read(size - offset).decode(errors="replace")
     return {"text": text, "offset": offset, "size": size, "head_truncated": head == HEAD_MARK}
 
 
@@ -269,7 +281,11 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                 if not re.fullmatch(r"[0-9]+", offset):
                     return self._json({"error": "offset must be a whole number"}, 400)
                 path = runs_dir / slug / "logs" / name
-                if not path.is_file():
+                try:
+                    found = path.is_file()
+                except OSError:  # LOG_RE bounds neither digit run: a hand-made
+                    found = False  # name can be longer than the filesystem allows
+                if not found:
                     return self._json({"error": "no such log file"}, 404)
                 self._json(log_slice(path, int(offset)))
             elif u.path == "/api/runs":
