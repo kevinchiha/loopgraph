@@ -6,7 +6,8 @@ tested on dictionaries and lists. The ledgers here are the shapes the engine has
 really produced, old ones included: a run that closed before `items` existed
 hands back a dictionary without the key, and printing it must not raise. The
 command itself runs against a fake client, which is the only way to test the
-paths that matter — a run that has not finished, and an id nobody has.
+paths that matter — a run that has not finished, and an id nobody has. The last
+section is copy: the help text and the two documents that teach this command.
 """
 
 from __future__ import annotations
@@ -396,3 +397,33 @@ def test_an_unanswerable_positional_query_prints_one_line_and_exits_1(lg, monkey
     out, err = capsys.readouterr()
     assert (code, out, err) == (1, "", NO_HANDLER + "\n")
     assert handle.awaited_result is False
+
+
+# ---------- what the help and the docs teach ----------
+
+def help_text(lg, monkeypatch, capsys, *argv) -> str:
+    """What argparse prints for `lg [...] --help`."""
+    monkeypatch.setattr(sys, "argv", ["lg", *argv, "--help"])
+    with pytest.raises(SystemExit):
+        lg.main()
+    return capsys.readouterr().out
+
+
+def test_the_status_help_offers_a_run_directory(lg, monkeypatch, capsys):
+    """A slug is no use to an owner who has no way of learning it works. The
+    subcommand line names both forms, and the usage line calls the argument
+    `arg`, because `workflow_id` reads as a refusal to take anything else."""
+    assert "<workflow-id|run-dir>" in help_text(lg, monkeypatch, capsys)
+    status = help_text(lg, monkeypatch, capsys, "status")
+    assert status.splitlines()[0] == "usage: lg status [-h] [--json] arg [query]"
+    assert "workflow_id" not in status
+
+
+@pytest.mark.parametrize("doc", ["README.md", "skills/loopgraph/SKILL.md"])
+def test_the_docs_show_the_slug_form(doc):
+    """The skill is what agents in other projects read, so a form documented
+    nowhere is a form nobody types. The id form stays in both files: it is what
+    they taught before, and it still works."""
+    text = (ROOT / doc).read_text()
+    assert "lg status runs/" in text, f"{doc} never shows the run-directory form"
+    assert "lg status <workflow-id> ledger" in text, f"{doc} dropped the id form"

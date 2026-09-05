@@ -215,9 +215,10 @@ build byproducts. Never fix it by loosening the scope gate.
 ## Watching a run
 
 ```bash
-lg status <workflow-id> ledger   # the scoreboard
-lg tail runs/<slug>              # live executor and audit streams
-lg ui                            # dashboard on http://localhost:8400
+lg status runs/<slug>             # what the run is doing
+lg status <workflow-id> ledger    # the raw ledger, as before
+lg tail runs/<slug>               # live executor and audit streams
+lg ui                             # dashboard on http://localhost:8400
 ```
 
 Temporal's own UI is on http://localhost:8233 and shows the workflow history,
@@ -278,7 +279,8 @@ Nothing above needs an agent. The skill is a shortcut, not a dependency.
 ```bash
 lg where                                                # paths and ports here
 lg start runs/example-hello /projects/loopgraph-example
-lg status <workflow-id> ledger                          # everything the run knows
+lg status runs/<slug>                                   # what the run is doing
+lg status <workflow-id> ledger                          # the raw ledger, as before
 lg approve <workflow-id> A
 ```
 

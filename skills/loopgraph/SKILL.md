@@ -156,7 +156,8 @@ xdg-open http://localhost:8233/namespaces/default/workflows    # the new run is 
 
 On a headless or SSH session skip `xdg-open` and give the two URLs in your reply.
 
-Also useful: `lg status <workflow-id> ledger` for the scoreboard, and
+Also useful: `lg status runs/<slug>` for what the run is doing (a workflow id
+works too, and `lg status <workflow-id> ledger` still prints the raw JSON), and
 `lg tail runs/<slug>` for the live executor and supervisor streams. `lg tail`
 never returns, so background it or use the dashboard instead.
 

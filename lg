@@ -2,7 +2,7 @@
 """lg — thin CLI for loopgraph-engine.
 
 M1: `lg gate <gates.yaml> [workdir]` runs gates through the GateCheckRun
-workflow; `lg status <workflow-id>` queries gate red/green.
+workflow; `lg status <workflow-id|run-dir>` prints what a run is doing.
 `lg new` / `lg start <brief>` land with M3.
 """
 
@@ -377,10 +377,11 @@ def main() -> int:
     g.add_argument("gates")
     g.add_argument("workdir", nargs="?", default="/app")
     g.set_defaults(fn=cmd_gate)
-    s = sub.add_parser("status", help="query a workflow (tries status, then ledger)")
-    s.add_argument("workflow_id")
+    s = sub.add_parser("status", help="read a run: lg status <workflow-id|run-dir> [ledger]")
+    s.add_argument("workflow_id", metavar="arg")
     s.add_argument("query", nargs="?", default=None)
-    s.add_argument("--json", action="store_true", help="print the raw query result as JSON")
+    s.add_argument("--json", action="store_true",
+                   help="print the raw query result instead of the summary")
     s.set_defaults(fn=cmd_status)
     r = sub.add_parser("round", help="run one executor round on a work item")
     r.add_argument("run_dir", help="run dir with brief.md/constraints.md/gates.yaml (container path)")
