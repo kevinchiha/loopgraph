@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import inspect
 import json
 import os
@@ -10,6 +11,7 @@ import tracemalloc
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
@@ -1041,6 +1043,141 @@ def test_the_run_list_is_patched_and_never_rebuilt():
     runs_fn = function_source(ui.page_html(), "runs")
     assert "patchRuns(" in runs_fn, "the poll does not go through the patch"
     assert "buildRunRow" not in runs_fn, "the poll builds rows itself"
+
+
+# ---------- the state board ----------
+
+
+def load_lg():
+    """`lg` has no .py extension, so it loads by path, under this file's own name."""
+    root = Path(ui.__file__).resolve().parent
+    loader = SourceFileLoader("lg_cli_board", str(root / "lg"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("lg_cli_board", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def test_the_board_fetches_the_ledger_by_workflow_id():
+    """The board's whole reason for existing. Until now the page asked only for
+    log names, so it could say a run was held and never what it was asking."""
+    src = function_source(ui.page_html(), "poll")
+    assert "/api/run?id=" in src, "the poll never asks for the run's state"
+    assert "patchBoard(" in src, "the reply reaches no patch"
+
+
+def test_the_board_copy_is_pinned():
+    """Every line the board says about a run's state, and the one gesture that
+    matters: one click on the command selects the whole of it."""
+    html = ui.page_html()
+    for line in ("temporal unreachable — logs only",
+                 "no workflow for this run",
+                 "awaiting: ",
+                 "no card was sent; the lg approve command is the only way to answer",
+                 "no items yet"):
+        assert line in html, f"the page no longer says {line!r}"
+    assert "user-select:all" in html, "the answer command cannot be selected in one gesture"
+
+
+def test_the_page_and_lg_status_use_the_same_no_card_line():
+    """AC-4 and AC-23 are one sentence written twice, in two files, with no shared
+    constant between them: `lg` cannot import a page string and `ui.py` cannot
+    import from a file with no extension without loading it.
+
+    So the two are held equal here. The line is taken out of `lg status`'s own
+    output rather than typed again — a copy in this test would pin the page to the
+    test and let the terminal drift away from both. The two ledgers differ in one
+    key, so the line is whatever `format_status` says when no card was sent and
+    does not say when one was.
+    """
+    lg = load_lg()
+    awaiting = {"kind": "decision", "question": "which port?", "options": {"A": "8400"},
+                "telegram": False, "answer_with": "lg approve run-toy-ab12cd <answer>"}
+    silent = set(lg.format_status({"status": "running", "awaiting": awaiting}).splitlines())
+    carded = set(lg.format_status(
+        {"status": "running", "awaiting": dict(awaiting, telegram=True)}).splitlines())
+
+    only = silent - carded
+    assert len(only) == 1, f"telegram false changes more than one line of lg status: {only}"
+    # lg indents the line under the awaiting block; the page has no terminal to
+    # indent in. The sentence itself is what has to be the same.
+    assert only.pop().strip() in ui.page_html(), \
+        "the page and lg status word the no-card case differently"
+
+
+def test_every_section_exists_after_the_board_is_built():
+    """The constraint the patches are written against: buildBoard runs on
+    selection and makes every section, hidden or not, so a patch never has to
+    create one — and a poll therefore never builds part of the page."""
+    build = function_source(ui.page_html(), "buildBoard")
+    for section in ("state", "why", "awaiting", "items", "rounds", "diff"):
+        assert f'id="{section}"' in build, f"#{section} is not built with the board"
+
+
+def test_the_round_cards_leave_the_board_for_their_own_section():
+    """The board is six sections now, and the log cards are one of them. Left
+    appending to #board they would land on top of the state sections."""
+    src = function_source(ui.page_html(), "patchRounds")
+    assert "getElementById('rounds')" in src, "the log cards still go straight onto the board"
+    assert "getElementById('board')" not in src
+
+
+def test_a_ledger_with_no_items_key_reads_as_an_empty_list():
+    """/api/run serves a closed workflow's recorded result untouched, and two runs
+    on this machine closed before `items` was a ledger key. The key is absent, not
+    empty, so `ledger.items.map(...)` is a TypeError on a run the owner can click
+    today — and the section must read `no items yet`, not break the board."""
+    src = function_source(ui.page_html(), "patchItems")
+    assert re.search(r"ledger\.items\s*\)?\s*\|\|\s*\[\]", src), \
+        "the items are read with no default for a ledger that carries no items key"
+    assert not re.search(r"\.items\s*[.\[]", src), "a call or an index straight on ledger.items"
+
+
+def test_an_item_row_shows_a_short_commit_or_a_parked_reason():
+    """AC-7. A full commit hash is 40 characters of noise beside the item text,
+    and a parked item's reason is the only thing that says why it stopped."""
+    src = function_source(ui.page_html(), "patchItemRow")
+    assert "'done'" in src and "'parked'" in src, "the two statuses with a detail"
+    assert re.search(r"slice\(0,\s*10\)", src), "the commit is not cut to 10 characters"
+    assert ".reason" in src, "a parked item says nothing about why"
+
+
+def test_the_question_is_left_out_when_it_was_never_recorded():
+    """A workflow that started before this phase recorded no `question`, and its
+    card is still up. Everything else about the block is worth showing, so the
+    question is hidden rather than drawn as an empty box under the heading."""
+    src = function_source(ui.page_html(), "patchAwaiting")
+    assert re.search(r"\.hidden\s*=\s*!\w+\.question", src), \
+        "the question element is drawn whether or not there is a question"
+
+
+def test_the_awaiting_block_goes_when_the_workflow_pops_it():
+    """AC-6. The workflow removes `awaiting` the moment the owner answers, so the
+    page drops the block on its next poll — 2 seconds at the outside. Nothing
+    else is needed for that, and nothing may keep the block alive across a reply
+    that no longer carries one."""
+    src = function_source(ui.page_html(), "patchAwaiting")
+    assert re.search(r"\.hidden\s*=\s*!\w+;", src), \
+        "the block's visibility does not follow the ledger's awaiting"
+
+
+def test_a_null_ledger_hides_the_state_sections_and_keeps_the_logs():
+    """AC-10. With no workflow behind a run directory the page still tails its
+    logs, says one line about why there is no state, and shows nothing that would
+    have come from a ledger."""
+    src = function_source(ui.page_html(), "patchState")
+    assert "no workflow for this run" in src and "temporal unreachable — logs only" in src
+    assert re.search(r"getElementById\('diff'\)\.hidden", src), \
+        "the diff pane stays on a run with no ledger to read a branch from"
+    assert "getElementById('rounds')" not in src, "the log cards are hidden with the state"
+
+
+def test_the_recorded_question_keeps_its_own_line_breaks():
+    """AC-5. The question is the text of the card the owner saw, location line and
+    blank line included. Collapsed to one line it stops being that."""
+    html = ui.page_html()
+    rule = re.search(r"#awaiting \.q \{([^}]*)\}", html)
+    assert rule, "the question has no style of its own"
+    assert "pre-wrap" in rule.group(1), "the question's line breaks are collapsed away"
 
 
 # ---------- the host repository behind a run's worktree ----------

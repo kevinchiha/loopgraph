@@ -2,10 +2,12 @@
 """lg ui — tiny local dashboard for watching loopgraph runs live.
 
 Stdlib HTTP server + the venv's temporalio. Left: runs (from Temporal, plus any
-run dir that has logs). Right: the selected run's stream logs, one collapsed pane
-per round and role. An open pane asks for the bytes past the ones it already has
-every 2 seconds and appends them; a collapsed one asks for nothing. If Temporal
-is down the page still tails log files.
+run dir that has logs). Right: the selected run's state, then its logs — the
+status, the question it is waiting on with the command that answers it, the work
+items, and one collapsed log pane per round and role. An open pane asks for the
+bytes past the ones it already has every 2 seconds and appends them; a collapsed
+one asks for nothing. If Temporal is down the page says so and still tails log
+files.
 
 Run: lg ui [--port 8400]  →  http://localhost:8400
 """
@@ -62,9 +64,38 @@ PAGE = """<!doctype html>
   .gray { background:rgba(125,133,144,.15); color:#8b949e; }
   #board { flex:1; overflow-y:auto; padding:16px 20px; min-width:0; }
   .empty { color:var(--dim); text-align:center; padding:40px 0; font-size:13px; }
+  /* The state board: what the run is doing, what it is asking, what it is
+     working through. The logs come after all three. */
+  #state { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; margin-bottom:14px; }
+  #state .reason { color:var(--dim); font-size:12.5px; min-width:0; word-break:break-word; }
+  #why { color:var(--dim); font-size:12.5px; margin-bottom:16px; }
+  #awaiting { background:var(--panel); border:1px solid var(--line);
+              border-left:3px solid var(--accent); border-radius:10px;
+              padding:13px 16px; margin-bottom:20px; }
+  #awaiting h2 { font:700 11px/1.4 ui-monospace,monospace; letter-spacing:1px;
+                 text-transform:uppercase; color:var(--accent); margin-bottom:9px; }
+  /* The question is the text of the card the owner saw, line breaks and all. */
+  #awaiting .q { white-space:pre-wrap; word-break:break-word; margin-bottom:10px; }
+  #awaiting .opt { font-size:13px; }
+  /* One click selects the whole command, so it can be pasted into a terminal
+     without picking the ends off it by hand. */
+  #awaiting .cmd { display:inline-block; user-select:all; margin-top:10px; padding:4px 9px;
+                   background:var(--bg); border:1px solid var(--line); border-radius:6px;
+                   color:var(--purple); word-break:break-all;
+                   font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  #awaiting .nocard { margin-top:9px; color:#d29922; font-size:12.5px; }
+  #items { margin-bottom:22px; }
+  #items .none { color:var(--dim); font-size:12.5px; }
+  .item { display:grid; grid-template-columns:24px minmax(0,1fr) auto; gap:2px 10px;
+          align-items:baseline; padding:8px 0; border-bottom:1px solid var(--line); }
+  .item .n { color:var(--dim); font:12px ui-monospace,Menlo,monospace; }
+  .item .what { min-width:0; word-break:break-word; }
+  .item .detail { grid-column:2 / 4; color:var(--dim); word-break:break-word;
+                  font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .item .detail:empty { display:none; }
   .round { margin-bottom:22px; }
-  .round > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px; color:var(--dim);
-                text-transform:uppercase; margin-bottom:8px; }
+  #items > h2, .round > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px;
+                             color:var(--dim); text-transform:uppercase; margin-bottom:8px; }
   .panels { display:flex; gap:14px; align-items:flex-start; }
   .panel { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:10px;
            overflow:hidden; }
@@ -208,9 +239,154 @@ function patchRuns(entries) {
 }
 // The board is emptied here rather than in poll(), so a card from the run just
 // left can never sit under the run just chosen, not even for one interval.
+//
+// Every section is made here, once, and the patches only ever fill them in or
+// hide them. That is what lets a poll be a poll: nothing on the 2-second path
+// has to decide whether a part of the page exists yet.
 function buildBoard() {
   const board = document.getElementById('board');
   board.replaceChildren();
+  const sections = document.createElement('div');
+  // Hidden to begin with, all but the log cards: a section says something about
+  // the run's state, and until the first reply lands there is no state to say it
+  // from. #rounds is the exception because a run directory with logs and no
+  // workflow is a real thing the page has always shown.
+  sections.innerHTML =
+      '<div id="state" hidden><span class="pill"></span><span class="reason"></span></div>'
+    + '<div id="why" hidden></div>'
+    + '<section id="awaiting" hidden><h2></h2><div class="q"></div><div class="opts"></div>'
+    + '<code class="cmd"></code>'
+    + '<div class="nocard">no card was sent; the lg approve command is the only way to answer</div>'
+    + '</section>'
+    + '<section id="items" hidden><h2>work items</h2><div class="rows"></div>'
+    + '<div class="none">no items yet</div></section>'
+    + '<div id="rounds"></div><div id="diff" hidden></div>';
+  board.append(sections);
+}
+function buildOptionRow(letter) {
+  const row = document.createElement('div');
+  row.className = 'opt';
+  // Keyed on the letter, because that is what the owner types back. The label
+  // beside it is written by the patch, so an option whose wording changed keeps
+  // its row and its place instead of being made again.
+  row.dataset.letter = letter;
+  return row;
+}
+function buildItemRow(n) {
+  const row = document.createElement('div');
+  row.className = 'item';
+  row.dataset.n = n;
+  // Empty on purpose, exactly as a run row is: every word comes from
+  // patchItemRow, so nothing an item is called can reach the page as markup.
+  row.innerHTML = '<span class="n"></span><span class="what"></span>'
+                + '<span class="pill"></span><span class="detail"></span>';
+  return row;
+}
+// status and reason, or the one line saying why there is no state at all.
+function patchState(d) {
+  const ledger = d && d.ledger;
+  const box = document.getElementById('state');
+  const why = document.getElementById('why');
+  box.hidden = !ledger;
+  why.hidden = !!ledger;
+  // The diff is read off the last round's branch, so a run with no ledger has
+  // nothing to ask /api/diff for. Task 16 fills the pane; this hides it.
+  document.getElementById('diff').hidden = !ledger;
+  if (ledger) {
+    const [word, reason] = box.children;
+    word.className = 'pill ' + pill(ledger.status);
+    setText(word, ledger.status || 'unknown');
+    setText(reason, ledger.reason || '');
+    return;
+  }
+  // The page's two lines for "there is no state", and it has no third. `temporal`
+  // says whether the feed is connected, never whether it knows this id, so an id
+  // Temporal has never heard of is the second line and not the first.
+  setText(why, d && d.temporal ? 'no workflow for this run'
+                               : 'temporal unreachable — logs only');
+}
+// What the run is asking. It goes the moment the workflow pops `awaiting`, which
+// it does as soon as the owner answers, so the next poll is the whole of AC-6.
+function patchAwaiting(ledger) {
+  const box = document.getElementById('awaiting');
+  const a = ledger && ledger.awaiting;
+  box.hidden = !a;
+  if (!a) return;
+  const [head, q, opts, cmd, nocard] = box.children;
+  setText(head, 'awaiting: ' + (a.kind || ''));
+  // A card that went up before this phase recorded no question. Everything else
+  // is still worth reading, so the question is left out rather than drawn as an
+  // empty box under the heading.
+  q.hidden = !a.question;
+  setText(q, a.question || '');
+  patchOptions(opts, a.options || {});
+  cmd.hidden = !a.answer_with;
+  setText(cmd, a.answer_with || '');
+  // No card was sent, so the owner's phone never buzzed and the command above is
+  // the only way in. lg status says this sentence too, word for word.
+  nocard.hidden = !!a.telegram;
+}
+function patchOptions(box, options) {
+  const rows = new Map([...box.children].map(row => [row.dataset.letter, row]));
+  let after = null;
+  for (const letter of Object.keys(options)) {
+    let row = rows.get(letter);
+    if (row) {
+      rows.delete(letter);
+    } else {
+      row = buildOptionRow(letter);
+      box.insertBefore(row, after ? after.nextSibling : box.firstChild);
+    }
+    setText(row, letter + ' — ' + options[letter]);
+    after = row;
+  }
+  for (const row of rows.values()) row.remove();
+}
+function patchItems(ledger) {
+  const box = document.getElementById('items');
+  box.hidden = !ledger;
+  // A workflow that closed before `items` was a ledger key hands back a
+  // dictionary with no `items` at all — two runs on this machine do — and
+  // /api/run serves that result untouched. Missing reads as empty, which is what
+  // `no items yet` is for; ledger.items.map() would be a TypeError on a run the
+  // owner can click today.
+  const items = (ledger && ledger.items) || [];
+  const [, rows, none] = box.children;
+  const have = new Map([...rows.children].map(row => [row.dataset.n, row]));
+  let after = null;
+  for (const entry of items) {
+    const key = String(entry.n);
+    let row = have.get(key);
+    if (row) {
+      have.delete(key);
+    } else {
+      row = buildItemRow(key);
+      rows.insertBefore(row, after ? after.nextSibling : rows.firstChild);
+    }
+    patchItemRow(row, entry);
+    after = row;
+  }
+  for (const row of have.values()) row.remove();
+  none.hidden = items.length > 0;
+}
+function patchItemRow(row, entry) {
+  const [n, what, state, detail] = row.children;
+  setText(n, String(entry.n));
+  setText(what, entry.item || '');
+  state.className = 'pill ' + pill(entry.status);
+  setText(state, entry.status || '');
+  // A done item's commit, cut to the length anyone actually reads, or a parked
+  // item's reason, which is the only thing that says why the run moved on.
+  setText(detail, entry.status === 'done' ? String(entry.commit || '').slice(0, 10)
+                : entry.status === 'parked' ? String(entry.reason || '') : '');
+}
+// One reply, three sections. patchRounds is not called from here: the log names
+// come from the other request and have to be handed down with the run they were
+// fetched for, which only poll() holds.
+function patchBoard(d) {
+  patchState(d);
+  patchAwaiting(d && d.ledger);
+  patchItems(d && d.ledger);
 }
 function buildRoundCard(key) {
   const card = document.createElement('div');
@@ -240,7 +416,7 @@ function patchRounds(dir, names) {
   // `dir` is passed in, never read off `sel`: these names were fetched for one
   // run and the panes built from them have to be stamped with that same run,
   // whatever the reader has clicked since.
-  const board = document.getElementById('board');
+  const box = document.getElementById('rounds');
   const rounds = {};
   for (const name of names) {
     const m = name.match(LOG_RE);
@@ -249,24 +425,24 @@ function patchRounds(dir, names) {
     (rounds[key] ||= {})[m[3]] = name;
   }
   const keys = Object.keys(rounds).sort().reverse();
-  const empty = board.querySelector('.empty');
+  const empty = box.querySelector('.empty');
   if (!keys.length) {
     if (empty) { setText(empty, 'no logs yet for this run'); return; }
     const line = document.createElement('div');
     line.className = 'empty';
     setText(line, 'no logs yet for this run');
-    board.append(line);
+    box.append(line);
     return;
   }
   if (empty) empty.remove();
   for (const key of keys) {
-    let card = [...board.children].find(c => c.dataset.key === key);
+    let card = [...box.children].find(c => c.dataset.key === key);
     if (!card) {
       card = buildRoundCard(key);
       // Newest first, and inserted rather than re-sorted: the cards already on
       // the board are in order, so putting each new one in front of the first
       // older card moves nothing the reader is looking at.
-      board.insertBefore(card, [...board.children].find(c => c.dataset.key < key) || null);
+      box.insertBefore(card, [...box.children].find(c => c.dataset.key < key) || null);
     }
     const panels = card.lastElementChild;
     for (const [role, label] of ROLES) {
@@ -332,9 +508,14 @@ async function runs() {
   const hdr = document.getElementById('hdr');
   try {
     const d = await (await fetch('/api/runs')).json();
-    const rows = d.runs || [];
-    patchRuns(rows);
-    if (!sel && rows.length) { sel = {id: rows[0].id, dir: rows[0].dir}; patchSelected(); poll(); }
+    patchRuns(d.runs || []);
+    // Nothing chosen yet: take the first row the way the reader would. Through
+    // the row's own handler, so there is one path that sets `sel`, builds the
+    // board and starts its poll — a second copy of it here would be a poll
+    // function calling buildBoard, which is the redraw AC-14 forbids, and a
+    // board that was never built has no sections for a patch to fill.
+    const first = document.getElementById('runs').firstElementChild;
+    if (!sel && first) first.click();
     setText(hdr, d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only');
   } catch(e) { setText(hdr, 'server error'); }
 }
@@ -354,8 +535,14 @@ async function poll() {
   const run = sel;
   if (!run) return;
   try {
-    const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(run.dir))).json();
-    if (run === sel) patchRounds(run.dir, d.logs || []);
+    // Both requests go out together, and the board is patched from the pair. The
+    // state and the logs are one run's answer, and fetching them a poll apart
+    // would put a verdict on screen beside the round before it.
+    const [state, logs] = await Promise.all([
+      fetch('/api/run?id=' + encodeURIComponent(run.id)).then(r => r.json()),
+      fetch('/api/logs?dir=' + encodeURIComponent(run.dir)).then(r => r.json()),
+    ]);
+    if (run === sel) { patchBoard(state); patchRounds(run.dir, logs.logs || []); }
   } catch(e) { /* the board keeps what it has until the next poll */ }
   patchOpenPanes();
 }
