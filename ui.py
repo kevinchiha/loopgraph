@@ -8,8 +8,10 @@ items, and one card per round carrying what the supervisor said about it and the
 two collapsed log panes that round wrote. An open pane asks for the bytes past
 the ones it already has every 2 seconds and appends them; a collapsed one asks
 for nothing. A round the executor is still working in has a growing log and no
-ledger row yet, and gets a card that says so. If Temporal is down the page says
-so and still tails log files.
+ledger row yet, and gets a card that says so. Last comes the branch diff, one
+pane for the whole run because every round shares one branch, fetched when the
+reader opens it and never on a timer. If Temporal is down the page says so and
+still tails log files.
 
 Run: lg ui [--port 8400]  →  http://localhost:8400
 """
@@ -134,6 +136,25 @@ PAGE = """<!doctype html>
                  font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; word-break:break-word; }
   .body .t { color:var(--dim); } .body .tool { color:var(--purple); }
   .body .res { color:var(--dim); } .body .asst { color:var(--fg); }
+  /* One diff for the whole run, at the foot of the board. It is a .panel like the
+     log panes and is styled with them, and everything below is where it differs. */
+  #diff { margin-bottom:22px; }
+  .panel.diff > summary { color:#3fb950; }
+  /* A log pane is a window onto a file that keeps growing, so it is given a fixed
+     44vh whether it is full or not. A diff is a finished thing, and most of them
+     are the one line saying the branch is already merged: an empty box that deep
+     around it reads as a pane that failed to load. It grows to what it holds. */
+  .panel.diff .body { height:auto; max-height:60vh; }
+  /* The patch is a <pre>, which comes with a font and a white-space of its own
+     that would undo the body's. Wrapped rather than scrolled sideways: a diff of
+     a minified file is one line, and a horizontal scrollbar inside a collapsed
+     pane inside a scrolling board is three things to get out of. */
+  .panel.diff pre { font:inherit; white-space:pre-wrap; word-break:break-word; }
+  /* Nothing between the stat and a patch that is not there. On every run the
+     owner has approved, that one line in the stat is the whole of the pane. */
+  .panel.diff pre:empty { display:none; }
+  .panel.diff .stat { color:var(--dim); margin-bottom:10px; }
+  .panel.diff .cut { margin-top:10px; color:#d29922; }
   /* Stacked, the cross axis is the width, so a collapsed pane must stretch to it
      or it shrinks to the width of its own label. */
   @media (max-width:900px) { .panels { flex-direction:column; align-items:stretch; }
@@ -147,11 +168,15 @@ PAGE = """<!doctype html>
 //   build…  makes an element and pours markup into it, once, before anything is
 //           on screen. It is the only place innerHTML may appear, and the only
 //           element it may be set on is the one the function just created.
-//   patch…  runs on every poll. It changes text, attributes and classes, adds
-//           and removes children, and appends with insertAdjacentHTML. It never
-//           assigns innerHTML, because that would throw away every node under
-//           the element — including the one holding the reader's selection, and
-//           the open pane they were reading — and build them all again.
+//   patch…  changes what is already on screen. It changes text, attributes and
+//           classes, adds and removes children, and appends with
+//           insertAdjacentHTML. It never assigns innerHTML, because that would
+//           throw away every node under the element — including the one holding
+//           the reader's selection, and the open pane they were reading — and
+//           build them all again. All of them but patchDiff run on every poll;
+//           patchDiff runs when its pane is opened. The name says what the
+//           function does, not what calls it, and it keeps the polling rules
+//           either way: a third name would be a rule that stopped applying.
 //
 // Two more shapes are innerHTML wearing a hat, and neither of them mentions it:
 //
@@ -213,7 +238,7 @@ function buildRunRow(entry) {
   // The closure keeps the reply this row was first built from, and that is safe
   // because neither field it reads ever moves: the id is what the row is found by
   // from here on, and the server works the directory out from the id.
-  div.onclick = () => { sel = {id: entry.id, dir: entry.dir}; patchSelected(); buildBoard(); poll(); };
+  div.onclick = () => { sel = {id: entry.id, dir: entry.dir}; patchSelected(); buildBoard(sel.id); poll(); };
   return div;
 }
 function patchRunRow(row, entry) {
@@ -277,7 +302,10 @@ function patchRuns(entries) {
 // Every section is made here, once, and the patches only ever fill them in or
 // hide them. That is what lets a poll be a poll: nothing on the 2-second path
 // has to decide whether a part of the page exists yet.
-function buildBoard() {
+// `id` is handed in rather than read off `sel`, the same way patchRounds is handed
+// its directory: the board is built for one run, and the diff pane it carries is
+// stamped with that run's workflow id once, here.
+function buildBoard(id) {
   const board = document.getElementById('board');
   board.replaceChildren();
   const sections = document.createElement('div');
@@ -296,6 +324,10 @@ function buildBoard() {
     + '<div class="none">no items yet</div></section>'
     + '<div id="rounds"></div><div id="diff" hidden></div>';
   board.append(sections);
+  // One pane, for the run and not for a round: execute_round derives the branch
+  // and the worktree from the run token, so every round of a run diffs to the
+  // same thing and a copy under each card would be the same patch drawn twice.
+  sections.lastElementChild.append(buildDiffPane(id));
 }
 function buildOptionRow(letter) {
   const row = document.createElement('div');
@@ -519,7 +551,10 @@ function buildLogPane(dir, name, label) {
   // <details> carries "open" itself and fires toggle, so there is no collapse
   // state of ours to get out of step with what the reader can see.
   const pane = document.createElement('details');
-  pane.className = 'panel ' + (label === 'executor' ? 'exec' : 'audit');
+  // `log` is what patchOpenPanes selects on. Not `.panel`: the diff pane is one of
+  // those too and holds no log name, so a poll that took it in would ask /api/log
+  // for `undefined` every 2 seconds for as long as the reader left it open.
+  pane.className = 'panel log ' + (label === 'executor' ? 'exec' : 'audit');
   // Everything the pane needs to poll itself: which file, how far into it this
   // pane has read, and whether the last reply said its head had been cut.
   pane.dataset.dir = dir;
@@ -605,7 +640,7 @@ async function patchOpenPanes() {
   if (panePoll) return;
   panePoll = true;
   try {
-    for (const pane of document.querySelectorAll('.panel[open]')) {
+    for (const pane of document.querySelectorAll('.panel.log[open]')) {
       const body = pane.lastElementChild;
       const offset = Number(pane.dataset.offset);
       const cut = pane.dataset.cut === '1';
@@ -647,6 +682,53 @@ async function patchOpenPanes() {
       if (stick) body.scrollTop = body.scrollHeight;
     }
   } finally { panePoll = false; }
+}
+// The run's branch diff. One pane, collapsed like the log panes, and fetched on
+// the reader's gesture rather than on a timer: the answer is two git commands in
+// a repository the owner may be working in this second, and a closed run's branch
+// does not change while the tab is open.
+function buildDiffPane(id) {
+  const pane = document.createElement('details');
+  pane.className = 'panel diff';
+  // A workflow id, and it has to be one: /api/diff reads the branch off the ledger
+  // this id names. The run directory the log panes carry is the other key — two
+  // workflows write one directory — and it would name no ledger here.
+  pane.dataset.id = id;
+  // The cut line is written once, here, and only shown or hidden from now on. It
+  // never changes, the same way the awaiting block's no-card sentence never does.
+  pane.innerHTML = '<summary></summary><div class="body"><div class="stat"></div>'
+                 + '<pre></pre><div class="cut" hidden>patch cut at 200 KB</div></div>';
+  pane.firstElementChild.textContent = 'diff';
+  pane.addEventListener('toggle', () => { if (pane.open) patchDiff(pane); });
+  return pane;
+}
+// Every opening asks again and the reply replaces what the last one said. Nothing
+// polls this, so it runs on the gesture that opened the pane: there is no
+// selection inside it to lose that the same gesture did not just uncover.
+async function patchDiff(pane) {
+  const [stat, patch, cut] = pane.lastElementChild.children;
+  // Said before the request goes out, so a pane opened a second time is never the
+  // previous diff sitting there reading as this one. git has 20 seconds to answer.
+  setText(stat, 'loading…');
+  let d;
+  try {
+    // The id the pane was built with, never the selection: a reader who moved on
+    // while this was in flight has a board built since, and this pane went with
+    // the one they left — writing into it reaches nobody, which is the answer.
+    d = await (await fetch('/api/diff?id=' + encodeURIComponent(pane.dataset.id))).json();
+  } catch (e) {
+    // The dashboard's own server, not the diff. Every way the diff itself can fail
+    // comes back 200 with its own line in `stat`, so there is nothing else this
+    // can be, and it is the word the header already says for the same condition.
+    setText(stat, 'server error');
+    return;
+  }
+  // `stat` is never empty here: diff_payload fills both empty diffs in with the
+  // line that tells them apart, so an empty pane would be that endpoint's bug and
+  // not a case to guess at. A merged run says so where a real stat would sit.
+  setText(stat, d.stat || '');
+  setText(patch, d.patch || '');
+  cut.hidden = !d.truncated;
 }
 async function runs() {
   const hdr = document.getElementById('hdr');

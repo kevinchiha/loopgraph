@@ -496,8 +496,100 @@ def test_the_injected_pattern_survives_javascript():
 #            on a row already on the page keeps the node and loses the selection
 #   NOT      anything about how often a build… function is actually called
 #
-# The NOT list is Task 16's browser checklist, not a list of things that do not
-# matter. What each test cannot see is written in its own docstring.
+# The NOT list is not a list of things that do not matter. It is the top of the
+# checklist below, and every entry on it reaches the reader as one of two things
+# they can see: a highlight that disappears, or a pane that shuts itself. Items 1
+# and 2 are how you look for them. What else each test cannot see is written in
+# its own docstring.
+#
+#
+# ---------- the browser checklist ----------
+#
+# Run this by hand whenever PAGE changes. Nothing in this file has ever seen the
+# page: it reads the JavaScript as text, so anything about how the page LOOKS is
+# outside every check in it. Two defects shipped through a green suite in this
+# phase alone. Sections that set `hidden` stayed on screen, because a `display` in
+# the page's own stylesheet outranks the browser's built-in `[hidden]` rule — CSS,
+# which nothing here parses. And a board said three contradictory things about one
+# run at once: a card reading `in progress`, a row reading `unknown`, a line saying
+# the page knew nothing. Each half was right on its own.
+#
+# Five minutes, in this order. Start the dashboard on a port that is not the
+# owner's 8400 — `.venv/bin/python ui.py 8410` — open http://localhost:8410, and
+# open the browser's developer tools at the Network tab (F12). Keep an eye on the
+# Console tab too: an exception thrown inside a fetch is why a pane goes blank,
+# and it is the one failure that leaves no mark on the page. The rail takes a few
+# seconds to fill on a machine with a dozen runs, because every row waits on
+# Temporal. Pick a run that has rounds.
+#
+#  1. Select some text in a run row in the left rail. Wait 15 seconds, touching
+#     nothing. That is three of the run list's 4-second polls, and you can see them
+#     go past as `/api/runs` rows in the network panel.
+#     See: the highlight is still there and the row has not moved. If a run in the
+#     rail is still open, its duration counts up while you wait; if every run has
+#     finished, the network rows are the proof the polls are running at all.
+#     If the highlight goes, a poll is making new nodes where it should be writing
+#     over the ones on screen — the run list is being rebuilt, not patched.
+#
+#  2. Open a round's executor log. Scroll up inside it, away from the bottom, and
+#     select a line. Wait 10 seconds — five of the board's 2-second polls.
+#     See: the pane is still open, still scrolled where you left it, and the line
+#     is still highlighted.
+#     If the pane shuts or the scroll jumps to the bottom, a poll is replacing the
+#     pane's contents rather than adding to the end of them. On a run that is still
+#     writing, watch a second longer: new lines arrive at the bottom and do not
+#     drag you down to them.
+#
+#  3. Click a run in the rail whose pill reads `unknown` and whose detail reads
+#     `logs only` — a directory with no workflow behind it.
+#     See: one line, `no workflow for this run` or `temporal unreachable — logs
+#     only`, and then the log cards. Nothing above that line. No status pill, no
+#     `answer with:` box, no work items, no diff pane.
+#     Anything still showing is a section that set `hidden` and stayed visible,
+#     which is the CSS bug: the page needs `[hidden] { display:none !important }`
+#     to beat its own rules, and something has got past it.
+#
+#  4. Read a run's row and its board together, on several runs.
+#     See: the pill in the row and the pill on the board say the same word, and
+#     nothing says `in progress` on a run whose row shows a duration that has
+#     stopped.
+#     A page that contradicts itself here is worse than one that says nothing: the
+#     reader cannot tell which half to believe.
+#
+#  5. Scroll to the foot of the board, past the round cards. The diff pane is
+#     there, closed. Open it.
+#     See: exactly one `GET /api/diff?id=…` in the network panel, a `stat` naming
+#     the files the branch changed, and the patch under it. The pane grows to what
+#     it holds and stops short of filling the window, scrolling inside itself. A
+#     one-line answer gets a one-line box, not an empty one eleven lines deep.
+#     A blank pane is a bug in /api/diff, not in the page: that endpoint answers
+#     every failure with a line to show, so an empty pane means it sent none.
+#     On a run that was discarded the line is `no worktree pointer at …`, because
+#     `lg discard` removed the worktree. That is the right answer, not a failure.
+#     If the stat says thousands of changed lines, scroll to the end of the patch:
+#     it either stops where the diff stops or says `patch cut at 200 KB`.
+#
+#  6. Close the diff pane and wait 10 seconds. Open it again.
+#     See: no `/api/diff` at all while it is closed, and exactly one more when it
+#     opens. The log panes go on polling throughout; the diff never joins them.
+#
+#  7. Click a run whose rail pill reads `merged` and open its diff.
+#     See: `already merged into <base>; the branch adds nothing to it`. That is the
+#     state of every run the owner has approved, so it is the diff they will see
+#     most often, and a pane that renders blank instead tells them nothing.
+#     `branch not found: lg-…` is the same run with its branch deleted by hand
+#     after the merge. Also right, but it is not this check — try another.
+#
+#  8. Leave a log pane open AND the diff pane open, watch the network panel for 10
+#     seconds and read every row.
+#     See: `/api/runs`, `/api/run`, `/api/logs` and `/api/log` — those four, all
+#     GET, and nothing else. Every `/api/log` row names a real log file. A
+#     collapsed pane asks for nothing, so the number of `/api/log` rows matches the
+#     number of panes you left open.
+#     `name=undefined` in a `/api/log` row is the log poll having picked up the
+#     diff pane, which is a `.panel` too and holds no log name. Any other method is
+#     a dashboard that is no longer read-only. Any other path is a request nobody
+#     meant to send.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
@@ -1461,6 +1553,56 @@ def test_a_round_card_carries_what_ac8_asks_for():
     rule = re.search(r"\.round \.field span \{([^}]*)\}", ui.page_html())
     assert rule and "pre-wrap" in rule.group(1), \
         "the lines a round is patched with are collapsed back into one"
+
+
+# ---------- the diff pane ----------
+
+
+def test_the_diff_is_fetched_by_workflow_id():
+    """AC-15. The two keys are not interchangeable and this is the page's end of
+    the split: `/api/diff` takes a workflow id, `/api/log` takes a run directory,
+    and two workflows of one run directory share the second and not the first.
+    Sending `dir` here would draw one run's branch on the other's board.
+
+    The id is the one the pane was built with rather than whatever `sel` says when
+    the reply lands: a reader who picks another run mid-request has a new board,
+    and this pane must not write a stale diff into it.
+    """
+    html = ui.page_html()
+    assert "/api/diff?id=" in html, "the page never asks for the diff"
+    assert "patch cut at 200 KB" in html, "a patch stopped at the cap says nothing about it"
+    src = function_source(html, "patchDiff")
+    assert "dataset.id" in src, "the pane asks for something other than the id it holds"
+    assert not re.search(r"\bsel\b", src), "the pane reads the global selection instead"
+    assert "dir" not in src, "a run directory reaches the endpoint that takes an id"
+
+
+def test_the_diff_pane_is_opened_not_polled():
+    """AC-9. The diff is two git commands against the owner's own repository, so
+    it goes out when the reader asks for it and never on a timer. A collapsed pane
+    sends nothing; each opening sends one request.
+
+    The log panes are the other half: `patchOpenPanes` runs every 2 seconds over
+    every open pane, so its selector has to name the panes that poll rather than
+    every `.panel` on the board — the diff pane is one of those, and it carries no
+    log name to ask about.
+    """
+    html = ui.page_html()
+    src, regs = regions(html)
+    asking = {n for n, s, e in regs if "/api/diff" in src[s:e]}
+    assert asking == {"patchDiff"}, f"the diff is fetched from {asking}"
+    callers = {n for n, s, e in regs if n != "patchDiff" and "patchDiff(" in src[s:e]}
+    assert callers == {"buildDiffPane"}, f"patchDiff is called from {callers}"
+
+    build = function_source(html, "buildDiffPane")
+    assert "createElement('details')" in build, "the pane cannot collapse itself"
+    assert re.search(r"addEventListener\('toggle'.*\.open\).*patchDiff\(", build), \
+        "the pane does not fetch when it is opened"
+
+    polled = function_source(html, "patchOpenPanes")
+    assert "/api/log?" in polled and "/api/diff" not in polled
+    assert ".panel[open]" not in polled, \
+        "the poll's selector takes in the diff pane, which has no log to ask for"
 
 
 # ---------- the host repository behind a run's worktree ----------
