@@ -122,11 +122,11 @@ still pass, and nothing outside the page you named got touched. You judge the lo
 yourself, on the branch, when it asks. That is still most of the tedium off your
 desk, and you are reviewing a finished thing instead of watching it get made.
 
-Note the "start with the settings page". A run does one job at a time, so a whole
-app is a series of runs, one page each. That is not a limitation to work around,
-it is what keeps the write set small enough for the scope gate to mean anything.
-Ask for the whole app in one brief and you get one enormous diff nobody can audit,
-which is the thing you were trying to get away from.
+Note the "start with the settings page". Today a run carries one work item: its
+three rounds are correction attempts on that item, not progress through a list. So
+a four-page redesign is four runs, each wanting your approval. Keeping each write
+set small is genuinely what makes the scope gate worth anything, but needing a
+separate run per page is a missing feature, not a design position.
 
 The agent writes the brief and the write set, digs the real check commands out of
 `package.json` or `pyproject.toml`, confirms they pass on a clean tree before
