@@ -514,8 +514,10 @@ def test_the_injected_pattern_survives_javascript():
 # run at once: a card reading `in progress`, a row reading `unknown`, a line saying
 # the page knew nothing. Each half was right on its own.
 #
-# Five minutes, in this order. Start the dashboard on a port that is not the
-# owner's 8400 — `.venv/bin/python ui.py 8410` — open http://localhost:8410, and
+# Ten minutes, in this order — items 1, 2, 6 and 8 are 45 seconds of waiting on
+# their own, and an honest number gets a checklist finished rather than dropped
+# halfway through. Start the dashboard on a port that is not the owner's 8400 —
+# `.venv/bin/python ui.py 8410` — open http://localhost:8410, and
 # open the browser's developer tools at the Network tab (F12). Keep an eye on the
 # Console tab too: an exception thrown inside a fetch is why a pane goes blank,
 # and it is the one failure that leaves no mark on the page. The rail takes a few
@@ -572,6 +574,11 @@ def test_the_injected_pattern_survives_javascript():
 #  6. Close the diff pane and wait 10 seconds. Open it again.
 #     See: no `/api/diff` at all while it is closed, and exactly one more when it
 #     opens. The log panes go on polling throughout; the diff never joins them.
+#     Then stop the dashboard with the pane closed and open it once more.
+#     See: `server error`, on its own. Not `server error` above the patch the last
+#     opening put there — a pane that keeps half of an answer it has disowned is
+#     the page contradicting itself again, in the one place a reader would read it
+#     as current.
 #
 #  7. Click a run whose rail pill reads `merged` and open its diff.
 #     See: `already merged into <base>; the branch adds nothing to it`. That is the
@@ -590,6 +597,18 @@ def test_the_injected_pattern_survives_javascript():
 #     diff pane, which is a `.panel` too and holds no log name. Any other method is
 #     a dashboard that is no longer read-only. Any other path is a request nobody
 #     meant to send.
+#
+#  9. Only when a run is actually holding a card. There was no such run on this
+#     machine the day this was written, so this item goes unrun more often than
+#     not — which is the reason it is written down rather than left out. Click the
+#     run that is waiting and find the block above the work items.
+#     See: the question with its own line breaks, the options, and the `lg approve
+#     …` command in a box. One click inside the box selects the whole command and
+#     nothing else — not the words `answer with:` beside it, which would go into
+#     the shell with it.
+#     That box is `display:inline-block`, the same shape as the rule that beat
+#     `hidden` in item 3, and the command is the highest-stakes text on the page:
+#     it is the only thing here that changes what a run does.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 

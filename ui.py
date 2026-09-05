@@ -13,6 +13,11 @@ pane for the whole run because every round shares one branch, fetched when the
 reader opens it and never on a timer. If Temporal is down the page says so and
 still tails log files.
 
+Changing PAGE means running the browser checklist in tests/test_ui.py by hand.
+That file reads this JavaScript as text and has never seen the page, so how the
+page looks, and what a poll does to the text a reader has selected, are outside
+every test in it: three defects have shipped past a green suite already.
+
 Run: lg ui [--port 8400]  →  http://localhost:8400
 """
 
@@ -707,15 +712,26 @@ function buildDiffPane(id) {
 // selection inside it to lose that the same gesture did not just uncover.
 async function patchDiff(pane) {
   const [stat, patch, cut] = pane.lastElementChild.children;
-  // Said before the request goes out, so a pane opened a second time is never the
-  // previous diff sitting there reading as this one. git has 20 seconds to answer.
+  // All three, and before the request goes out. Clearing the line alone left the
+  // last answer's patch underneath the next one's: open the pane on a 67 KB diff,
+  // close it, lose the server, open it again, and the pane read `server error`
+  // over 67 KB of patch that was no longer being claimed by anything. A page
+  // saying two things at once is the failure this whole phase is about.
   setText(stat, 'loading…');
+  setText(patch, '');
+  cut.hidden = true;
   let d;
   try {
     // The id the pane was built with, never the selection: a reader who moved on
     // while this was in flight has a board built since, and this pane went with
     // the one they left — writing into it reaches nobody, which is the answer.
-    d = await (await fetch('/api/diff?id=' + encodeURIComponent(pane.dataset.id))).json();
+    const r = await fetch('/api/diff?id=' + encodeURIComponent(pane.dataset.id));
+    // fetch rejects on a broken connection and NOT on a 4xx, so without this a
+    // 400 would be read as a diff: `stat` undefined, and a pane rendering blank.
+    // The endpoint answers 200 with a line for every failure of its own, so a
+    // status that is not 200 is a request this page should never have sent.
+    if (!r.ok) throw new Error('/api/diff answered ' + r.status);
+    d = await r.json();
   } catch (e) {
     // The dashboard's own server, not the diff. Every way the diff itself can fail
     // comes back 200 with its own line in `stat`, so there is nothing else this

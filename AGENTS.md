@@ -25,7 +25,9 @@ produces bug reports nobody can reproduce.
   the run it belongs to (`activities/route.py`) and signals it. Nothing else may
   call `getUpdates`: Telegram allows one poller per bot, and a second one steals
   replies and triggers 409s.
-- `ui.py` — read-only dashboard on port 8400.
+- `ui.py` — read-only dashboard on port 8400. Change its `PAGE` string and you
+  must run the browser checklist in `tests/test_ui.py` by hand: the suite reads
+  that JavaScript as text and cannot see the page.
 - `runs/` — run directories. Gitignored except the shipped examples.
 
 ## Rules that bite if you ignore them
