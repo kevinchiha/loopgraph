@@ -62,6 +62,15 @@ after installing.) The run dir already exists. Skip to step 2 with
   test across two items; they share one verification, so they are one item. Leave
   the heading out for anything small and the whole brief is a single item.
 
+  **A decision that is genuinely the user's can stay out of the brief.** Say
+  plainly that it is theirs, that nothing in the repo settles it, and that no
+  default is to be picked. The executor builds everything the answer will need,
+  reports the decision as a blocker, and the supervisor checks whether the repo
+  really is silent on it before putting it to the user as a card. So do not guess
+  a policy on their behalf to keep a brief tidy, and do not bury the question in
+  prose and hope somebody notices. This costs the run nothing: a question does not
+  spend a correction round.
+
   Items must stand alone. No item's done-when may depend on another item landing
   first, because any of them can park and the rest carry on regardless. Keep their
   write sets apart too where the work allows it: two items editing one file is how
@@ -92,8 +101,10 @@ after installing.) The run dir already exists. Skip to step 2 with
   Traps worth knowing: Next.js 16 and later have no `next lint`; npm gates in a
   fresh worktree need `npm ci --prefer-offline --no-audit --silent &&` in front,
   and `npm ci` needs a lockfile the repo actually tracks (`git ls-files
-  package-lock.json` — a worktree holds tracked files and nothing else); every
-  gate needs a timeout.
+  package-lock.json` — a worktree holds tracked files and nothing else); a Python
+  project with a `src/` layout needs `pip install -e ".[dev]" -q &&` in front, or
+  the tests cannot import the package they are testing; every gate needs a
+  timeout.
 
   **Green gates are not the last check.** After the audit accepts, the engine
   stages the write set and runs `git diff --cached --check` before committing. An
@@ -106,11 +117,25 @@ after installing.) The run dir already exists. Skip to step 2 with
   BEFORE starting the run. In order matters: a test gate that writes
   `__pycache__/` or `.pytest_cache/` will turn a later scope gate red, and that
   defect is invisible if you only run each gate against a clean tree. The fix is
-  a `.gitignore` in the target repo, never a weakened scope gate. Use the closest host
-  equivalent where a gate's interpreter only exists in the container. A gate that
+  a `.gitignore` in the target repo, never a weakened scope gate. A gate that
   cannot pass on an untouched repo will burn three executor rounds and escalate.
   If one fails on the clean tree, the project is already broken: report that
   instead of starting a run.
+
+  **Prove them on tracked files only, in the container.** A run works in a fresh
+  worktree, which holds what git tracks and nothing else. Your checkout also holds
+  `node_modules`, a `.venv`, a config file you never committed, and any of them can
+  be the only reason a gate passes for you. Build the same tree the run will get:
+
+  ```bash
+  <docker> compose exec -T worker sh -c '
+    rm -rf /tmp/gatetest && mkdir -p /tmp/gatetest
+    git -C /projects/<repo> archive HEAD | tar -x -C /tmp/gatetest
+    cd /tmp/gatetest && <each gate command, in order>'
+  ```
+
+  That also settles the interpreter question, since it runs where the gates will
+  run, and it tells you what a round actually costs in wall-clock time.
 
 ## 2. Start and watch
 
@@ -140,10 +165,11 @@ never returns, so background it or use the dashboard instead.
 A run stops at a decision and holds there, changing nothing, until the user
 answers. Tell them a decision is coming and how to answer it:
 
-- A card lands in the bot `lg where` names. Buttons on merge-ready cards,
-  plain-text replies on question cards. Tell the user to **reply to the card**
-  rather than sending a new message: that is what tells the engine which run they
-  are answering when more than one is in flight.
+- A card lands in the bot `lg where` names. A merge card always has buttons. A
+  question card has them when the supervisor could name the choices and a reply
+  box when it could not, so tell the user both are possible. Tell them to **reply
+  to the card** rather than sending a new message: that is what tells the engine
+  which run they are answering when more than one is in flight.
 - From a terminal: `lg approve <workflow-id> A`. Give them this too; it is faster
   when they are already at the machine.
 - Whatever they answer is written to `owner-answers.md` in the run dir, and both
