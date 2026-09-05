@@ -119,7 +119,9 @@ A run stops at a decision and holds there, changing nothing, until the user
 answers. Tell them a decision is coming and how to answer it:
 
 - A card lands in the bot `lg where` names. Buttons on merge-ready cards,
-  plain-text replies on question cards.
+  plain-text replies on question cards. Tell the user to **reply to the card**
+  rather than sending a new message: that is what tells the engine which run they
+  are answering when more than one is in flight.
 - From a terminal: `lg approve <workflow-id> A`. Give them this too; it is faster
   when they are already at the machine.
 

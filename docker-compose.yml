@@ -64,6 +64,29 @@ services:
       - ${LOOPGRAPH_NPM_CACHE:?not set - run ./install.sh}:/home/worker/.npm
     restart: unless-stopped
 
+  dispatcher:
+    # The only thing that reads Telegram. Telegram allows one getUpdates per bot,
+    # and text replies carry no run id, so runs polling for themselves fought over
+    # the connection and ate each other's answers. This routes each update to the
+    # run it names and signals that workflow.
+    build:
+      context: .
+      args:
+        LOOPGRAPH_UID: ${LOOPGRAPH_UID:-1000}
+    depends_on: [temporal]
+    network_mode: host
+    environment:
+      TEMPORAL_ADDRESS: localhost:7233
+    env_file:
+      - path: .env
+        required: false
+      - path: ${LOOPGRAPH_TELEGRAM_ENV:?not set - run ./install.sh}
+        required: true
+    volumes:
+      - ./:/app
+    command: ["python", "dispatcher.py"]
+    restart: unless-stopped
+
 volumes:
   temporal-pg:
 

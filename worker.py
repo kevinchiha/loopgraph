@@ -15,7 +15,7 @@ from activities.gate import run_gates
 from activities.items import load_work_items
 from activities.learn import learn
 from activities.notify import configured as telegram_ok
-from activities.notify import poll_reply, send_card, telegram_configured, wait_decision
+from activities.notify import send_card, telegram_configured
 from workflows.run import GateCheckRun, LoopGraphRun, RoundRun
 
 TASK_QUEUE = "loopgraph"
@@ -46,8 +46,7 @@ async def main() -> None:
         task_queue=TASK_QUEUE,
         workflows=[GateCheckRun, RoundRun, LoopGraphRun],
         activities=[run_gates, execute_round, audit, checkpoint, merge, discard, learn,
-                    load_work_items, send_card, wait_decision, telegram_configured,
-                    poll_reply],
+                    load_work_items, send_card, telegram_configured],
     )
     print(f"worker up on task queue {TASK_QUEUE!r}", flush=True)
     await worker.run()

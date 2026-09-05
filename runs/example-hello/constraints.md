@@ -1,2 +1,4 @@
 - Add each CLI flag in cli.py mirroring --version: independent `if` block printing the exact literal, plus a subprocess-based test in test_cli.py styled on test_version.
 - In cli.py, give each flag its own independent `if args.<flag>:` block — never elif or shared branches — so flags compose and print only their own line.
+- Don't trust the scope gate: check-write-set.sh is vacuously green (`read -r -d` under `#!/bin/sh`); verify scope yourself via `git status --porcelain`.
+- Verify scope independently with `git status --porcelain` — check-write-set.sh is #!/bin/sh but uses bashism `read -r -d ""`, so it passes vacuously.

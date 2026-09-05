@@ -287,6 +287,10 @@ for _ in $(seq 60); do
 done
 (cd "$ROOT" && $DOCKER compose logs worker 2>/dev/null | grep -q "worker up on task queue") \
   || { (cd "$ROOT" && $DOCKER compose logs worker | tail -20); die "worker did not come up (log above)"; }
+# Without the dispatcher, cards go out and nothing comes back.
+(cd "$ROOT" && $DOCKER compose logs dispatcher 2>/dev/null | grep -q "dispatcher up") \
+  || { (cd "$ROOT" && $DOCKER compose logs dispatcher | tail -20)
+       die "the dispatcher did not come up, so replies would never reach a run (log above)"; }
 
 # --------------------------------------------------------------- 8. example ---
 EXAMPLE="$PROJECTS/loopgraph-example"

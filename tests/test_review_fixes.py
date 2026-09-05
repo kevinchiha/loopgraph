@@ -526,28 +526,28 @@ def test_discard_removes_the_worktree_that_holds_the_branch(tmp_path):
 
 # ---------- taps land on the card that is actually up ----------
 
-def test_a_tap_on_an_old_card_does_not_answer_the_current_one():
-    """The failure: an earlier card is still sitting in the chat and still
-    tappable, and any tap for the run was accepted, so a letter that is not even
-    on the current card decided it."""
-    from activities.notify import cb_key, extract_reply
-    wf = "run-demo-ab12cd"
-    updates = [{"update_id": 7,
-                "callback_query": {"id": "cb1", "data": f"lg:{cb_key(wf)}:D"}}]
-    assert extract_reply(updates, wf, "42", allowed={"A", "B", "C"}) is None
-    assert extract_reply(updates, wf, "42", allowed={"D", "E"})[1] == "D"
+def test_a_tap_on_an_old_card_cannot_decide_a_merge_it_was_not_offered():
+    """An earlier card is still in the chat and still tappable. The letter check
+    lives in the workflow now: a merge card takes only its own letters, so a stale
+    tap arrives as a signal and is ignored rather than acted on."""
+    from workflows.run import LoopGraphRun
+    wf = LoopGraphRun()
+    wf.decide("D")
+    assert wf._peek({"A", "B", "C"}) is None
+    assert wf._peek({"D", "E"}) == 0
 
 
-def test_a_reply_carries_the_update_it_came_from():
-    """poll_reply must confirm exactly what it consumed. Acknowledging everything
-    it read while returning one answer destroyed the rest."""
-    from activities.notify import extract_reply
-    updates = [
-        {"update_id": 11, "message": {"text": "first", "chat": {"id": 42}}},
-        {"update_id": 12, "message": {"text": "second", "chat": {"id": 42}}},
-    ]
-    hit = extract_reply(updates, "run-x", "42")
-    assert hit[1] == "first" and hit[3] == 11, "confirming past 11 would drop 'second'"
+def test_a_run_only_takes_updates_that_name_it():
+    """The failure the dispatcher removes: one run polled, took whatever was
+    pending, and swallowed another run's answer. Routing is now by name."""
+    from activities.route import resolve_by_suffix, route_update
+    card = "loopgraph: decision\nrun: runs/b\nworkflow: run-b-999999\n\nq"
+    u = {"update_id": 1, "message": {"text": "postgres", "chat": {"id": 42},
+                                     "reply_to_message": {"text": card}}}
+    assert route_update(u, "42", ["run-a-111111", "run-b-999999"])["wf_id"] == "run-b-999999"
+    # and an ambiguous truncated key is refused rather than guessed
+    assert resolve_by_suffix("999999", ["run-a-999999", "run-b-999999"]) is None
+    assert resolve_by_suffix("999999", ["run-b-999999"]) == "run-b-999999"
 
 
 # ---------- sub-bullets belong to their item ----------

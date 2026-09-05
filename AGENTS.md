@@ -21,10 +21,21 @@ produces bug reports nobody can reproduce.
   checkpoint, learning, notifications.
 - `graphs/round_graph.py` — the LangGraph loop inside one round.
 - `lg` — the host CLI. No `.py` extension, so tests load it by path.
+- `dispatcher.py` — the only process that reads Telegram. Routes each update to
+  the run it belongs to (`activities/route.py`) and signals it. Nothing else may
+  call `getUpdates`: Telegram allows one poller per bot, and a second one steals
+  replies and triggers 409s.
 - `ui.py` — read-only dashboard on port 8400.
 - `runs/` — run directories. Gitignored except the shipped examples.
 
 ## Rules that bite if you ignore them
+
+**Answers arrive as signals, never by polling.** A workflow waits on
+`wait_condition` for the `decide` signal. `lg approve` sends it directly; a
+Telegram reply reaches it through the dispatcher. Adding a second way in is what
+produced four separate bugs: a retry that re-skipped the queue and lost an answer,
+an unconfirmed update replayed as a fresh instruction, a poll that destroyed the
+updates it did not return, and a stale tap deciding the wrong card.
 
 **Workflow code must be deterministic.** No environment reads, no clocks, no
 randomness, no I/O in `workflows/run.py`. Temporal replays it from history, and a

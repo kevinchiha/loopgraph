@@ -7,7 +7,6 @@ The full LoopGraphRun (rounds, cadences, signals) lands in M3 — same file.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
@@ -21,7 +20,7 @@ with workflow.unsafe.imports_passed_through():
     from activities.gate import run_gates
     from activities.items import load_work_items
     from activities.learn import learn
-    from activities.notify import poll_reply, send_card, telegram_configured, wait_decision
+    from activities.notify import send_card, telegram_configured
 
 
 @workflow.defn
@@ -94,12 +93,6 @@ def build_merge_summary(summary: str, total: int, parked: list[dict]) -> str:
             f"another run.")
 
 
-def _swallow(task: asyncio.Task) -> None:
-    """Loser of a decision race. Retrieve its outcome so the loop stays quiet."""
-    if not task.cancelled():
-        task.exception()
-
-
 @workflow.defn
 class LoopGraphRun:
     """The full run: round → audit → verdict branch. The ledger is workflow state.
@@ -160,15 +153,13 @@ class LoopGraphRun:
                 entry.update(status="parked", reason=outcome["reason"])
                 await self._park_note(run_dir, i, len(items), item, outcome["reason"])
 
-            reply = await workflow.execute_activity(
-                poll_reply,
-                args=[workflow.info().workflow_id],
-                start_to_close_timeout=timedelta(minutes=1),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
-            if reply.get("value"):
-                entry.setdefault("owner_notes", []).append(reply["value"])
-                carried = f"The owner sent this mid-run, after item {i}: {reply['value']}"
+            # Anything the owner sent while that item ran is steering for the next
+            # one. It is already in workflow state: the dispatcher signalled it.
+            notes = self._drain_decisions()
+            if notes:
+                entry.setdefault("owner_notes", []).extend(notes)
+                carried = ("The owner sent this mid-run, after item "
+                           f"{i}: {' / '.join(notes)}")
 
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
         if accepted is None:
@@ -295,6 +286,14 @@ class LoopGraphRun:
         overwritten, so an answer that arrives early is not lost."""
         self._decisions.append(str(value))
 
+    def _drain_decisions(self) -> list[str]:
+        """Everything queued since the last look, as steering notes for the next
+        item. Between items there is no card up, so anything that arrived is a
+        comment on the run rather than an answer to a question."""
+        notes = [d.strip() for d in self._decisions if d.strip()]
+        self._decisions = []
+        return notes
+
     def _peek(self, allowed: set[str] | None) -> int | None:
         """Index of the first queued answer this card will accept, or None.
 
@@ -348,29 +347,15 @@ class LoopGraphRun:
         else:
             workflow.logger.warning("no Telegram configured; answer with: %s", hint)
 
-        sig = asyncio.create_task(workflow.wait_condition(lambda: self._peek(allowed) is not None))
-        tasks: list[asyncio.Task] = [sig]
-        poll: asyncio.Task | None = None
-        if telegram:
-            poll = asyncio.create_task(workflow.execute_activity(
-                wait_decision,
-                args=[wf_id, accept_text, sorted(options)],
-                start_to_close_timeout=timedelta(days=2),
-                heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=100),  # durable indefinite wait
-            ))
-            tasks.append(poll)
-        # workflow.wait, not asyncio.wait: the Temporal sandbox flags the asyncio one
-        # as non-deterministic, and this is the code path that decides a merge.
-        done, pending = await workflow.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-            t.add_done_callback(_swallow)
+        # One way in. A tap on the card and `lg approve` both arrive here as the
+        # same signal: the dispatcher is the only thing reading Telegram, and it
+        # signals the run the update names. Waiting on workflow state rather than
+        # on a long-polling activity is also what makes this wait genuinely
+        # durable — there is nothing to retry, restart or re-skip.
+        await workflow.wait_condition(lambda: self._peek(allowed) is not None)
         self._ledger.pop("awaiting", None)
-        if sig in done:
-            value = self._decisions.pop(self._peek(allowed)).strip()
-            return value.upper() if allowed else value
-        return poll.result()["value"]
+        value = self._decisions.pop(self._peek(allowed)).strip()
+        return value.upper() if allowed else value
 
     async def _ask_owner(self, run_dir: str, question: str, options: dict) -> str:
         """Supervisor `ask`: a question the owner answers by button, text or signal."""

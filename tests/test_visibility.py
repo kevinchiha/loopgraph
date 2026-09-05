@@ -1,42 +1,50 @@
-from activities.notify import accept_hit, build_card_text, build_keyboard, extract_reply
+from activities.notify import build_card_text, build_keyboard, cb_key
+from activities.route import route_update, wf_from_card
 from activities.stream import append_log, summarize_tool
 
-
-# --- notify: replies (buttons + free text) ---
-
-def test_extract_reply_button():
-    updates = [{"update_id": 1, "callback_query": {"id": "cb1", "data": "lg:run-x:A"}}]
-    assert extract_reply(updates, "run-x", "42") == ("button", "A", "cb1", 1)
+CARD = "loopgraph: decision\nrun: runs/x\nworkflow: run-x\n\npick one"
 
 
-def test_extract_reply_free_text_from_owner_chat():
-    updates = [{"update_id": 1, "message": {"text": "yes, use postgres", "chat": {"id": 42}}}]
-    assert extract_reply(updates, "run-x", "42") == ("text", "yes, use postgres", None, 1)
+# --- routing a reply back to the run that asked ---
+
+def test_a_button_tap_names_its_run():
+    u = {"update_id": 1, "callback_query": {"id": "cb1", "data": f"lg:{cb_key('run-x')}:A",
+                                            "message": {"text": CARD}}}
+    assert route_update(u, "42", []) == {"wf_id": "run-x", "value": "A", "callback_id": "cb1"}
 
 
-def test_extract_reply_ignores_other_chats_and_commands():
-    updates = [
-        {"update_id": 1, "message": {"text": "intruder", "chat": {"id": 999}}},
-        {"update_id": 2, "message": {"text": "/start", "chat": {"id": 42}}},
-    ]
-    assert extract_reply(updates, "run-x", "42") is None
+def test_a_reply_that_quotes_a_card_names_its_run():
+    u = {"update_id": 1, "message": {"text": "yes, use postgres", "chat": {"id": 42},
+                                     "reply_to_message": {"text": CARD}}}
+    assert route_update(u, "42", ["run-a", "run-b"]) == \
+        {"wf_id": "run-x", "value": "yes, use postgres", "callback_id": None}
 
 
-def test_extract_reply_button_beats_text():
-    updates = [
-        {"update_id": 1, "message": {"text": "hello", "chat": {"id": 42}}},
-        {"update_id": 2, "callback_query": {"id": "cb9", "data": "lg:run-x:B"}},
-    ]
-    assert extract_reply(updates, "run-x", "42") == ("button", "B", "cb9", 2)
+def test_a_bare_reply_goes_to_the_only_run_in_flight():
+    u = {"update_id": 1, "message": {"text": "use postgres", "chat": {"id": 42}}}
+    assert route_update(u, "42", ["run-only"])["wf_id"] == "run-only"
 
 
-def test_accept_hit_stray_text_never_decides_merge():
-    text_hit = ("text", "Blue", None, 1)
-    btn_hit = ("button", "A", "cb1", 2)
-    assert accept_hit(text_hit, accept_text=True)
-    assert not accept_hit(text_hit, accept_text=False)   # merge cards ignore free text
-    assert accept_hit(btn_hit, accept_text=False)
-    assert not accept_hit(None, accept_text=True)
+def test_a_bare_reply_is_refused_when_two_runs_could_have_asked():
+    """The bug this replaces: whichever run polled first took whatever was
+    pending, so one run swallowed another run's answer and that run waited
+    forever. Refusing and saying so beats guessing."""
+    u = {"update_id": 1, "message": {"text": "use postgres", "chat": {"id": 42}}}
+    out = route_update(u, "42", ["run-a", "run-b"])
+    assert "wf_id" not in out and "cannot tell which" in out["problem"]
+
+
+def test_other_chats_and_commands_are_ignored():
+    for u in ({"update_id": 1, "message": {"text": "intruder", "chat": {"id": 999}}},
+              {"update_id": 2, "message": {"text": "/start", "chat": {"id": 42}}}):
+        assert route_update(u, "42", ["run-a"]) is None
+
+
+def test_the_card_carries_the_id_the_routing_reads_back():
+    """These two have to agree or a reply can never be placed."""
+    text = build_card_text("merge-ready", "run-y-ab12cd", "runs/y", "did things", None,
+                           {"A": "merge"})
+    assert wf_from_card(text) == "run-y-ab12cd"
 
 
 def test_card_text_without_commit_and_capped():

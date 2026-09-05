@@ -253,6 +253,13 @@ The same question is already on your phone with buttons, and a tap does the same
 thing. `lg approve` is for when you are at the machine anyway; it is not a
 substitute for being told a run needs you.
 
+Both routes end in the same place. A small dispatcher service is the only thing
+that reads Telegram: it works out which run each reply belongs to and signals that
+run. Buttons carry the run id, and a card names its own run in its text, so
+replying to a card routes correctly even with several runs going. If you send a
+bare message while two runs are waiting, it says so rather than guessing, because
+guessing is how an answer meant for one run merges another.
+
 Merge cards take letters only. A stray text reply can never decide a merge.
 
 So the run carries on by itself exactly when nothing needs your judgment, and the
@@ -272,7 +279,8 @@ never use it: it is the shortest description of how to drive this thing properly
 
 ## Limits, honestly
 
-- One run at a time per target repo. Concurrent worktree branches collide.
+- One run at a time per target repo. Concurrent worktree branches collide. Runs on
+  different repos are fine, and replies route to the right one.
 - Target repos must live under the one directory tree you mount. Nothing outside
   it is reachable, by design.
 - The executor runs with permissions bypassed inside the container. Its file writes
