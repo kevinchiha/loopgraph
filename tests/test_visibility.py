@@ -77,6 +77,22 @@ def test_a_card_whose_summary_starts_with_a_location_still_routes():
     assert wf_from_card(text) == "run-y-ab12cd"
 
 
+# --- what a waiting run records about the card it is holding ---
+
+def test_the_ledger_records_the_question_it_sent():
+    """The ledger said a run was awaiting a decision but never what it had asked,
+    so the page could only name the kind and the letters. The question has to be
+    the one the card carries: anything reassembled elsewhere can drift from it."""
+    import inspect
+
+    from workflows.run import LoopGraphRun
+    src = inspect.getsource(LoopGraphRun._await_decision)
+    awaiting = src.split('self._ledger["awaiting"] = {')[1].split("}")[0]
+    assert '"question": summary' in awaiting, "the question is not recorded"
+    card = src.split("args=[kind, wf_id, run_dir,")[1].split("]")[0]
+    assert card.strip().startswith("summary,"), "the card no longer sends that same string"
+
+
 # --- stream log ---
 
 def test_summarize_tool():

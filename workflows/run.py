@@ -385,7 +385,10 @@ class LoopGraphRun:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
         hint = f"lg approve {wf_id} <{'|'.join(options) or 'answer'}>"
-        self._ledger["awaiting"] = {"kind": kind, "options": options,
+        # question is the card's own text, not a rebuild of it. The ledger said a
+        # run was waiting and never what it had asked, so anything reading the run
+        # had to guess the question from the kind and the letters.
+        self._ledger["awaiting"] = {"kind": kind, "question": summary, "options": options,
                                     "telegram": telegram, "answer_with": hint}
         if telegram:
             await workflow.execute_activity(
