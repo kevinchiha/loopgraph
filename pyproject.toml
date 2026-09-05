@@ -16,3 +16,10 @@ dev = ["pytest>=8.0"]
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+# A finished run leaves a worktree under runs/<slug>/worktrees/, holding the
+# TARGET project's tests. Without this, `pytest` from the repo root collects
+# those too and reports failures that have nothing to do with the engine.
+testpaths = ["tests"]
+norecursedirs = ["runs", ".venv", "docs", "graphs/__pycache__"]

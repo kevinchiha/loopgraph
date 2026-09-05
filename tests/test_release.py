@@ -69,20 +69,21 @@ def test_telegram_configured_needs_both_values(monkeypatch):
     assert notify.configured() is True
 
 
-def test_worker_refuses_to_start_when_telegram_is_required_but_missing(monkeypatch):
+def test_worker_refuses_to_start_without_telegram(monkeypatch):
+    """A run nobody can be told about is a run that waits silently. There is no
+    flag to turn this off: every run can stop and ask a question."""
     import worker
-    monkeypatch.setenv("LOOPGRAPH_REQUIRE_TELEGRAM", "1")
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     with pytest.raises(SystemExit) as e:
         worker.check_telegram()
-    assert "lg approve" in str(e.value)
+    assert "install.sh" in str(e.value)
 
 
-def test_worker_starts_when_telegram_is_not_required(monkeypatch):
+def test_worker_starts_once_telegram_is_configured(monkeypatch):
     import worker
-    monkeypatch.setenv("LOOPGRAPH_REQUIRE_TELEGRAM", "0")
-    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
     worker.check_telegram()  # no raise
 
 

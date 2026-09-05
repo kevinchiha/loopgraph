@@ -36,8 +36,13 @@ it escalates to the auditor instead of grinding.
 
 ## What you need
 
-Linux, Docker with the Compose v2 plugin, Python 3.13+, and a way to reach Claude.
-Nobody has tried this on macOS.
+Linux, Docker with the Compose v2 plugin, Python 3.13+, a way to reach Claude, and
+a Telegram bot. Nobody has tried this on macOS.
+
+The bot is not decoration. A run stops and asks you things, and the engine refuses
+to start without a way to reach you, because a run nobody is told about waits
+silently for as long as you happen not to look. @BotFather takes two minutes and
+the installer does the rest.
 
 For the model, you have two routes:
 
@@ -63,8 +68,9 @@ Install loopgraph from https://github.com/kevinchiha/loopgraph.
 Clone it, then follow INSTALL_WITH_AGENT.md in the repo.
 ```
 
-It collects three answers from you, runs `./install.sh` with them, then proves the
-install by driving the example run to a decision. Read
+It asks where your repos live, how you reach Claude, and walks you through
+@BotFather. Then it runs `./install.sh` with your answers and proves the install by
+driving the example run to a decision. Read
 [INSTALL_WITH_AGENT.md](INSTALL_WITH_AGENT.md) if you want to know exactly what it
 will do before you let it.
 
@@ -76,10 +82,11 @@ git clone https://github.com/kevinchiha/loopgraph.git && cd loopgraph
 ./install.sh
 ```
 
-It asks the same questions in a terminal, and `./install.sh --yes` takes every
-default and skips Telegram, for scripted installs. It works. You are just on your
-own when your machine disagrees with its assumptions, which is what the agent is
-there for.
+It asks the same questions in a terminal. `./install.sh --yes` takes every default
+for scripted installs, but it cannot do the @BotFather step for you, so it writes
+the config and stops short of starting the stack. Either way it works. You are just
+on your own when your machine disagrees with its assumptions, which is what the
+agent is there for.
 
 </details>
 
@@ -103,7 +110,7 @@ Then point it at something real, in a repo under the tree you mounted:
 > keep everything passing.
 
 > Run this through loopgraph: redesign the app to match the screenshots in
-> `mockups/`. Start with the settings page, and don't break anything it already does.
+> `mockups/`, one page at a time, and don't break anything they already do.
 
 > Run this through loopgraph: the payments module has no tests. Write them, cover
 > the refund and partial-refund paths, and change no behaviour while you do it.
@@ -122,11 +129,16 @@ still pass, and nothing outside the page you named got touched. You judge the lo
 yourself, on the branch, when it asks. That is still most of the tedium off your
 desk, and you are reviewing a finished thing instead of watching it get made.
 
-Note the "start with the settings page". Today a run carries one work item: its
-three rounds are correction attempts on that item, not progress through a list. So
-a four-page redesign is four runs, each wanting your approval. Keeping each write
-set small is genuinely what makes the scope gate worth anything, but needing a
-separate run per page is a missing feature, not a design position.
+"One page at a time" is not a figure of speech. The brief lists work items and the
+run does them in order: each gets its own rounds, its own audit, and its own commit
+on one branch, so page four starts from page three's verified state. You get one
+merge card at the end, not one per page.
+
+An item that will not go green after three rounds is parked and the run carries on.
+One page with a broken gate does not throw away the five that worked. You get a
+message the moment something is parked, and whatever you reply is handed to the
+next item, so you can correct a run in flight without stopping it. The final card
+names every parked item and says plainly that merging does not include them.
 
 The agent writes the brief and the write set, digs the real check commands out of
 `package.json` or `pyproject.toml`, confirms they pass on a clean tree before
@@ -150,6 +162,22 @@ A run is a directory under `runs/`. Three files:
 
 **`brief.md`** — the feature, the checkable done-when, and the write set: the exact
 paths the executor may touch. One screen. A vague brief produces vague work.
+
+List the work under a `## Work items` heading and the run does them one at a time:
+
+```markdown
+## Work items
+
+- Redesign the settings page to match mockups/settings.png
+- Redesign the profile page to match mockups/profile.png
+```
+
+Each item gets its own rounds, audit and commit. Leave the heading out and the
+whole brief is a single item, which is the right shape for something small.
+
+Size them so one item is one independently verifiable change. Too big and the
+audit is reading a diff nobody could check; too small and you pay for a fresh
+executor context to move one line.
 
 **`gates.yaml`** — the real check commands for that project.
 
@@ -189,19 +217,35 @@ lg ui                            # dashboard on http://localhost:8400
 Temporal's own UI is on http://localhost:8233 and shows the workflow history,
 which is the place to look when something is stuck rather than slow.
 
-## Approving
+## When it talks to you
 
-A run holds at a decision and changes nothing until you answer.
+Three moments, and they behave differently on purpose.
+
+**The auditor needs a decision only you can make.** Credentials, spend, a schema
+change, lowering a bar it was told to hold. The run stops, changes nothing, and
+waits however long you take. Your answer goes into the next round for that item.
+The auditor is told never to ask what it could verify itself, so this should be
+rare; if it starts asking often, your brief is leaving something undecided.
+
+**An item got parked.** No question, no waiting. You are told and the run carries
+on with the rest. Anything you reply reaches the executor before the next item
+starts, which is how you steer a long run without restarting it.
+
+**Merge-ready at the end.** The work is committed on a branch and nothing has been
+merged.
 
 ```bash
 lg approve <workflow-id> A     # A merge, B keep the branch, C discard
 ```
 
-With Telegram configured, the same decision arrives on your phone as a card with
-buttons, and a tap does the same thing. Set it up. Watching a terminal for forty
-minutes so you can press one key is a bad way to spend an afternoon.
+The same question is already on your phone with buttons, and a tap does the same
+thing. `lg approve` is for when you are at the machine anyway; it is not a
+substitute for being told a run needs you.
 
 Merge cards take letters only. A stray text reply can never decide a merge.
+
+So the run carries on by itself exactly when nothing needs your judgment, and the
+moment something does, it stops and waits.
 
 ## Doing it by hand
 
@@ -225,6 +269,8 @@ never use it: it is the shortest description of how to drive this thing properly
 - Three rounds, then it escalates. It does not grind forever, and it does not
   quietly give up either.
 - Linux and Docker only.
+- A Telegram bot is required, not optional. If you want a different channel, the
+  place to add one is `activities/notify.py`, which is about ninety lines.
 
 ## How it fits together
 

@@ -40,6 +40,9 @@ persistent evidence. A claim you cannot point at in the diff is a lie by omissio
 ## Red lines
 
 - No git push. No destructive git (reset --hard, clean, branch -D, checkout --).
+- **No git commit.** Leave your work in the working tree. The engine commits it
+  after the gates re-run and the audit accepts, and it commits only the declared
+  write set. A commit of your own hides the work from that check.
 - No writes outside the worktree. No new dependencies without the brief allowing it.
 - No secrets in code or output. No network calls beyond what the work item needs.
 

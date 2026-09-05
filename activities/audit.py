@@ -79,7 +79,7 @@ async def run_supervisor(prompt: str, worktree: str, log_path: str) -> dict:
 
 
 @activity.defn
-async def audit(run_dir: str, round_result: dict, round_no: int = 1) -> dict:
+async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: int = 1) -> dict:
     """Audit one round's output. Returns the verdict packet."""
     run = Path(run_dir)
     brief = (run / "brief.md").read_text()
@@ -87,6 +87,6 @@ async def audit(run_dir: str, round_result: dict, round_no: int = 1) -> dict:
     worktree = round_result["worktree"]
     diff = (await _git("diff", "HEAD", cwd=worktree))[:DIFF_CAP]
     prompt = assemble_audit_prompt(brief, constraints, round_result, diff)
-    verdict = await run_supervisor(prompt, worktree, str(run / "logs" / f"r{round_no}-audit.log"))
+    verdict = await run_supervisor(prompt, worktree, str(run / "logs" / f"i{item_no}-r{round_no}-audit.log"))
     verdict["diff_chars"] = len(diff)
     return verdict

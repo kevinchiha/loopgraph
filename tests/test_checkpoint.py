@@ -68,7 +68,9 @@ def test_whitespace_error_refuses(worktree):
 
 def test_message_format():
     m = build_commit_message(2, "first line\nsecond", ["a.py"])
-    assert m.startswith("loopgraph: round 2 accept — first line\n")
+    assert m.startswith("loopgraph: item 1 round 2 accept — first line\n")
+    assert build_commit_message(1, "x", ["a.py"], item_no=3).startswith(
+        "loopgraph: item 3 round 1 accept")
     assert "- a.py" in m
 
 

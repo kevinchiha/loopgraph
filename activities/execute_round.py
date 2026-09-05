@@ -93,6 +93,22 @@ async def ensure_worktree(target_repo: str, worktree: str, branch: str) -> None:
         await _git("worktree", "add", "-b", branch, worktree, cwd=target_repo)
 
 
+async def undo_self_commit(worktree: str, start_head: str) -> bool:
+    """Put an executor's own commit back into the working tree.
+
+    An executor that commits hides its work: `git status --porcelain` comes back
+    clean, the write set is empty, and the checkpoint refuses a round that
+    actually passed every gate. The prompt forbids committing; this is what
+    happens when it does anyway. A mixed reset keeps every change and drops the
+    commit, so the engine still commits only what the audit accepted, and the
+    audit still sees a diff to read.
+    """
+    if (await _git("rev-parse", "HEAD", cwd=worktree)).strip() == start_head:
+        return False
+    await _git("reset", "-q", start_head, cwd=worktree)
+    return True
+
+
 async def run_executor(prompt: str, feedback: str | None, worktree: str, log_path: str) -> dict:
     """One headless Claude produce (or correct) pass inside the worktree."""
     if os.environ.get("LOOPGRAPH_IN_CONTAINER") != "1":
@@ -115,16 +131,28 @@ async def run_executor(prompt: str, feedback: str | None, worktree: str, log_pat
 
 @activity.defn
 async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no: int = 1,
-                        directive: str | None = None) -> dict:
+                        directive: str | None = None, item_no: int = 1) -> dict:
+    """One round on one work item.
+
+    All items in a run share one branch and one worktree, so item 2 starts from
+    item 1's checkpoint and the owner gets a single branch to merge at the end.
+    A supervisor redo resets the worktree to the last checkpoint: the failed
+    attempt is dropped, everything already accepted survives.
+    """
     run = Path(run_dir)
     brief = (run / "brief.md").read_text()
     constraints = (run / "constraints.md").read_text() if (run / "constraints.md").exists() else ""
     prompt = assemble_prompt(brief, constraints, work_item or brief, directive)
 
-    worktree = str(run / "worktrees" / f"r{round_no}")
+    worktree = str(run / "worktrees" / "run")
+    branch = f"lg-{run.name}"
     base_branch = (await _git("branch", "--show-current", cwd=target_repo)).strip()
-    await ensure_worktree(target_repo, worktree, f"lg-{run.name}-r{round_no}")
-    log_path = str(run / "logs" / f"r{round_no}-executor.log")
+    await ensure_worktree(target_repo, worktree, branch)
+    if round_no > 1:  # a redo: drop the rejected attempt, keep every checkpoint
+        await _git("reset", "-q", "--hard", "HEAD", cwd=worktree)
+        await _git("clean", "-qfd", cwd=worktree)
+    (run / "logs").mkdir(parents=True, exist_ok=True)
+    log_path = str(run / "logs" / f"i{item_no}-r{round_no}-executor.log")
 
     gates = load_gates(str(run / "gates.yaml"))
 
@@ -138,7 +166,10 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
             results.append(await _run_one(g, worktree, heartbeat=activity.heartbeat))
         return results
 
+    start_head = (await _git("rev-parse", "HEAD", cwd=worktree)).strip()
     final = await run_round(prompt, exec_fn, gate_fn)
+
+    self_committed = await undo_self_commit(worktree, start_head)
 
     diff_stat = await _git("diff", "--stat", "HEAD", cwd=worktree)
     files = parse_porcelain(await _git("status", "--porcelain", cwd=worktree))
@@ -153,5 +184,7 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
         "gate_results": final["gate_results"],
         "worktree": worktree,
         "base_branch": base_branch,
-        "branch": f"lg-{run.name}-r{round_no}",
+        "branch": branch,
+        "item_no": item_no,
+        "self_committed": self_committed,
     }

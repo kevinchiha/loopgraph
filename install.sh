@@ -85,19 +85,25 @@ fi
 
 # -------------------------------------------------------------- 3. telegram ---
 TELEGRAM_ENV="$HOME/.config/loopgraph-telegram.env"
-REQUIRE_TELEGRAM=0
+HAVE_TELEGRAM=0
 BOT_NAME=""
-say "Telegram (optional, but you'll want it)"
+say "Telegram (required)"
 cat <<'TXT'
-A run stops and asks you before it merges anything. Without Telegram you answer
-in a terminal with `lg approve`. With it, the question arrives on your phone as a
-card with buttons, which is a lot better when a run takes 40 minutes to get there.
+A run stops and asks you: before it merges anything, and any time the auditor hits
+a call only you can make. The engine will not start without a way to reach you,
+because a run nobody is told about just waits, silently, for as long as you happen
+not to look. It takes two minutes to set up.
 TXT
 if [ -s "$TELEGRAM_ENV" ]; then
   echo "  already configured at $TELEGRAM_ENV — leaving it alone"
-  REQUIRE_TELEGRAM=1
+  HAVE_TELEGRAM=1
   BOT_NAME="$(sed -n 's/^# *Bot: *//p' "$TELEGRAM_ENV" | head -1)"
-elif confirm "Set up a Telegram bot now?"; then
+elif [ "$YES" = 1 ] || [ ! -t 0 ]; then
+  warn "Non-interactive install: skipping the Telegram step."
+  warn "The worker will refuse to start until you configure it. Re-run ./install.sh"
+  warn "interactively, or write TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID into"
+  warn "$TELEGRAM_ENV (mode 600) yourself."
+else
   cat <<'TXT'
 
   1. In Telegram, message @BotFather and send /newbot
@@ -155,15 +161,15 @@ PY
         printf '# loopgraph decision cards.\n# Bot: %s\nTELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\n' \
           "$BOT_NAME" "$BOT_TOKEN" "$CHAT_ID" > "$TELEGRAM_ENV" )
       chmod 600 "$TELEGRAM_ENV"
-      REQUIRE_TELEGRAM=1
+      HAVE_TELEGRAM=1
       echo "  wrote $TELEGRAM_ENV (mode 600)"
     else
-      warn "Still no chat id. Skipping Telegram; add it later and set LOOPGRAPH_REQUIRE_TELEGRAM=1."
+      die "No chat id: the bot has never heard from you. Press Start in $BOT_NAME's chat, then re-run ./install.sh."
     fi
     unset BOT_TOKEN
+  else
+    die "No token given. The engine needs a way to reach you; re-run ./install.sh when you have one."
   fi
-else
-  echo "  skipped. Answer runs with: lg approve <workflow-id> A"
 fi
 
 # ------------------------------------------------------------------ 4. .env ---
@@ -184,7 +190,6 @@ LOOPGRAPH_UID=$(id -u)
 LOOPGRAPH_DOCKER=$DOCKER
 
 LOOPGRAPH_TELEGRAM_ENV=$TELEGRAM_ENV
-LOOPGRAPH_REQUIRE_TELEGRAM=$REQUIRE_TELEGRAM
 LOOPGRAPH_TELEGRAM_BOT=$BOT_NAME
 EOF
 )
@@ -235,6 +240,13 @@ if [ -d "$SKILL_SRC" ]; then
 fi
 
 # ------------------------------------------------------------------- 7. up ----
+if [ "$HAVE_TELEGRAM" = 0 ]; then
+  say "Not starting the stack"
+  warn "Telegram is not configured, so the worker would refuse to start."
+  warn "Configure it, then: cd $ROOT && $DOCKER compose up -d --build"
+  exit 0
+fi
+
 say "Starting the stack"
 (cd "$ROOT" && $DOCKER compose up -d --build)
 printf '  waiting for the worker'
@@ -298,9 +310,5 @@ cat <<EOF
   lg where                                        # paths and ports on this machine
   lg start runs/example-hello /projects/loopgraph-example
 EOF
-if [ "$REQUIRE_TELEGRAM" = 1 ]; then
-  echo "  The decision card will land in $BOT_NAME on Telegram."
-else
-  echo "  When it asks, answer with: lg approve <workflow-id> A"
-fi
+echo "  Cards land in $BOT_NAME on Telegram. From a terminal: lg approve <workflow-id> A"
 echo "  Dashboard: http://localhost:8400   Temporal: http://localhost:8233"

@@ -18,10 +18,10 @@ from activities.execute_round import _git, parse_porcelain
 from activities.gate import _run_one, load_gates
 
 
-def build_commit_message(round_no: int, summary: str, files: list[str]) -> str:
+def build_commit_message(round_no: int, summary: str, files: list[str], item_no: int = 1) -> str:
     subject = summary.strip().splitlines()[0][:72] if summary.strip() else "verified write set"
     body = "\n".join(f"- {f}" for f in files)
-    return f"loopgraph: round {round_no} accept — {subject}\n\nFiles:\n{body}\n"
+    return f"loopgraph: item {item_no} round {round_no} accept — {subject}\n\nFiles:\n{body}\n"
 
 
 async def _ignored(worktree: str, files: list[str]) -> set[str]:
@@ -71,10 +71,11 @@ async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict
 
 
 @activity.defn
-async def checkpoint(run_dir: str, worktree: str, files: list[str], round_no: int, summary: str) -> dict:
+async def checkpoint(run_dir: str, worktree: str, files: list[str], round_no: int,
+                     summary: str, item_no: int = 1) -> dict:
     activity.heartbeat("checkpoint start")
     gates = load_gates(str(Path(run_dir) / "gates.yaml"))
-    return await checkpoint_write_set(worktree, files, gates, build_commit_message(round_no, summary, files))
+    return await checkpoint_write_set(worktree, files, gates, build_commit_message(round_no, summary, files, item_no))
 
 
 async def merge_branch(target_repo: str, base_branch: str, branch: str) -> dict:

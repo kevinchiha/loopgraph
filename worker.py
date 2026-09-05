@@ -12,23 +12,30 @@ from activities.audit import audit
 from activities.checkpoint import checkpoint, merge
 from activities.execute_round import execute_round
 from activities.gate import run_gates
+from activities.items import load_work_items
 from activities.learn import learn
 from activities.notify import configured as telegram_ok
-from activities.notify import send_card, telegram_configured, wait_decision
+from activities.notify import poll_reply, send_card, telegram_configured, wait_decision
 from workflows.run import GateCheckRun, LoopGraphRun, RoundRun
 
 TASK_QUEUE = "loopgraph"
 
 
 def check_telegram() -> None:
-    """Fail at startup, not when a card is due. Without this, a run reaches
-    merge-ready and then waits forever on a card that was never going to arrive."""
-    if os.environ.get("LOOPGRAPH_REQUIRE_TELEGRAM") == "1" and not telegram_ok():
+    """Refuse to start without a way to reach the owner.
+
+    Any run can stop mid-flight and ask a question only the owner can answer, and
+    every run ends by asking whether to merge. Without a notification channel that
+    is a run nobody is watching: it waits, silently, for as long as the owner
+    happens not to look. Failing here beats failing when the first card is due."""
+    if not telegram_ok():
         raise SystemExit(
-            "LOOPGRAPH_REQUIRE_TELEGRAM=1 but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID "
-            "are not set. Check that LOOPGRAPH_TELEGRAM_ENV in .env points at your "
-            "credentials file, or set LOOPGRAPH_REQUIRE_TELEGRAM=0 to answer runs "
-            "with `lg approve` instead."
+            "No Telegram credentials. The engine will not start without a way to "
+            "reach you: runs stop and ask questions, and one that nobody sees just "
+            "waits.\n"
+            "Fix: point LOOPGRAPH_TELEGRAM_ENV in .env at a file holding "
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID. `./install.sh` sets this up, "
+            "and README.md has the @BotFather steps."
         )
 
 
@@ -39,7 +46,8 @@ async def main() -> None:
         task_queue=TASK_QUEUE,
         workflows=[GateCheckRun, RoundRun, LoopGraphRun],
         activities=[run_gates, execute_round, audit, checkpoint, merge, learn,
-                    send_card, wait_decision, telegram_configured],
+                    load_work_items, send_card, wait_decision, telegram_configured,
+                    poll_reply],
     )
     print(f"worker up on task queue {TASK_QUEUE!r}", flush=True)
     await worker.run()

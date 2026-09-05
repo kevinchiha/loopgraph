@@ -48,13 +48,11 @@ services:
     env_file:
       - path: .env
         required: false
-      # Telegram is optional: a run can also be answered with `lg approve`.
-      # The path must be set (install.sh writes it), but the file may be absent.
-      # If you did configure a bot, install.sh also sets LOOPGRAPH_REQUIRE_TELEGRAM=1
-      # and the worker refuses to start without the credentials, so a run can never
-      # stall waiting on a card that was never going to arrive.
+      # Required. Runs stop and ask the owner questions, so the engine refuses to
+      # start without a way to reach them. `lg approve` answers a waiting run from
+      # a terminal, but it is not a substitute for being told there is one.
       - path: ${LOOPGRAPH_TELEGRAM_ENV:?not set - run ./install.sh}
-        required: false
+        required: true
     volumes:
       - ./:/app
       # The only tree the agent can reach. Target repos must live under it.

@@ -115,6 +115,31 @@ def accept_hit(hit: tuple | None, accept_text: bool) -> bool:
 
 
 @activity.defn
+async def poll_reply(wf_id: str) -> dict:
+    """One non-blocking look for an owner reply, for use mid-run.
+
+    A parked item does not stop the run, so this cannot block the way
+    wait_decision does. It takes whatever is pending, acknowledges it so the same
+    message is not read twice, and returns immediately. No Telegram, no reply,
+    empty dict either way."""
+    if not configured():
+        return {}
+    token, chat = _creds()
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API}/bot{token}/getUpdates", json={"timeout": 0, "offset": 0})
+        if r.status_code >= 300:
+            return {}
+        updates = r.json().get("result", [])
+        if not updates:
+            return {}
+        # Acknowledge everything we just read, so the next poll starts clean.
+        await client.post(f"{API}/bot{token}/getUpdates",
+                          json={"timeout": 0, "offset": updates[-1]["update_id"] + 1})
+    hit = extract_reply(updates, wf_id, chat)
+    return {"kind": hit[0], "value": hit[1]} if hit else {}
+
+
+@activity.defn
 async def wait_decision(wf_id: str, accept_text: bool = True) -> dict:
     """Long-poll getUpdates until the owner taps a button (or replies by text, if allowed).
 

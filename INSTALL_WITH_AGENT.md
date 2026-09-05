@@ -40,13 +40,14 @@ you ask, because it decides where they put future projects.
 Tell them why it matters, in one line: a single run can spend three executor
 rounds plus an audit pass, so per-token billing adds up faster than they expect.
 
-**Whether they want Telegram decision cards.** Give the trade honestly. Without
-it, they answer a waiting run with `lg approve <workflow-id> A` in a terminal.
-With it, the same question arrives on their phone as a card with buttons, which
-matters when a run takes forty minutes to reach the point of needing them. If yes,
-walk them through @BotFather: `/newbot`, pick a name, pick a username ending in
-`bot`, and then **press Start in the new bot's chat**, because a bot cannot send
-the first message. The script takes the token and finds the chat id itself.
+**A Telegram bot.** This one is required, and the install will stop without it.
+Say why rather than just demanding it: runs stop and ask questions, and the engine
+refuses to start without a way to reach them, because a run nobody is told about
+waits silently. Walk them through @BotFather: `/newbot`, pick a name, pick a
+username ending in `bot`, and then **press Start in the new bot's chat**, because a
+bot cannot send the first message. The script takes the token and finds the chat id
+itself. If they push back, the honest answer is that `lg approve` can answer a
+waiting run from a terminal but cannot tell them there is one.
 
 ## 2. Clone if you need to, then run the script
 
@@ -77,9 +78,9 @@ ask for a run against a repo outside the mounted tree, it cannot work. Say so an
 stop. Do not improvise a mount.
 
 **The worker not coming up.** Read `<docker> compose logs worker`. The most common
-cause is `LOOPGRAPH_REQUIRE_TELEGRAM=1` with credentials that did not get written,
-which fails at startup on purpose so a run never stalls on a card that was never
-going to arrive.
+cause is missing Telegram credentials, which stops the worker at startup on
+purpose. Check that `LOOPGRAPH_TELEGRAM_ENV` in `.env` points at a file that holds
+both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 
 ## 4. Prove it, then report
 

@@ -37,6 +37,24 @@ after installing.) The run dir already exists. Skip to step 2 with
 - `brief.md` — the feature, the checkable done-when, and the write set (the exact
   paths the executor may touch). One screen, no more. If the request is vague,
   pick the smallest honest slice and say which slice you chose.
+
+  **Split multi-part work into work items.** A `## Work items` heading with one
+  bullet per item makes the run do them in order, each with its own rounds, audit
+  and commit, all onto one branch:
+
+  ```markdown
+  ## Work items
+
+  - Redesign the settings page to match mockups/settings.png
+  - Redesign the profile page to match mockups/profile.png
+  ```
+
+  One item = one independently verifiable change. Do not split a change and its
+  test across two items; they share one verification, so they are one item. Leave
+  the heading out for anything small and the whole brief is a single item.
+
+  A bullet may wrap onto indented lines. The next heading, or unindented prose,
+  ends the list.
 - `constraints.md` — `touch` it. The learning edge appends to it between rounds.
 - `gates.yaml` — the project's REAL check commands. Read `package.json`,
   `Makefile`, `pyproject.toml` or `Cargo.toml` to find them:
@@ -94,14 +112,22 @@ never returns, so background it or use the dashboard instead.
 A run stops at a decision and holds there, changing nothing, until the user
 answers. Tell them a decision is coming and how to answer it:
 
-- Telegram configured (check `lg where`): a card lands in the bot it names.
-  Buttons on merge-ready cards, plain-text replies on question cards.
-- Either way: `lg approve <workflow-id> A`.
+- A card lands in the bot `lg where` names. Buttons on merge-ready cards,
+  plain-text replies on question cards.
+- From a terminal: `lg approve <workflow-id> A`. Give them this too; it is faster
+  when they are already at the machine.
+
+**Parked items.** An item that cannot go green after three rounds is parked and
+the run carries on with the rest. The user gets a message straight away, which
+needs no answer, and anything they reply is handed to the next item. So a run can
+finish `merge-ready` with some items missing: read `items` in the ledger, and
+report which ones were parked and why. Do not describe such a run as done.
 
 Runs end as `merge-ready` (waiting on the user, your job is done), `merged`,
-`held` or `discarded` (their answer), or `stopped`. For `stopped`, read `reason`
-in the ledger (escalated round, checkpoint refusal, supervisor plan or stop) and
-report it with the red gate's output tail, verbatim.
+`held` or `discarded` (their answer), or `stopped`. `stopped` means either every
+item was parked or the supervisor said stop, which is the one verdict that ends a
+whole run. Read `reason` in the ledger and report it with the red gate's output
+tail, verbatim.
 
 ## Don'ts
 
