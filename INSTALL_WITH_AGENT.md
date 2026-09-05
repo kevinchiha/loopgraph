@@ -1,42 +1,81 @@
-# Installing loopgraph with a coding agent
+# Installing loopgraph
 
-Paste this into Claude Code (or any coding agent) from inside a clone of this repo.
+This is the supported install path. Open this repo in Claude Code, or any coding
+agent that reads files and runs commands, and say:
+
+> Install loopgraph. Follow INSTALL_WITH_AGENT.md.
+
+Everything below is written for the agent.
 
 ---
 
-Install the loopgraph engine in this repository. `./install.sh` does the actual
-work. Your job is to gather what it needs, run it, and read the failures properly.
+## Your job
 
-**Collect from me first, in one message, and do not guess any of it:**
+Wire this engine to this machine, then prove it works by running something real.
+`./install.sh` does the mechanical work. You gather what it needs, run it, read
+failures properly, and verify the result.
 
-1. Which directory holds my code repositories. The worker mounts exactly one tree
-   and can reach nothing outside it, so every repo I want the engine to work on
-   must live under it. Default `~/projects`.
-2. How I reach Claude: a local CLIProxyAPI with a Claude subscription
-   (recommended, ask for the base URL and its local api-key), or a plain Anthropic
-   API key. Tell me a run can spend three executor rounds plus an audit pass, so
-   metered billing is the expensive choice.
-3. Whether I want Telegram decision cards. Explain the trade honestly: without it
-   I answer runs with `lg approve <workflow-id> A` in a terminal; with it the same
-   question arrives on my phone with buttons, which matters when a run takes forty
-   minutes to need me. If I say yes, walk me through @BotFather and remind me to
-   press Start in the new bot's chat, because a bot cannot message me first.
+**Do not reimplement what the script does.** Not the `.env`, not the `lg` wrapper,
+not the compose invocation. It handles machine differences you will not think of
+until they bite: docker needing `sudo`, a uid that isn't 1000, `~/.local/bin`
+missing from PATH, an existing `.env` worth backing up. A hand-rolled install
+produces a setup nobody can reproduce, including you, next week.
 
-**Then run `./install.sh`** and answer its prompts with what I gave you. Do not
-reimplement what it does. If it fails, fix the cause and run it again; it is safe
-to re-run and it backs up an existing `.env`.
+## 1. Ask for three things, in one message
 
-**Three failures worth recognising:**
+Ask all three at once. Do not start work and interrupt them three times.
 
-- `~/.local/bin` missing from PATH. The install works but `lg` is not found. Tell
-  me the exact line to add to my shell rc, and use the full path meanwhile.
-- Docker needing `sudo`. The script detects this and records it in `.env` as
-  `LOOPGRAPH_DOCKER`. Use that value, do not assume plain `docker`.
-- A projects directory outside the mounted tree. If I later ask for a run against
-  a repo somewhere else, it will not work. Say so and stop rather than improvising
-  a mount.
+**Where your code repositories live.** The worker mounts exactly one directory
+tree and can reach nothing outside it, so every repo you want the engine to work
+on has to live under it. Default `~/projects`. Say this constraint out loud when
+you ask, because it decides where they put future projects.
 
-**Verify before you tell me it worked.** Not "the script exited 0":
+**How you reach Claude.** Two routes:
+
+- CLIProxyAPI with a Claude subscription. Ask for the base URL (usually
+  `http://127.0.0.1:8317`) and its local api-key. Recommended.
+- A plain Anthropic API key.
+
+Tell them why it matters, in one line: a single run can spend three executor
+rounds plus an audit pass, so per-token billing adds up faster than they expect.
+
+**Whether they want Telegram decision cards.** Give the trade honestly. Without
+it, they answer a waiting run with `lg approve <workflow-id> A` in a terminal.
+With it, the same question arrives on their phone as a card with buttons, which
+matters when a run takes forty minutes to reach the point of needing them. If yes,
+walk them through @BotFather: `/newbot`, pick a name, pick a username ending in
+`bot`, and then **press Start in the new bot's chat**, because a bot cannot send
+the first message. The script takes the token and finds the chat id itself.
+
+## 2. Run the script
+
+```bash
+./install.sh
+```
+
+Answer its prompts with what they gave you. It is safe to re-run and it backs up
+an existing `.env`. If it fails, fix the cause and run it again.
+
+## 3. Failures worth recognising
+
+**`lg: command not found` after a clean install.** `~/.local/bin` is not on their
+PATH. Give them the exact line for their shell rc, and use the full path meanwhile.
+
+**Docker needing sudo.** The script detects this and records it in `.env` as
+`LOOPGRAPH_DOCKER`. Read that value and use it. Do not assume plain `docker`.
+
+**A projects directory that doesn't cover what they care about.** If they later
+ask for a run against a repo outside the mounted tree, it cannot work. Say so and
+stop. Do not improvise a mount.
+
+**The worker not coming up.** Read `<docker> compose logs worker`. The most common
+cause is `LOOPGRAPH_REQUIRE_TELEGRAM=1` with credentials that did not get written,
+which fails at startup on purpose so a run never stalls on a card that was never
+going to arrive.
+
+## 4. Prove it, then report
+
+"The script exited 0" is not verification. Run all three:
 
 ```bash
 lg where                                                # paths, ports, Telegram
@@ -44,5 +83,13 @@ lg where                                                # paths, ports, Telegram
 lg start runs/example-hello /projects/loopgraph-example
 ```
 
-That last one runs the real thing end to end and stops at a decision. Tell me how
-to answer it, then report what the ledger says.
+The last one is the real test. It takes a few minutes, implements a `--hello`
+flag, gates it, audits it, and then holds at a decision. Tell them how to answer:
+`lg approve <workflow-id> A` to merge, or a tap on the Telegram card if they set
+one up. Then report what the ledger says.
+
+**If that run escalates instead of reaching a decision**, read the ledger's
+`reason` and the executor's claims before blaming the install. An escalation with
+a gate defect written up in the claims means a gate is wrong, not that the engine
+is broken. Report it with the gate's output, verbatim. Never loosen a gate to make
+a run pass.

@@ -1,7 +1,18 @@
-# Working on loopgraph itself
+# loopgraph, for agents
 
-For driving the engine from another project, use the skill in `skills/loopgraph/`.
-This file is for agents changing the engine's own code.
+Three different jobs, three different places to look. Find yours first.
+
+**Installing loopgraph for the user** — read
+[INSTALL_WITH_AGENT.md](INSTALL_WITH_AGENT.md) and follow it. That is the supported
+install path. It tells you what to collect, what to run, and how to prove it
+worked. Do not improvise an install out of the README or this file: `install.sh`
+handles a dozen machine differences you will not think of, and a hand-rolled setup
+produces bug reports nobody can reproduce.
+
+**Running a task through the engine from another project** — use the skill in
+`skills/loopgraph/`.
+
+**Changing the engine's own code** — the rest of this file.
 
 ## Layout
 

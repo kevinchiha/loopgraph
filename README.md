@@ -50,18 +50,33 @@ For the model, you have two routes:
 
 ## Install
 
-```bash
-git clone https://github.com/kevinchiha/loopgraph.git && cd loopgraph
-./install.sh
+Installing this means wiring it to your machine: where your repos live, how you
+reach Claude, whether Docker needs `sudo` here, which uid the container has to
+write as. A coding agent can look all of that up and ask you about the rest, so
+that is the supported path.
+
+Open the repo in Claude Code (or any coding agent) and say:
+
+```
+Install loopgraph. Follow INSTALL_WITH_AGENT.md.
 ```
 
-It checks your prerequisites, asks where your projects live, sets up credentials,
-optionally wires a Telegram bot, writes `.env`, puts `lg` on your PATH, brings the
-stack up, and creates a small example repo to run against.
+It collects three answers from you, runs `./install.sh` with them, then proves the
+install by driving the example run to a decision. Read
+[INSTALL_WITH_AGENT.md](INSTALL_WITH_AGENT.md) if you want to know exactly what it
+will do before you let it.
 
-Using a coding agent instead? Point it at [INSTALL_WITH_AGENT.md](INSTALL_WITH_AGENT.md).
+<details>
+<summary>No agent to hand?</summary>
 
-Then:
+`./install.sh` asks the same questions in a terminal, and `./install.sh --yes`
+takes every default and skips Telegram, for scripted installs. It works. You are
+just on your own when your machine disagrees with its assumptions, which is what
+the agent is there for.
+
+</details>
+
+When it finishes:
 
 ```bash
 lg where                                                # paths and ports here
