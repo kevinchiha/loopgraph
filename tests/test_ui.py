@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -443,3 +444,85 @@ def test_the_injected_pattern_survives_javascript():
     assert "new RegExp('^" not in html, "pattern pasted raw into a JS string"
     # The pattern itself still has to match what stream.py writes.
     assert re.match(LOG_RE, "i2-r1-audit.log")
+
+
+# ---------- the host repository behind a run's worktree ----------
+
+
+@pytest.fixture
+def wt(tmp_path):
+    """A run's worktree pointer, and the repository on this machine it points at.
+
+    The pointer holds the one line every live worktree holds today, the `/app/runs`
+    worktree is the container path the ledger records, and `<tmp_path>/projects`
+    stands in for LOOPGRAPH_PROJECTS_DIR. tmp_path and never a real directory:
+    test_release.py fails the build on a home directory in a tracked file.
+    """
+    runs_dir = tmp_path / "runs"
+    pointer = runs_dir / "x" / "worktrees" / "ab12cd" / ".git"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text("gitdir: /projects/proj/.git/worktrees/ab12cd\n")
+    projects = tmp_path / "projects"
+    (projects / "proj").mkdir(parents=True)
+    return SimpleNamespace(runs_dir=runs_dir, pointer=pointer, projects=str(projects),
+                           worktree="/app/runs/x/worktrees/ab12cd", repo=projects / "proj")
+
+
+def test_a_pointer_resolves_to_the_host_repository(wt):
+    assert ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects) == (wt.repo, "")
+
+
+def test_the_projects_prefix_swap_keeps_the_separator(wt):
+    """The separator is the whole trap. .env.example ships
+    LOOPGRAPH_PROJECTS_DIR=/home/you/projects and install.sh writes what the owner
+    typed without normalising it, so no real value carries a slash of its own.
+    Swapping the bare value in for `/projects/` turns /projects/deye into
+    <dir>deye, which exists on no machine, so every diff on the dashboard would
+    answer `repository not found`."""
+    assert not wt.projects.endswith("/"), "the shipped shape has no trailing slash"
+    path, err = ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects)
+    assert err == ""
+    assert str(path) == wt.projects + "/proj"
+    assert str(path) != wt.projects + "proj", "the swap ate the separator"
+
+
+def test_a_projects_dir_with_a_trailing_slash_resolves_the_same(wt):
+    assert ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects + "/") == (wt.repo, "")
+
+
+def test_a_nested_projects_segment_is_not_rewritten(wt):
+    """The swap is anchored at the start and made once. A whole-string replace
+    would rewrite the second `/projects/` too and land nowhere."""
+    wt.pointer.write_text("gitdir: /projects/deye/projects/x/.git/worktrees/ab12cd\n")
+    (Path(wt.projects) / "deye" / "projects" / "x").mkdir(parents=True)
+    path, err = ui.resolve_repo(wt.worktree, wt.runs_dir, wt.projects)
+    assert (path, err) == (Path(wt.projects) / "deye" / "projects" / "x", "")
+
+
+@pytest.mark.parametrize("case", ["host path", "discarded worktree", "no gitdir line",
+                                  "projects dir unset", "projects dir empty",
+                                  "repository gone"])
+def test_each_resolve_failure_returns_its_line(wt, tmp_path, case):
+    """None of these is an exception. Each is a run the owner can still look at,
+    with one line saying why there is no diff."""
+    worktree, projects = wt.worktree, wt.projects
+    if case == "host path":  # the ledger records the container path, not this one
+        worktree = str(wt.pointer.parent)
+        want = f"worktree is not a container path: {worktree}"
+    elif case == "discarded worktree":  # `lg discard` removed it, pointer and all
+        worktree = "/app/runs/x/worktrees/gone"
+        want = f"no worktree pointer at {wt.runs_dir / 'x' / 'worktrees' / 'gone' / '.git'}"
+    elif case == "no gitdir line":
+        wt.pointer.write_text("ref: refs/heads/main\n")
+        want = "pointer file has no gitdir line"
+    elif case == "projects dir unset":  # no .env yet, or the key is missing from it
+        projects = None
+        want = "LOOPGRAPH_PROJECTS_DIR is not set; run ./install.sh"
+    elif case == "projects dir empty":  # `LOOPGRAPH_PROJECTS_DIR=` reads as ""
+        projects = ""
+        want = "LOOPGRAPH_PROJECTS_DIR is not set; run ./install.sh"
+    else:
+        projects = str(tmp_path / "elsewhere")
+        want = f"repository not found: {tmp_path / 'elsewhere' / 'proj'}"
+
+    assert ui.resolve_repo(worktree, wt.runs_dir, projects) == (None, want)

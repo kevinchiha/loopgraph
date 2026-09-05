@@ -200,6 +200,67 @@ def run_entry(wf_id: str, status: str, start_time: datetime | None,
     return entry
 
 
+# The two container paths every run is written in terms of: the run directory is
+# mounted at /app/runs and the projects tree at /projects. AGENTS.md pins both.
+CONTAINER_RUNS = "/app/runs/"
+CONTAINER_PROJECTS = "/projects/"
+
+
+def resolve_repo(worktree: str, runs_dir: Path,
+                 projects_dir: str | None) -> tuple[Path | None, str]:
+    """The repository on THIS machine behind a round's recorded `worktree`.
+
+    `worktree` is a container path, `/app/runs/<slug>/worktrees/<token>`, because
+    that is what the executor ran in. The same directory is `runs_dir/<slug>/
+    worktrees/<token>` here, and it holds a one-line pointer file, `.git`, reading
+    `gitdir: /projects/<repo>/.git/worktrees/<token>` — again a container path,
+    which `projects_dir` (LOOPGRAPH_PROJECTS_DIR, read from .env per request, not
+    at import, so an install after `lg ui` started is picked up) turns into a real
+    one.
+
+    That last swap is a prefix swap: `/projects/` off the front, `projects_dir`
+    plus a slash on. The slash is the whole of it. `.env.example` ships
+    LOOPGRAPH_PROJECTS_DIR=/home/you/projects and install.sh writes what the owner
+    typed without normalising it, so no real value ends in one, and dropping it
+    would turn /projects/deye into <dir>deye — a directory on no machine, so every
+    diff the dashboard drew would answer `repository not found`. It is anchored at
+    the front and made once, so a repository whose own path contains a /projects/
+    segment keeps it. A value that does end in a slash still works: Path collapses
+    the double.
+
+    Returns (path, "") or (None, one line saying why). Every failure here is a run
+    the owner can still read — a worktree `discard` removed, a machine with no
+    .env yet, a repository since moved — so none of them raises.
+    """
+    if not worktree.startswith(CONTAINER_RUNS):
+        return None, f"worktree is not a container path: {worktree}"
+    pointer = runs_dir / worktree[len(CONTAINER_RUNS):] / ".git"
+    try:
+        text = pointer.read_text(errors="replace")
+    except OSError:
+        # Gone (discard removes the worktree), unreadable, or a directory: a real
+        # clone's .git is one. Either way there is no pointer to follow.
+        return None, f"no worktree pointer at {pointer}"
+    line = next((ln for ln in text.splitlines() if ln.strip().startswith("gitdir:")), "")
+    # Everything before /.git/worktrees/ is the repository. A line that names no
+    # repository — no value, or nothing before the marker — is no more use than a
+    # missing one, and saying so beats returning Path("") and reporting the
+    # server's own working directory as the repository.
+    repo = line.split(":", 1)[1].strip().split("/.git/worktrees/", 1)[0] if line else ""
+    if not repo:
+        return None, "pointer file has no gitdir line"
+    if not projects_dir:
+        return None, "LOOPGRAPH_PROJECTS_DIR is not set; run ./install.sh"
+    if repo.startswith(CONTAINER_PROJECTS):
+        repo = projects_dir + "/" + repo[len(CONTAINER_PROJECTS):]
+    path = Path(repo)
+    try:
+        found = path.is_dir()
+    except OSError:
+        found = False
+    return (path, "") if found else (None, f"repository not found: {path}")
+
+
 async def _still_running(handle) -> bool:
     """Whether waiting on this workflow's result would block.
 
