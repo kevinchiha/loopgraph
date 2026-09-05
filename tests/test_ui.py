@@ -1238,6 +1238,149 @@ def test_the_recorded_question_keeps_its_own_line_breaks():
     assert "pre-wrap" in rule.group(1), "the question's line breaks are collapsed away"
 
 
+# ---------- the rounds ----------
+
+
+def test_the_rounds_copy_is_pinned():
+    """Every word a round card says that was not read off the ledger.
+
+    `no logs yet for this run` is no longer among them. Task 12 put that line in
+    #rounds when the section held log cards and nothing else; #rounds is where
+    every round card lives now, and a run whose ledger has rounds is not empty
+    because a log file is missing. One empty case cannot own two sentences, so
+    the older one goes and `no rounds yet` stays.
+    """
+    html = ui.page_html()
+    assert re.search(r"`item \$\{\w+\} · round \$\{\w+\}`", html), \
+        "the card header no longer reads `item <i> · round <r>`"
+    for line in (" · in progress", "no rounds yet", "audit running", "escalated"):
+        assert line in html, f"the page no longer says {line!r}"
+    for key in ("verdict_reasons", "owner_question", "owner_reply", "directive", "files"):
+        assert key in html, f"the page reads no {key} off a round"
+    assert "no logs yet for this run" not in html, \
+        "two empty-state lines claim #rounds, and only one of them is about rounds"
+
+
+def test_a_round_without_an_item_number_keys_to_item_one():
+    """AC-8, and the only thing keeping two live runs from drawing every round twice.
+
+    `microbits-fact-corrections` and `microbits-ideas-sharpen` both closed before
+    the ledger carried `item_no`, and both wrote their logs in the old shape,
+    `r1-executor.log`, with no item number either. Read with different defaults
+    the ledger round keys `undefined-1` and the log names key `1-1`, so each
+    round draws twice: one card headed `item undefined` carrying the verdict and
+    no panes, one carrying the panes and a permanent ` · in progress` on a run
+    that finished hours ago.
+
+    One helper for both sides is the whole of the fix, and `lg`'s format_status
+    defaults the same way, so the page and the terminal cannot disagree.
+    """
+    html = ui.page_html()
+    helper = function_source(html, "roundKey")
+    assert re.search(r"\|\|\s*1\b", helper), "a round with no item number keys to `undefined`"
+    calls = [c.strip() for c in re.findall(r"roundKey\(([^,]+),", function_source(html, "patchRounds"))]
+    assert len(calls) == 2, f"the two sides do not both go through the key helper: {calls}"
+    assert any(c.endswith(".item_no") for c in calls), \
+        "the ledger round's item_no is keyed without the helper's default"
+    assert any(re.fullmatch(r"\w+\[1\]", c) for c in calls), \
+        "the log name's LOG_RE item group is keyed without the helper's default"
+
+    lg = load_lg()
+    assert "item 1 round 1" in lg.format_status({"rounds": [{"round": 1, "verdict": "accept"}]}), \
+        "lg no longer reads a round with no item_no as item 1"
+
+
+def test_the_page_says_what_lg_says_where_a_round_has_no_verdict():
+    """AC-8. `workflows/run.py` appends the round entry BEFORE the audit runs, and
+    the audit has half an hour to answer, so a round with no `verdict` key is two
+    different pieces of news and they must not read alike.
+
+    `escalated` means the gates stayed red and no audit ever ran. `green` means
+    the supervisor is still out. Printing the gate word `green` where a verdict
+    belongs would read as an acceptance nobody has made, on a screen whose whole
+    job is saying what was actually verified.
+
+    The words are taken out of `lg`'s own helper rather than typed again here: a
+    copy in this test would pin the page to the test and let the terminal drift
+    away from both.
+    """
+    lg = load_lg()
+    src = function_source(ui.page_html(), "roundVerdict")
+    for status in ("escalated", "green"):
+        word = lg._round_verdict({"status": status})
+        assert f"'{word}'" in src, f"the page does not say {word!r} where lg status does"
+    assert re.search(r"green[^\n]*audit running", src), \
+        "the gate word green does not map to the words that say the audit is out"
+
+    # `redo` is a real verdict — run-2026-09-05-macweb-metadata-19220a records one
+    # — and it is not in the plan's list of four. So the word is printed as it
+    # stands, and a page that enumerates verdicts prints a blank where it sits.
+    assert lg._round_verdict({"status": "green", "verdict": "redo"}) == "redo"
+    assert not re.search(r"'(accept|stop|plan|ask|redo)'", src), \
+        "the page enumerates verdict words instead of printing the one it was given"
+
+
+def test_a_round_says_it_is_in_progress_through_both_halves_of_its_life():
+    """The live view the old dashboard gave away for free, and it is two states.
+
+    `_run_item` appends the round entry only after `execute_round` returns, so
+    while the executor works there is a log file growing and no ledger row at
+    all — the first half. Then the entry is appended and the audit is awaited for
+    up to 30 minutes, and only then is `verdict` written — the second half. A
+    card that only knew the first would go quiet for half an hour on a round that
+    is still very much running.
+    """
+    src = function_source(ui.page_html(), "patchRoundCard")
+    assert "' · in progress'" in src, "no card ever says a round is still running"
+    assert re.search(r"!\w+\.entry", src), \
+        "a round with no ledger row at all is not read as running"
+    assert "audit running" in src, \
+        "a round whose audit is still out drops the suffix half an hour early"
+
+
+def test_a_log_with_no_ledger_row_still_gets_a_card():
+    """AC-10 and the in-progress half above, from the other side: the cards are
+    the union of the ledger's rounds and the log names, not either one alone. A
+    ledger-only view loses every round the executor is still working in; a
+    names-only view is what the page did before it could read a verdict."""
+    src = function_source(ui.page_html(), "patchRounds")
+    assert re.search(r"for \(const \w+ of rounds\)", src), "the ledger's rounds build no cards"
+    assert re.search(r"for \(const \w+ of names\)", src), "the log names build no cards"
+    assert "LOG_RE" in src, "the log names are grouped by something other than the shared pattern"
+    assert ".remove()" in src, "a card whose key left the reply stays on screen for ever"
+
+
+def test_rounds_are_ordered_by_number_and_not_as_strings():
+    """`1-10` sorts under `1-2` as a string, so `item 1 · round 10` sat above
+    `item 1 · round 2` — and cards are inserted rather than re-sorted, so no
+    later poll ever moves it back. The comparison has to read numbers, and the
+    same comparison has to place a new card as sorts the list."""
+    html = ui.page_html()
+    order = function_source(html, "newerFirst")
+    assert "Number" in order, "the keys are compared as text, so round 10 sits above round 2"
+    src = function_source(html, "patchRounds")
+    assert "sort(newerFirst)" in src, "the keys are sorted by something else"
+    assert re.search(r"newerFirst\(\w+\.dataset\.key", src), \
+        "a new card is placed by a comparison the sort does not use"
+    assert not re.search(r"dataset\.key\s*<", src), \
+        "the old string comparison is still deciding where a card goes"
+    assert "insertBefore" in src, "a new card cannot arrive without moving the ones on screen"
+
+
+def test_a_round_card_carries_what_ac8_asks_for():
+    """Verdict, reasons one per line, files one per line, the directive when there
+    is one, and the owner's question with the answer when the round asked. All of
+    it written through setText, so a poll that changes nothing touches no node."""
+    src = function_source(ui.page_html(), "patchRoundCard")
+    for field in ("verdict_reasons", "files", "directive", "owner_question", "owner_reply"):
+        assert field in src, f"a round card says nothing about {field}"
+    assert src.count("'\\n'") >= 2, "the reasons and the files are not one per line"
+    assert ".textContent =" not in src, "a poll writes text without checking it changed"
+    rule = re.search(r"\.round \.field span \{([^}]*)\}", ui.page_html())
+    assert rule and "pre-wrap" in rule.group(1), \
+        "the lines a round is patched with are collapsed back into one"
+
+
 # ---------- the host repository behind a run's worktree ----------
 
 

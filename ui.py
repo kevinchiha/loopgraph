@@ -2,12 +2,14 @@
 """lg ui — tiny local dashboard for watching loopgraph runs live.
 
 Stdlib HTTP server + the venv's temporalio. Left: runs (from Temporal, plus any
-run dir that has logs). Right: the selected run's state, then its logs — the
+run dir that has logs). Right: the selected run's state, then its rounds — the
 status, the question it is waiting on with the command that answers it, the work
-items, and one collapsed log pane per round and role. An open pane asks for the
-bytes past the ones it already has every 2 seconds and appends them; a collapsed
-one asks for nothing. If Temporal is down the page says so and still tails log
-files.
+items, and one card per round carrying what the supervisor said about it and the
+two collapsed log panes that round wrote. An open pane asks for the bytes past
+the ones it already has every 2 seconds and appends them; a collapsed one asks
+for nothing. A round the executor is still working in has a growing log and no
+ledger row yet, and gets a card that says so. If Temporal is down the page says
+so and still tails log files.
 
 Run: lg ui [--port 8400]  →  http://localhost:8400
 """
@@ -107,6 +109,20 @@ PAGE = """<!doctype html>
   .round { margin-bottom:22px; }
   #items > h2, .round > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px;
                              color:var(--dim); text-transform:uppercase; margin-bottom:8px; }
+  /* The verdict is the one word on the card that says whether anything was
+     accepted, so it is not dim like the labels around it. */
+  .round .verdict { font:700 12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+                    color:var(--accent); margin-bottom:9px; }
+  .round .field { margin-bottom:9px; }
+  .round .field b { display:block; margin-bottom:2px; color:var(--dim);
+                    font:700 10.5px/1.6 ui-monospace,monospace; letter-spacing:.9px;
+                    text-transform:uppercase; }
+  /* The reasons and the files are patched in as one string with newlines between
+     them — one setText for the lot, so a poll that changes nothing touches
+     nothing — and this is what puts each of them back on its own line. */
+  .round .field span { display:block; white-space:pre-wrap; word-break:break-word;
+                       font-size:12.5px; color:var(--fg); }
+  .round .panels { margin-top:11px; }
   .panels { display:flex; gap:14px; align-items:flex-start; }
   .panel { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:10px;
            overflow:hidden; }
@@ -401,13 +417,88 @@ function patchBoard(d) {
   patchAwaiting(d && d.ledger);
   patchItems(d && d.ledger);
 }
+// A round's key, `<item>-<round>`, and the one place the item-1 default lives.
+// Two runs recorded rounds before `item_no` was a ledger key, and both wrote
+// their logs in the old shape, r1-executor.log, with no item number either. Read
+// with different defaults the ledger round keys undefined-1 while its logs key
+// 1-1, and the round draws twice: one card headed `item undefined` with the
+// verdict and no panes, one with the panes and a permanent ` · in progress` on a
+// run that finished hours ago. lg's format_status reads them as item 1 too.
+function roundKey(item, round) { return `${item || 1}-${round}`; }
+// Newest first: higher item, then higher round, compared as numbers. As strings
+// `1-10` sorts under `1-2`, which put round 10 above round 2 and left it there —
+// cards are placed once and never re-sorted, so no later poll moves one back.
+function newerFirst(a, b) {
+  const [ai, ar] = a.split('-').map(Number), [bi, br] = b.split('-').map(Number);
+  return bi - ai || br - ar;
+}
+// What a round says where its verdict goes, in lg._round_verdict's words.
+//
+// workflows/run.py appends the round entry BEFORE the audit starts, and the
+// audit has half an hour to answer, so a round with no `verdict` key is two
+// different pieces of news and they must not read alike: `escalated` means the
+// gates stayed red and no audit ever ran, and `green` means the supervisor is
+// still out. The gate word `green` itself never goes here — it would read as an
+// acceptance nobody has made, on the screen whose job is saying what was
+// verified.
+//
+// Whatever verdict is recorded is printed as it stands. `redo` is one this
+// engine writes and a live ledger holds, so a list of the words anyone
+// remembered would blank it out.
+function roundVerdict(entry) {
+  if (entry.verdict) return String(entry.verdict);
+  if (entry.status === 'escalated') return 'escalated';
+  if (entry.status === 'green') return 'audit running';
+  return '';
+}
 function buildRoundCard(key) {
   const card = document.createElement('div');
   card.className = 'round';
   card.dataset.key = key;
-  card.innerHTML = '<h2></h2><div class="panels"></div>';
-  card.firstElementChild.textContent = key;  // a heading is text, never markup
+  // Empty on purpose, exactly as a run row is: every word comes from
+  // patchRoundCard, so there is one code path for the text instead of two that
+  // have to agree, and nothing a supervisor wrote can reach the page as markup.
+  card.innerHTML = '<h2></h2><div class="verdict"></div>'
+                 + '<div class="field"><b>reasons</b><span></span></div>'
+                 + '<div class="field"><b>files</b><span></span></div>'
+                 + '<div class="field"><b>directive</b><span></span></div>'
+                 + '<div class="field"><b>owner asked</b><span></span></div>'
+                 + '<div class="field"><b>owner replied</b><span></span></div>'
+                 + '<div class="panels"></div>';
   return card;
+}
+// A labelled block that is not on the card at all when the round has nothing to
+// put in it. An empty box under the word `directive` says less than no box.
+function patchField(field, text) {
+  field.hidden = !text;
+  setText(field.lastElementChild, text);
+}
+function patchRoundCard(card, row) {
+  // No ledger entry is a state, not a gap: _run_item appends the round only
+  // after execute_round returns, so a round the executor is working in right now
+  // has a log file growing and no row at all. An empty entry reads every field
+  // below as absent, which is exactly what they are.
+  const entry = row.entry || {};
+  const [head, verdict, reasons, files, directive, asked, replied] = card.children;
+  const word = roundVerdict(entry);
+  // Both halves of a round's life, and they are two states rather than one. The
+  // first is the card with no row behind it. The second is the row written and
+  // the audit still out, which lasts up to 30 minutes — a card that knew only
+  // the first would go quiet for half an hour on a round that is still running.
+  // The suffix goes when the verdict arrives.
+  const running = !row.entry || word === 'audit running';
+  const [item, round] = card.dataset.key.split('-');
+  setText(head, `item ${item} · round ${round}` + (running ? ' · in progress' : ''));
+  verdict.hidden = !word;
+  setText(verdict, word);
+  // One string with newlines in it rather than a row per reason: the whole lot
+  // is one setText, so a poll that changes nothing replaces nothing, and the
+  // stylesheet puts each entry back on its own line.
+  patchField(reasons, (entry.verdict_reasons || []).join('\\n'));
+  patchField(files, (entry.files || []).join('\\n'));
+  patchField(directive, entry.directive || '');
+  patchField(asked, entry.owner_question || '');
+  patchField(replied, entry.owner_reply || '');
 }
 function buildLogPane(dir, name, label) {
   // <details> carries "open" itself and fires toggle, so there is no collapse
@@ -425,25 +516,28 @@ function buildLogPane(dir, name, label) {
   pane.addEventListener('toggle', () => { if (pane.open) patchOpenPanes(); });
   return pane;
 }
-function patchRounds(dir, names) {
+function patchRounds(dir, rounds, names) {
   // `dir` is passed in, never read off `sel`: these names were fetched for one
   // run and the panes built from them have to be stamped with that same run,
   // whatever the reader has clicked since.
   const box = document.getElementById('rounds');
-  const rounds = {};
+  // One row per key, filled from both sides, because neither side alone is the
+  // set of rounds a run has had. The ledger has nothing about the round the
+  // executor is in right now; the logs have nothing about a verdict.
+  const rows = {};
+  const slot = key => (rows[key] ||= {entry: null, logs: {}});
+  for (const entry of rounds) slot(roundKey(entry.item_no, entry.round)).entry = entry;
   for (const name of names) {
     const m = name.match(LOG_RE);
-    if (!m) continue;
-    const key = m[1] ? `item ${m[1]} · round ${m[2]}` : `round ${m[2]}`;
-    (rounds[key] ||= {})[m[3]] = name;
+    if (m) slot(roundKey(m[1], m[2])).logs[m[3]] = name;
   }
-  const keys = Object.keys(rounds).sort().reverse();
+  const keys = Object.keys(rows).sort(newerFirst);
   const empty = box.querySelector('.empty');
   if (!keys.length) {
-    if (empty) { setText(empty, 'no logs yet for this run'); return; }
+    if (empty) { setText(empty, 'no rounds yet'); return; }
     const line = document.createElement('div');
     line.className = 'empty';
-    setText(line, 'no logs yet for this run');
+    setText(line, 'no rounds yet');
     box.append(line);
     return;
   }
@@ -452,18 +546,26 @@ function patchRounds(dir, names) {
     let card = [...box.children].find(c => c.dataset.key === key);
     if (!card) {
       card = buildRoundCard(key);
-      // Newest first, and inserted rather than re-sorted: the cards already on
-      // the board are in order, so putting each new one in front of the first
+      // Newest first, and put in place rather than re-sorted: the cards already
+      // on the board are in order, so putting each new one in front of the first
       // older card moves nothing the reader is looking at.
-      box.insertBefore(card, [...box.children].find(c => c.dataset.key < key) || null);
+      box.insertBefore(card,
+        [...box.children].find(c => newerFirst(c.dataset.key, key) > 0) || null);
     }
+    patchRoundCard(card, rows[key]);
+    // A pane never moves between cards: its key chose its card when it was built
+    // and it is added once, so a reader mid-log keeps the log they were reading.
     const panels = card.lastElementChild;
     for (const [role, label] of ROLES) {
-      const name = rounds[key][role];
+      const name = rows[key].logs[role];
       if (name && ![...panels.children].some(p => p.dataset.name === name))
         panels.append(buildLogPane(dir, name, label));
     }
   }
+  // A card whose key the reply no longer carries. Choosing another run rebuilds
+  // the board, so this is a ledger that changed under a run already on screen.
+  const wanted = new Set(keys);
+  for (const card of [...box.children]) if (!wanted.has(card.dataset.key)) card.remove();
 }
 // A pane's next offset is only written when its own reply lands. A second pass
 // starting before the first has finished would read the offset the first pass
@@ -555,7 +657,14 @@ async function poll() {
       fetch('/api/run?id=' + encodeURIComponent(run.id)).then(r => r.json()),
       fetch('/api/logs?dir=' + encodeURIComponent(run.dir)).then(r => r.json()),
     ]);
-    if (run === sel) { patchBoard(state); patchRounds(run.dir, logs.logs || []); }
+    // The ledger's rounds and the log names reach the same patch, because one
+    // round is both: a row saying what the supervisor decided, and the two files
+    // the round wrote while deciding it.
+    if (run === sel) {
+      patchBoard(state);
+      patchRounds(run.dir, (state && state.ledger && state.ledger.rounds) || [],
+                  logs.logs || []);
+    }
   } catch(e) { /* the board keeps what it has until the next poll */ }
   patchOpenPanes();
 }
@@ -1031,8 +1140,7 @@ def page_html() -> str:
     pattern between quotes instead looked right and was not: a JS string eats an
     unknown escape, so `\\d` reached RegExp as a bare `d`, the browser built
     /^(?:i(d+)-)?r(d+)-(executor|audit).log$/, every filename failed to match, and
-    the log pane said "no logs yet for this run" for every run there has ever
-    been."""
+    the page said there were no rounds for every run there has ever been."""
     return PAGE.replace("__LOG_RE__", json.dumps(LOG_RE))
 
 
