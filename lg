@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """lg — thin CLI for loopgraph-engine.
 
-M1: `lg gate <gates.yaml> [workdir]` runs gates through the GateCheckRun
-workflow; `lg status <workflow-id|run-dir>` prints what a run is doing.
-`lg new` / `lg start <brief>` land with M3.
+`lg start <run-dir> [repo]` runs a brief; `lg status <workflow-id|run-dir>`
+prints what a run is doing; `lg approve <workflow-id> <answer>` answers a
+waiting one; `lg gate`, `lg round` and `lg prompt` drive the pieces on their
+own. `lg --help` lists them all.
 """
 
 from __future__ import annotations
@@ -79,7 +80,7 @@ def resolve_run_arg(arg: str, candidates: list[tuple[str, datetime]]) -> tuple[s
 
     An id given in full wins outright. Otherwise the id has to be `run-<slug>-`
     plus a token holding no `-`, which is the shape cmd_start builds and the
-    inverse of ui.TemporalFeed's id[4:id.rfind("-")]. Without the no-dash rule
+    inverse of ui.run_entry's id[4:id.rfind("-")]. Without the no-dash rule
     the slug `foo` would swallow every run whose own slug starts with `foo-`.
     """
     for wf_id, _ in candidates:
@@ -179,7 +180,7 @@ async def _still_running(handle) -> bool:
 
     temporalio types WorkflowExecution.status as optional and leaves it None when
     Temporal reports no status, so unknown has to fall one way. It falls the way
-    ui.TemporalFeed._runs falls it — unknown counts as running — because the two
+    ui._still_running falls it — unknown counts as running — because the two
     mistakes are not equal: skipping the fallback prints one line, and taking it
     on a run that is waiting for its owner holds the terminal for as long as the
     card is up.
@@ -195,8 +196,11 @@ async def _answer(handle, queries: list[str]) -> tuple[str, object]:
     comes straight back out and the caller reads the argument as a run directory
     instead. Anything else just moves to the next query. When `ledger` was among
     the queries that failed, a finished run still has its ledger: it is the value
-    the workflow returned, and query-by-replay on a closed run can fail to decode
-    in this SDK. That is the fallback the dashboard already makes.
+    the workflow returned, and a query on a closed run makes the worker replay
+    its whole history against the workflow code registered now — a history
+    written by older code diverges and the query dies with a nondeterminism
+    error, not a decoding one. Half the runs on a long-lived engine are in that
+    state. That is the fallback ui._ledger already makes.
     """
     failure: Exception = RuntimeError("no query to ask")
     for q in queries:

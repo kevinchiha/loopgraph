@@ -361,7 +361,7 @@ function patchState(d) {
   box.hidden = !ledger;
   why.hidden = !!ledger;
   // The diff is read off the last round's branch, so a run with no ledger has
-  // nothing to ask /api/diff for. Task 16 fills the pane; this hides it.
+  // nothing to ask /api/diff for, so the pane is hidden rather than empty.
   document.getElementById('diff').hidden = !ledger;
   if (ledger) {
     const [word, reason] = box.children;

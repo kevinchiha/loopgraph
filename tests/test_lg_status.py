@@ -118,9 +118,11 @@ def test_empty_items_and_rounds_say_none_yet(lg):
 
 
 def test_a_ledger_with_no_items_or_rounds_keys_says_none_yet(lg):
-    """The real recorded result of run-2026-09-05-microbits-ideas-sharpen-794631,
-    which closed before `items` was a ledger key. `ledger["items"]` is a KeyError
-    on it, and a traceback is not an answer to `lg status`."""
+    """The shape a run closed before both keys existed hands back. Not a
+    verbatim copy of any one run — the real ideas-sharpen ledger does carry
+    `rounds` — but two closed runs on this machine have no `items` key at all.
+    `ledger["items"]` is a KeyError on them, and a traceback is not an answer
+    to `lg status`."""
     out = lg.format_status({"status": "stopped",
                             "reason": "checkpoint refused: empty write set",
                             "checkpoint": {"committed": False, "reason": "empty write set"}})
@@ -179,7 +181,7 @@ def test_bare_slug_and_runs_forms_resolve_the_same(lg, arg):
 
 
 def test_a_slug_that_prefixes_another_run_matches_only_its_own(lg):
-    """The no-dash rule is the inverse of ui.TemporalFeed's id[4:id.rfind("-")].
+    """The no-dash rule is the inverse of ui.run_entry's id[4:id.rfind("-")].
     Without it `foo` would claim every run whose slug starts with foo-."""
     candidates = [("run-foo-ab12cd", at(1)), ("run-foo-bar-ef34gh", at(2)),
                   ("run-foo-", at(3))]
@@ -199,7 +201,9 @@ def test_no_match_is_none_and_zero(lg):
 # ---------- the command itself ----------
 
 NO_HANDLER = "Query handler for 'status' expected but not found, known queries: [ledger]"
-UNDECODABLE = RuntimeError("failed to decode query result")
+# What the SDK really raises: the worker replays the closed run's history
+# against today's workflow code and diverges. Never a decoding failure.
+DRIFTED = RuntimeError("[TMPRL1100] Nondeterminism error: activity type mismatch")
 
 LEDGER = {"status": "merged",
           "items": [{"n": 1, "item": "one", "status": "done", "commit": "3f2a1b9c0d5e"}],
@@ -355,10 +359,10 @@ def test_no_match_names_the_prefix_and_exits_1(lg, monkeypatch, capsys):
 
 
 def test_a_closed_run_whose_ledger_query_fails_uses_the_result(lg, monkeypatch, capsys):
-    """Query-by-replay fails to decode on closed runs in this SDK, and the
-    ledger of a finished run IS its return value — the same fallback the
-    dashboard makes."""
-    handle = FakeHandle("run-toy-ab12cd", {"ledger": UNDECODABLE}, result=LEDGER)
+    """A query on a closed run replays its history against current workflow
+    code; one written by older code diverges and the query fails. The ledger of
+    a finished run IS its return value — the same fallback ui._ledger makes."""
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": DRIFTED}, result=LEDGER)
     assert run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}),
                       "run-toy-ab12cd") == 0
     assert capsys.readouterr().out == lg.format_status(LEDGER)
@@ -368,29 +372,31 @@ def test_a_closed_run_whose_ledger_query_fails_uses_the_result(lg, monkeypatch, 
 def test_a_running_run_whose_ledger_query_fails_does_not_wait_on_result(lg, monkeypatch, capsys):
     """result() blocks until the workflow ends, so on a run that is waiting on
     its card this would hold the owner's terminal for as long as the card is up."""
-    handle = FakeHandle("run-toy-ab12cd", {"ledger": UNDECODABLE},
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": DRIFTED},
                         status=WorkflowExecutionStatus.RUNNING, result=LEDGER)
     code = run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}), "run-toy-ab12cd")
     out, err = capsys.readouterr()
-    assert (code, out, err) == (1, "", "failed to decode query result\n")
+    assert (code, out, err) == (
+        1, "", "[TMPRL1100] Nondeterminism error: activity type mismatch\n")
     assert handle.awaited_result is False
 
 
 def test_an_unknown_status_is_treated_as_running(lg, monkeypatch, capsys):
     """temporalio types the status as optional and leaves it None when Temporal
-    reports none. Unknown counts as running, the way ui.TemporalFeed reads it:
+    reports none. Unknown counts as running, the way ui._still_running reads it:
     a skipped fallback prints one line, a wrong one hangs the terminal."""
-    handle = FakeHandle("run-toy-ab12cd", {"ledger": UNDECODABLE}, status=None, result=LEDGER)
+    handle = FakeHandle("run-toy-ab12cd", {"ledger": DRIFTED}, status=None, result=LEDGER)
     code = run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}), "run-toy-ab12cd")
     out, err = capsys.readouterr()
-    assert (code, out, err) == (1, "", "failed to decode query result\n")
+    assert (code, out, err) == (
+        1, "", "[TMPRL1100] Nondeterminism error: activity type mismatch\n")
     assert handle.awaited_result is False
 
 
 def test_an_unanswerable_positional_query_prints_one_line_and_exits_1(lg, monkeypatch, capsys):
     """`lg status <id> status` on a LoopGraphRun, which declares only `ledger`.
-    The help text teaches `status`, so this is reached by typing, and the answer
-    is one line — not the traceback it used to be."""
+    Any query name can be typed, so a wrong one has to answer in one line —
+    not the traceback it used to be."""
     handle = FakeHandle("run-toy-ab12cd", {"ledger": LEDGER}, result=LEDGER)
     code = run_status(lg, monkeypatch, FakeClient({"run-toy-ab12cd": handle}),
                       "run-toy-ab12cd", "status")

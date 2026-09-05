@@ -66,7 +66,7 @@ do. Everything machine-specific comes from `.env`, which `install.sh` writes.
 ## Checks
 
 ```bash
-.venv/bin/python -m pytest -q      # all of it, ~4s
+.venv/bin/python -m pytest -q      # all of it, ~45s
 ```
 
 `tests/test_release.py` guards publishing: no credentials or personal paths in

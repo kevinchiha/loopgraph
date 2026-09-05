@@ -885,7 +885,7 @@ def test_a_poll_never_calls_a_build_function_for_its_side_effect():
     has to be used — put in a variable or passed to an insert — so a call written
     for what it does to the document instead stands out on the line.
 
-    Two hops out it is invisible again, and Task 16's checklist carries that.
+    Two hops out it is invisible again, and the browser checklist carries that.
     """
     src, regs = regions(ui.page_html())
     reached = poll_path(src, regs)
@@ -1296,7 +1296,7 @@ def test_a_hidden_section_is_really_off_the_page():
     nondeterminism on 7 of the 15 histories on this machine.
 
     One rule beside the reset settles it for every section this page hides, the
-    ones Tasks 15 and 16 add included. It has to carry !important, because the
+    round cards and the diff pane included. It has to carry !important, because the
     page's own rules are the ones it is overruling.
     """
     rule = re.search(r"\[hidden\]\s*\{([^}]*)\}", ui.page_html())
@@ -1355,7 +1355,7 @@ def test_the_recorded_question_keeps_its_own_line_breaks():
 def test_the_rounds_copy_is_pinned():
     """Every word a round card says that was not read off the ledger.
 
-    `no logs yet for this run` is no longer among them. Task 12 put that line in
+    `no logs yet for this run` is no longer among them. That line lived in
     #rounds when the section held log cards and nothing else; #rounds is where
     every round card lives now, and a run whose ledger has rounds is not empty
     because a log file is missing. One empty case cannot own two sentences, so
