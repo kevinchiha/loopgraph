@@ -98,16 +98,26 @@ whether to merge. Answer it and you have seen the whole engine.
 
 Then point it at something real, in a repo under the tree you mounted:
 
-> Run this through loopgraph: add a --json flag to the export command in myapp.
+> Run this through loopgraph: replace every direct `process.env` read in `src/`
+> with a call to the typed `config` module, and keep the build and the test suite
+> green.
 
-The agent writes the brief and the write set, digs the actual check commands out
-of the project's `package.json` or `pyproject.toml`, confirms they pass on a clean
-tree before starting, then starts the run and reports back. You hear from it again
-when there is a decision to make.
+That is the shape worth a loop. Wide, mechanical, and easy to get almost right.
+An agent will tell you it converted all thirty call sites. The gates and the audit
+are how you find out it converted twenty-eight and quietly left two, which is the
+kind of thing you would have accepted at 6pm on a Friday.
 
-That last step is the point. It refuses to start a run whose gates cannot pass on
-an untouched repo, because a broken gate burns all three rounds and then the
-report blames the executor for your build.
+The agent writes the brief and the write set, digs the real check commands out of
+`package.json` or `pyproject.toml`, confirms they pass on a clean tree before
+starting, then starts the run and reports back. You hear from it again when there
+is a decision to make.
+
+That clean-tree check matters more than it sounds. A gate that cannot pass on an
+untouched repo burns all three rounds, and then the report blames the executor for
+your build.
+
+Work that is not worth a loop: anything you would have finished while writing the
+brief. Ask your agent directly for those.
 
 ## Defining a run
 
