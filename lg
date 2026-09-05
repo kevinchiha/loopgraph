@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime
 
 from temporalio.client import Client
 
@@ -64,6 +65,106 @@ async def cmd_gate(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps(result, indent=2))
     return 0
+
+
+def run_slug(arg: str) -> str:
+    """The run directory an argument names: `x`, `runs/x` and `runs/x/` are one run."""
+    parts = [p for p in arg.split("/") if p]
+    return parts[-1] if parts else ""
+
+
+def resolve_run_arg(arg: str, candidates: list[tuple[str, datetime]]) -> tuple[str | None, int]:
+    """Which workflow a run-directory slug names, and how many claimed it.
+
+    An id given in full wins outright. Otherwise the id has to be `run-<slug>-`
+    plus a token holding no `-`, which is the shape cmd_start builds and the
+    inverse of ui.TemporalFeed's id[4:id.rfind("-")]. Without the no-dash rule
+    the slug `foo` would swallow every run whose own slug starts with `foo-`.
+    """
+    for wf_id, _ in candidates:
+        if wf_id == arg:
+            return arg, 1
+    prefix = f"run-{run_slug(arg)}-"
+    matches = [(wf_id, start) for wf_id, start in candidates
+               if wf_id.startswith(prefix)
+               and wf_id[len(prefix):] and "-" not in wf_id[len(prefix):]]
+    if not matches:
+        return None, 0
+    return max(matches, key=lambda m: m[1])[0], len(matches)
+
+
+def _round_verdict(entry: dict) -> str:
+    """What a round says where its verdict goes.
+
+    The entry is written before the audit starts, so a round with no verdict is
+    two different pieces of news and they must not read alike: `escalated` means
+    the gates stayed red and no audit ever ran, `green` means the audit is still
+    out. The gate word `green` itself never goes here — it would read as an
+    acceptance the supervisor has not made.
+    """
+    if entry.get("verdict"):
+        return str(entry["verdict"])
+    return {"escalated": "escalated", "green": "audit running"}.get(entry.get("status"), "")
+
+
+def format_status(ledger: dict) -> str:
+    """A run's ledger as something readable in a terminal.
+
+    Every key is optional, because this is handed ledgers older than half the
+    keys it reads: a run that closed before `items` was a ledger key hands back
+    a dictionary with no `items` at all, and two runs on this machine do exactly
+    that. `ledger["items"]` on one of those is a traceback where the owner asked
+    a plain question.
+    """
+    head = [f"status: {ledger.get('status', '')}"]
+    if "reason" in ledger:
+        head.append(f"reason: {ledger['reason']}")
+    sections = [head]
+
+    awaiting = ledger.get("awaiting")
+    if awaiting:
+        block = [f"awaiting: {awaiting.get('kind', '')}"]
+        question = awaiting.get("question")
+        if question:
+            # Printed as recorded, line breaks and all: it is the text of the card
+            # the owner saw, and nothing here rebuilds it from the kind and letters.
+            block += [f"  {line}" if line else "" for line in str(question).splitlines()]
+        else:
+            block.append("  question not recorded")
+        block += [f"  {letter} — {label}"
+                  for letter, label in (awaiting.get("options") or {}).items()]
+        block.append(f"  answer with: {awaiting.get('answer_with', '')}")
+        if not awaiting.get("telegram"):
+            # The dashboard says this sentence too, and a test pins the two equal.
+            # Nothing was sent to the owner's phone, so a run that is waiting looks
+            # stuck until something says why.
+            block.append("  no card was sent; the lg approve command is the only way to answer")
+        sections.append(block)
+
+    items = ["items:"]
+    for entry in ledger.get("items") or []:
+        detail = ""
+        if entry.get("status") == "done":
+            detail = str(entry.get("commit") or "")[:10]
+        elif entry.get("status") == "parked":
+            detail = str(entry.get("reason") or "")
+        items.append(f"  {entry.get('n', '')} {entry.get('status', '')} {detail}".rstrip())
+    if len(items) == 1:
+        items.append("  (none yet)")
+    sections.append(items)
+
+    rounds = ["rounds:"]
+    for entry in ledger.get("rounds") or []:
+        # item_no arrived after the first runs. Those were single-item runs, so
+        # item 1 is what they were, and it is the default the dashboard uses too.
+        word = _round_verdict(entry)
+        rounds.append(f"  item {entry.get('item_no') or 1} round {entry.get('round', '')} {word}"
+                      .rstrip())
+    if len(rounds) == 1:
+        rounds.append("  (none yet)")
+    sections.append(rounds)
+
+    return "\n\n".join("\n".join(s) for s in sections) + "\n"
 
 
 async def cmd_status(args: argparse.Namespace) -> int:
