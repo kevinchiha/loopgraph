@@ -15,6 +15,7 @@ import json
 import re
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -173,6 +174,46 @@ def run_dirs(runs_dir: Path) -> list[str]:
                   key=lambda n: (runs_dir / n).stat().st_mtime, reverse=True)
 
 
+def run_entry(wf_id: str, status: str, start_time: datetime | None,
+              close_time: datetime | None, ledger: dict | None) -> dict:
+    """One row of /api/runs.
+
+    `id` is the key the page selects on and the key /api/run and /api/diff take.
+    `dir` is the run directory, which is not the same thing: two workflows of one
+    directory write the same log files, so they are two rows sharing one `dir`.
+
+    The times come straight off WorkflowExecution and go out as ISO 8601. A
+    running workflow has no close time, and a row built from log files alone has
+    neither, so the page shows no time rather than a wrong one.
+    """
+    entry = {"id": wf_id,
+             "dir": wf_id[4:wf_id.rfind("-")] if wf_id.startswith("run-") else wf_id,
+             "state": status,
+             "detail": "",
+             "start_time": start_time.isoformat() if start_time else None,
+             "close_time": close_time.isoformat() if close_time else None}
+    if ledger:
+        rounds = ledger.get("rounds", [])
+        verdict = rounds[-1].get("verdict", "") if rounds else ""
+        entry["state"] = ledger.get("status", entry["state"])
+        entry["detail"] = f"r{len(rounds)} {verdict}".strip()
+    return entry
+
+
+async def _still_running(handle) -> bool:
+    """Whether waiting on this workflow's result would block.
+
+    temporalio types the status optional and leaves it None when Temporal reports
+    none, so unknown has to fall one way. It falls the way lg._still_running falls
+    it — unknown counts as running — because the two mistakes are not equal:
+    skipping the fallback costs one row its detail, and taking it on a run that is
+    waiting for its owner holds the poll until call() gives up.
+    """
+    from temporalio.client import WorkflowExecutionStatus
+    status = (await handle.describe()).status
+    return status is None or status == WorkflowExecutionStatus.RUNNING
+
+
 class TemporalFeed:
     """Persistent temporalio client on its own loop thread; sync callers use call()."""
 
@@ -194,29 +235,66 @@ class TemporalFeed:
             self._err = str(e)
         self._loop.run_forever()
 
+    @property
+    def connected(self) -> bool:
+        return bool(self._client)
+
     def call(self, coro, timeout=10):
+        """Run a coroutine on the feed's loop and wait for it. Request threads only.
+
+        run_coroutine_threadsafe has no same-thread guard. Called from inside the
+        loop's own thread it blocks that loop, so the coroutine it just submitted
+        can never start and the wait runs the full timeout out. Anything already on
+        the loop — _runs is — awaits the coroutine instead.
+        """
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+
+    async def _ledger(self, wf_id: str) -> dict | None:
+        """One workflow's ledger, on the feed's own loop. Unknown id: None.
+
+        Both branches carry real traffic. A workflow answers the `ledger` query
+        while the worker can replay its history; when it cannot, the ledger is the
+        value the workflow returned instead.
+
+        That second branch is not a decoding failure, whatever the comment that
+        used to sit here said and its copy in lg._answer still says. Read that way
+        it sends the next person searching the data converter for a bug that is not
+        there. What happens is that a query makes the worker replay the whole
+        history against the workflow code registered right now, so a history
+        written by older code comes back as WorkflowQueryFailedError, [TMPRL1100]
+        Nondeterminism error. It is fixed per workflow id — 7 of the 15 runs on
+        this machine — and the share grows every time the engine changes. Neither
+        branch may be dropped, and neither costs anything: a failing query answers
+        in 0.01-0.03 s and a closed run's result in about none.
+
+        result() on a workflow that has not finished is the exception. It waits for
+        the workflow, and a run holding its owner's card does not finish, so
+        _still_running is asked first.
+        """
+        handle = self._client.get_workflow_handle(wf_id)
+        try:
+            return await handle.query("ledger")
+        except Exception:
+            pass
+        try:
+            return None if await _still_running(handle) else await handle.result()
+        except Exception:
+            return None
+
+    def ledger(self, wf_id: str) -> dict | None:
+        """The same ledger, for an HTTP handler thread. Never raises into a poll."""
+        if not self._client:
+            return None
+        try:
+            return self.call(self._ledger(wf_id))
+        except Exception:
+            return None
 
     async def _runs(self):
         out = []
         async for wf in self._client.list_workflows('WorkflowType = "LoopGraphRun"'):
-            entry = {"id": wf.id, "dir": wf.id[4:wf.id.rfind("-")] if wf.id.startswith("run-") else wf.id,
-                     "state": wf.status.name.lower() if wf.status else "running", "detail": ""}
-            try:
-                ledger = await self._client.get_workflow_handle(wf.id).query("ledger")
-            except Exception:
-                # closed workflows: the ledger IS the workflow's return value
-                # (query-by-replay on closed runs can fail decoding in this SDK)
-                try:
-                    ledger = await self._client.get_workflow_handle(wf.id).result()
-                except Exception:
-                    ledger = None
-            if ledger:
-                rounds = ledger.get("rounds", [])
-                verdict = rounds[-1].get("verdict", "") if rounds else ""
-                entry["state"] = ledger.get("status", entry["state"])
-                entry["detail"] = f"r{len(rounds)} {verdict}".strip()
-            out.append(entry)
+            out.append(run_entry(wf.id, wf.status.name.lower() if wf.status else "running",
+                                 wf.start_time, wf.close_time, await self._ledger(wf.id)))
             if len(out) >= 25:
                 break
         return out
@@ -244,8 +322,15 @@ def page_html() -> str:
     return PAGE.replace("__LOG_RE__", json.dumps(LOG_RE))
 
 
-def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhost:7233"):
-    feed = TemporalFeed(temporal_addr) if temporal_addr else None
+def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhost:7233",
+                feed=None) -> ThreadingHTTPServer:
+    """The dashboard's server. `feed` stands in for the Temporal connection.
+
+    The handler reads only `connected`, `runs()` and `ledger()` off it, so a test
+    can pass a fake and assert the endpoints over HTTP with no engine running.
+    """
+    if feed is None and temporal_addr:
+        feed = TemporalFeed(temporal_addr)
 
     class H(BaseHTTPRequestHandler):
         def _json(self, obj, code=200):
@@ -293,8 +378,19 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                 known = {w["dir"] for w in wf}
                 for d in run_dirs(runs_dir):
                     if d not in known:
-                        wf.append({"id": d, "dir": d, "state": "unknown", "detail": "logs only"})
-                self._json({"runs": wf, "temporal": bool(feed and feed._client)})
+                        # No workflow, so no id to key on but the directory itself,
+                        # and no times: the page shows none rather than a wrong one.
+                        wf.append({"id": d, "dir": d, "state": "unknown", "detail": "logs only",
+                                   "start_time": None, "close_time": None})
+                self._json({"runs": wf, "temporal": bool(feed and feed.connected)})
+            elif u.path == "/api/run":
+                wf_id = parse_qs(u.query).get("id", [""])[0]
+                if bad_param(wf_id):
+                    return self._json({"error": "id must be a workflow id"}, 400)
+                # An id Temporal does not know is a null ledger with temporal true;
+                # `temporal` says the feed is connected, nothing about the id.
+                self._json({"ledger": feed.ledger(wf_id) if feed else None,
+                            "temporal": bool(feed and feed.connected)})
             else:
                 self.send_error(404)
 

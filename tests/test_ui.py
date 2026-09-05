@@ -1,12 +1,17 @@
+import asyncio
 import inspect
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import pytest
+from temporalio.client import WorkflowExecutionStatus
 
 import ui
 
@@ -235,11 +240,195 @@ def test_dir_and_name_reject_empty_slash_and_dotdot(server, endpoint, param, bad
 
 
 def test_runs_endpoint_without_temporal(server):
-    import json
-    d = json.loads(get(server + "/api/runs").read())
+    d = getjson(server + "/api/runs")
     assert d["temporal"] is False
-    assert d["runs"][0]["dir"] == "2026-01-01-demo"
-    assert d["runs"][0]["state"] == "unknown"
+    row = d["runs"][0]
+    assert row["dir"] == "2026-01-01-demo"
+    assert row["state"] == "unknown"
+    assert row["id"] == row["dir"], "a row known only from its logs is keyed on its directory"
+    assert row["start_time"] is None
+    assert row["close_time"] is None, "no workflow, so no time rather than a wrong one"
+
+
+# ---------- the ledger, per workflow id ----------
+
+LEDGER = {"status": "merge-ready", "rounds": [{"verdict": "PASS"}]}
+KNOWN = "run-2026-01-01-demo-aaaaaa"
+START = datetime(2026, 9, 5, 15, 45, 29, tzinfo=timezone.utc)
+CLOSE = datetime(2026, 9, 5, 16, 0, 0, tzinfo=timezone.utc)
+
+
+class FakeFeed:
+    """The three members the handler reads, over canned values.
+
+    `make_server(feed=...)` takes one of these in place of a real TemporalFeed, so
+    the endpoints can be asserted over HTTP with no engine running. It cannot stand
+    in for the feed's own tests further down: it replaces `ledger`, which is the
+    method those exist to exercise.
+    """
+
+    def __init__(self, connected=True, rows=(), ledgers=None):
+        self.connected = connected
+        self.rows = [dict(r) for r in rows]
+        self.ledgers = dict(ledgers or {})
+
+    def runs(self):
+        return [dict(r) for r in self.rows]
+
+    def ledger(self, wf_id):
+        return self.ledgers.get(wf_id)
+
+
+@pytest.fixture
+def fed(tmp_path):
+    """A server whose feed is a fake: Temporal's answers without Temporal."""
+    feed = FakeFeed(rows=[ui.run_entry(KNOWN, "completed", START, CLOSE, LEDGER)],
+                    ledgers={KNOWN: LEDGER})
+    srv = ui.make_server(0, tmp_path, temporal_addr=None, feed=feed)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+
+
+def test_run_entry_formats_times_and_keeps_dir():
+    done = ui.run_entry(KNOWN, "completed", START, CLOSE, LEDGER)
+    assert done["start_time"] == "2026-09-05T15:45:29+00:00"
+    assert done["close_time"] == "2026-09-05T16:00:00+00:00"
+    assert done["state"] == "merge-ready", "the ledger's status wins over Temporal's"
+    assert done["detail"] == "r1 PASS"
+
+    live = ui.run_entry("run-2026-01-01-demo-bbbbbb", "running", START, None, None)
+    assert live["close_time"] is None, "a running workflow has not closed"
+    assert live["state"] == "running" and live["detail"] == ""
+
+    # Two workflows of one run directory: two rows, two ids, one dir, one set of logs.
+    assert done["dir"] == live["dir"] == "2026-01-01-demo"
+    assert done["id"] != live["id"]
+
+
+def test_run_endpoint_without_temporal_is_null_and_200(server):
+    assert getjson(f"{server}/api/run?id={KNOWN}") == {"ledger": None, "temporal": False}
+
+
+def test_run_endpoint_returns_the_feeds_ledger(fed):
+    known = getjson(f"{fed}/api/run?id={KNOWN}")
+    assert known["ledger"] == LEDGER
+    assert known["temporal"] is True
+
+    unknown = getjson(f"{fed}/api/run?id=run-nobody-knows-me-000000")
+    assert unknown["ledger"] is None
+    assert unknown["temporal"] is True, "an id Temporal never heard of is not Temporal being down"
+
+
+@pytest.mark.parametrize("bad", ["", "a/b", ".."])
+def test_run_endpoint_rejects_bad_ids(server, bad):
+    assert status_of(f"{server}/api/run?{urlencode({'id': bad})}") == 400
+
+
+# ---------- the feed itself, over a stub client ----------
+
+HANGS = object()  # a result() that never comes back, the way a held run's does not
+
+
+class StubHandle:
+    """One workflow's handle. Each call answers with its canned value, or raises it."""
+
+    def __init__(self, query, result, status=WorkflowExecutionStatus.COMPLETED):
+        self._query, self._result, self._status = query, result, status
+        self.result_awaited = False
+
+    @staticmethod
+    async def _answer(canned):
+        if isinstance(canned, Exception):
+            raise canned
+        if canned is HANGS:
+            await asyncio.Event().wait()
+        return canned
+
+    async def query(self, name):
+        return await self._answer(self._query)
+
+    async def result(self):
+        self.result_awaited = True
+        return await self._answer(self._result)
+
+    async def describe(self):
+        return SimpleNamespace(status=self._status)
+
+
+def stub_feed(monkeypatch, handles, rows=()):
+    """A real TemporalFeed — its own loop, its own thread, its real call() — over a
+    stub client, because the fallback and the two entry points are the feed's own
+    code and FakeFeed replaces exactly that."""
+
+    class Client:
+        @staticmethod
+        async def connect(address):
+            return Client()
+
+        def get_workflow_handle(self, wf_id):
+            return handles.get(wf_id) or StubHandle(KeyError(wf_id), KeyError(wf_id))
+
+        async def list_workflows(self, query):
+            for wf in rows:
+                yield wf
+
+    monkeypatch.setattr("temporalio.client.Client", Client)
+    return ui.TemporalFeed("stub:0")
+
+
+def test_the_feed_falls_back_from_query_to_result(monkeypatch):
+    """Both branches are hot and neither may be optimised away. Of the 15 LoopGraphRun
+    workflows on this machine 8 answer query("ledger") and 7 raise [TMPRL1100]
+    Nondeterminism, because a query replays the whole history against the workflow
+    code registered now. Their ledger is the value the workflow returned."""
+    feed = stub_feed(monkeypatch, {
+        "wf-queryable": StubHandle(LEDGER, RuntimeError("result() must not be reached")),
+        "wf-replay-diverged": StubHandle(RuntimeError("[TMPRL1100] Nondeterminism error"), LEDGER),
+        "wf-neither": StubHandle(RuntimeError("query failed"), RuntimeError("result failed")),
+    })
+    assert feed.ledger("wf-queryable") == LEDGER
+    assert feed.ledger("wf-replay-diverged") == LEDGER
+    assert feed.ledger("wf-neither") is None
+    assert feed.ledger("wf-never-existed") is None
+
+
+@pytest.mark.parametrize("status", [WorkflowExecutionStatus.RUNNING, None],
+                         ids=["running", "no status"])
+def test_the_feed_never_waits_on_a_running_workflows_result(monkeypatch, status):
+    """result() blocks until the workflow finishes, and a run holding its owner's
+    card does not finish. Unguarded it burned call()'s whole 10 s timeout, which
+    timed the enclosing _runs out too and served an empty run list. Temporal reports
+    no status sometimes, and unknown counts as running for the same reason."""
+    held = StubHandle(RuntimeError("[TMPRL1100] Nondeterminism error"), HANGS, status=status)
+    feed = stub_feed(monkeypatch, {"wf-held": held})
+    t0 = time.monotonic()
+    assert feed.ledger("wf-held") is None
+    assert time.monotonic() - t0 < 2, "it waited on a running workflow's result"
+    assert held.result_awaited is False
+
+
+def test_the_feed_serves_a_ledger_from_both_threads(monkeypatch):
+    """_runs is already on the feed's loop, so it awaits the coroutine; a request
+    thread calls the sync wrapper. One sync method shared by both deadlocks —
+    call() submitted from inside its own loop blocks that loop until the timeout —
+    so this fails on the clock rather than on the value."""
+    wf = SimpleNamespace(id=KNOWN, status=WorkflowExecutionStatus.COMPLETED,
+                         start_time=START, close_time=CLOSE)
+    feed = stub_feed(monkeypatch, {KNOWN: StubHandle(LEDGER, RuntimeError("not needed"))},
+                     rows=[wf])
+    t0 = time.monotonic()
+    rows = feed.runs()
+    got = []
+    t = threading.Thread(target=lambda: got.append(feed.ledger(KNOWN)))
+    t.start()
+    t.join(5)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 2, "one sync ledger() shared by both callers deadlocks on the loop thread"
+    assert rows == [ui.run_entry(KNOWN, "completed", START, CLOSE, LEDGER)]
+    assert rows[0]["detail"] == "r1 PASS", "the run list still carries ledger detail"
+    assert got == [LEDGER]
 
 
 def test_the_injected_pattern_survives_javascript():
