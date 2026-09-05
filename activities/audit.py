@@ -14,13 +14,14 @@ from pathlib import Path
 
 from temporalio import activity
 
-from activities.execute_round import _git, parse_final_json
+from activities.execute_round import NO_TELEGRAM, _git, parse_final_json
 from activities.owner import read_answers
 from activities.stream import log_name, stream_query
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
 
 DIFF_CAP = 12_000  # chars of unified diff handed to the auditor; keeps prompts bounded
+BLOCKED_CAP = 6      # blockers shown per round; a longer list is the executor stalling
 VERDICTS = {"accept", "redo", "plan", "stop", "ask"}
 
 
@@ -72,6 +73,33 @@ def declared_vs_actual(round_result: dict) -> tuple[list[str], list[str]]:
     return sorted(declared - actual), sorted(actual - declared)
 
 
+def format_blocked(entries) -> str:
+    """The executor's blocked list, as text the supervisor can judge.
+
+    The executor cannot reach the owner and must not. This is the only way it can
+    say a decision is out of its hands, and every field is flattened for the same
+    reason claims are: it is untrusted text landing in the middle of a prompt, and
+    a newline in it could open a section of its own.
+    """
+    if not entries:
+        return "(none)"
+    lines = []
+    for e in entries[:BLOCKED_CAP]:
+        if not isinstance(e, dict):
+            lines.append(f"- {flatten_claim(e)}")
+            continue
+        opts = e.get("options") or {}
+        opts_txt = "; ".join(f"{k}: {flatten_claim(v)}" for k, v in list(opts.items())[:6]) or "(free text)"
+        lines.append(
+            f"- decision: {flatten_claim(e.get('decision', '(unstated)'))}\n"
+            f"  recommends: {flatten_claim(e.get('recommend', '(none)'))}\n"
+            f"  options: {opts_txt}\n"
+            f"  why now: {flatten_claim(e.get('why_now', '(unstated)'))}")
+    if len(entries) > BLOCKED_CAP:
+        lines.append(f"- [{len(entries) - BLOCKED_CAP} more, not shown]")
+    return "\n".join(lines)
+
+
 def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str,
                           owner_answers: str = "", work_item: str = "",
                           item_no: int = 1, item_total: int = 1) -> str:
@@ -94,6 +122,7 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
             f"  output:\n```\n{tail[-1500:] or '(no output)'}\n```"
         )
     gates = "\n".join(gate_blocks) or "(no gates)"
+    blocked = format_blocked(round_result.get("blocked") or [])
     violation = ""
     if round_result.get("self_committed"):
         violation = ("\n\n# Executor red line broken (engine check)\n\n"
@@ -135,6 +164,10 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
         f"# Owner answers (recorded by the engine, never by the executor)\n\n"
         f"{owner_answers.strip() or '(none)'}\n\n"
         f"# Executor claims\n\n{claims}\n\n"
+        # The executor has no channel to the owner. This is its only way to say a
+        # decision is not its to make, and judging these is the supervisor's job:
+        # settle what it can settle, card what it cannot.
+        f"# Executor says these are the owner's call\n\n{blocked}\n\n"
         f"# Write set (from git status)\n\n{files}{mismatch}{violation}\n\n"
         f"# Gate results\n\n{gates}\n\n"
         f"# Unified diff (capped at {DIFF_CAP} chars)\n\n```diff\n{diff}{truncated}\n```\n\n"
@@ -167,6 +200,7 @@ async def run_supervisor(prompt: str, worktree: str, log_path: str) -> dict:
         # accept. The executor still loads its project's settings; it is the one
         # being supervised, not the supervisor.
         setting_sources=[],
+        env=NO_TELEGRAM,
     ), log_path)
     return parse_verdict(text)
 

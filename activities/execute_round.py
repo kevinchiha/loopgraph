@@ -36,6 +36,14 @@ CORRECTION_PREAMBLE = (
 
 _OUTPUT_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 
+# The worker holds the bot credentials because send_card runs here, and the SDK
+# subprocess inherits this process's environment. Both nodes have Bash and the
+# container is on the host network, so an executor that decided to message the
+# owner directly could. It must not be able to: the supervisor is the only path
+# to the owner, and a node that could message them could also answer its own
+# card. options.env overrides what is inherited.
+NO_TELEGRAM = {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}
+
 
 # ---------- pure helpers (tested without Claude) ----------
 
@@ -181,11 +189,13 @@ async def run_executor(prompt: str, feedback: str | None, worktree: str, log_pat
         cwd=worktree,
         permission_mode="bypassPermissions",
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        env=NO_TELEGRAM,
     ), log_path)
     try:
         payload = parse_final_json(text)
     except ValueError:
-        payload = {"claims": [], "files_changed": [], "summary": "executor violated the output contract"}
+        payload = {"claims": [], "files_changed": [], "blocked": [],
+                   "summary": "executor violated the output contract"}
     payload["parse_ok"] = "```json" in text
     return payload
 
@@ -248,6 +258,10 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
         "claims": final["result"].get("claims", []),
         "summary": final["result"].get("summary", ""),
         "executor_files": final["result"].get("files_changed", []),
+        # What the executor says only the owner can settle. It has no channel of
+        # its own and must not have one: the supervisor reads these and decides
+        # which, if any, become a card.
+        "blocked": final["result"].get("blocked", []) or [],
         "files": files,
         "diff_stat": diff_stat.strip(),
         "gate_results": final["gate_results"],

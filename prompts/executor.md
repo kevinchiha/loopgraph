@@ -60,9 +60,31 @@ End your final message with exactly one fenced block and nothing after it:
 {
   "claims": ["checkable statement 1", "..."],
   "files_changed": ["relative/path", "..."],
-  "summary": "one paragraph: what changed, how it was verified, gaps registered"
+  "summary": "one paragraph: what changed, how it was verified, gaps registered",
+  "blocked": []
 }
 ```
 
 Claims must be checkable against the diff and gates. `files_changed` is checked
 against `git status` — omissions and inventions are both findings.
+
+## Blocked on the owner
+
+You have no way to reach the owner and must not try. When something genuinely only
+they can settle — credentials, spend, a schema change, lowering a bar, a brief
+ambiguity no verification can settle — put it in `blocked` and carry on with
+whatever else the item allows:
+
+```json
+"blocked": [{
+  "decision": "one plain sentence the owner can answer without reading the code",
+  "recommend": "A — what happens if they pick it",
+  "options": {"A": "...", "B": "..."},
+  "why_now": "what is stuck, and what it costs to wait"
+}]
+```
+
+The supervisor decides what reaches the owner. It will settle anything it can
+settle itself, so a blocker you could have answered by reading the repo comes back
+as a finding against you. Write the entry for someone who has not seen the code:
+it becomes the text of a card on their phone. An empty list is the normal case.
