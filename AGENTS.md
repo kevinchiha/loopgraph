@@ -18,7 +18,7 @@ produces bug reports nobody can reproduce.
 
 - `workflows/run.py` — Temporal workflows. The orchestration between rounds.
 - `activities/` — everything with a side effect: executor, gates, audit,
-  checkpoint, learning, notifications.
+  checkpoint, learning, notifications, and the record of what the owner answered.
 - `graphs/round_graph.py` — the LangGraph loop inside one round.
 - `lg` — the host CLI. No `.py` extension, so tests load it by path.
 - `dispatcher.py` — the only process that reads Telegram. Routes each update to
@@ -36,6 +36,15 @@ Telegram reply reaches it through the dispatcher. Adding a second way in is what
 produced four separate bugs: a retry that re-skipped the queue and lost an answer,
 an unconfirmed update replayed as a fresh instruction, a poll that destroyed the
 updates it did not return, and a stale tap deciding the wrong card.
+
+**The supervisor knows only what `assemble_audit_prompt` hands it.** It never sees
+the executor's transcript, its directive, or the workflow's state, and that
+isolation is the point. So anything it must weigh has to be built into that
+prompt. Two bugs came from forgetting it: an owner's answer reached the executor
+alone, so every value the owner authorised looked invented and the same question
+came back every round; and the work item was passed for the log filename only, so
+a multi-item run judged each round against the whole brief and called the other
+items' absence a defect.
 
 **Workflow code must be deterministic.** No environment reads, no clocks, no
 randomness, no I/O in `workflows/run.py`. Temporal replays it from history, and a

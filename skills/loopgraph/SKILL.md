@@ -38,6 +38,15 @@ after installing.) The run dir already exists. Skip to step 2 with
   paths the executor may touch). One screen, no more. If the request is vague,
   pick the smallest honest slice and say which slice you chose.
 
+  **Prove the defect before you describe it.** Open the code that shows the
+  problem, not the code you expect to show it, and check the neighbours of every
+  file you name. A brief that opens with a problem the repo does not have burns a
+  whole item: the executor finds the premise false in its first minute, the
+  supervisor returns `plan`, and the item parks having done nothing. That has
+  already happened on a Next.js repo, over pages whose "missing" metadata was
+  sitting in a sibling `layout.tsx` nobody looked for. Grepping one filename
+  pattern is not a survey.
+
   **Split multi-part work into work items.** A `## Work items` heading with one
   bullet per item makes the run do them in order, each with its own rounds, audit
   and commit, all onto one branch:
@@ -52,6 +61,11 @@ after installing.) The run dir already exists. Skip to step 2 with
   One item = one independently verifiable change. Do not split a change and its
   test across two items; they share one verification, so they are one item. Leave
   the heading out for anything small and the whole brief is a single item.
+
+  Items must stand alone. No item's done-when may depend on another item landing
+  first, because any of them can park and the rest carry on regardless. Keep their
+  write sets apart too where the work allows it: two items editing one file is how
+  a parked item's leftovers end up in the next item's commit.
 
   A bullet may wrap onto indented lines. The next heading, or unindented prose,
   ends the list.
@@ -76,8 +90,16 @@ after installing.) The run dir already exists. Skip to step 2 with
   `runs/example-hello/check-write-set.sh` and edit the filenames in its `case`.
 
   Traps worth knowing: Next.js 16 and later have no `next lint`; npm gates in a
-  fresh worktree need `npm ci --prefer-offline --no-audit --silent &&` in front;
-  every gate needs a timeout.
+  fresh worktree need `npm ci --prefer-offline --no-audit --silent &&` in front,
+  and `npm ci` needs a lockfile the repo actually tracks (`git ls-files
+  package-lock.json` — a worktree holds tracked files and nothing else); every
+  gate needs a timeout.
+
+  **Green gates are not the last check.** After the audit accepts, the engine
+  stages the write set and runs `git diff --cached --check` before committing. An
+  added line carrying trailing whitespace fails it, and the item parks with every
+  gate green and a clean audit. It bites hardest when the write set holds
+  generated output, so look at what the generator emits.
 
 - **Gate-first, non-negotiable.** Run every gate command yourself, in the order
   gates.yaml lists them and in the same directory, and confirm each exits 0
@@ -124,6 +146,10 @@ answers. Tell them a decision is coming and how to answer it:
   are answering when more than one is in flight.
 - From a terminal: `lg approve <workflow-id> A`. Give them this too; it is faster
   when they are already at the machine.
+- Whatever they answer is written to `owner-answers.md` in the run dir, and both
+  the executor and the auditor read it from there. So the same question is not
+  asked twice, and that file is where you read their answer back when you report.
+  A question does not spend a correction round; only a redo does.
 - A merge card takes a letter and nothing else. If they type an answer instead,
   the engine tells them so and keeps waiting; the run is not stuck.
 
