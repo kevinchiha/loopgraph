@@ -466,7 +466,36 @@ def test_the_injected_pattern_survives_javascript():
 # these tests do not pretend otherwise. What they hold is the structure underneath
 # it — the page is written so a poll path and a first-render path can be told apart
 # by reading the source, and every function that builds markup says so in its name.
-# What each test cannot see is written in its own docstring.
+#
+# Read what follows as tripwires on the shapes this page is written in, not as a
+# proof that a poll cannot redraw. They are keyed on names (build…, patch…, runs,
+# poll), on the literal words innerHTML and replaceChildren, and on there being
+# exactly two intervals. An independent reviewer wrote ten rewrites of the page:
+# six left this file green, and the three of those it served to a browser each
+# destroyed what AC-14 protects — a board permanently empty, a selection gone
+# inside three polls, a text node detached. Four of the six are closed by counting
+# the intervals and two by reading one hop past the poll functions. Everything
+# below was measured by rewriting the page and running this file over it, the
+# NOT list included:
+#
+#   caught   a poll function — or a plainly-named helper it calls directly — that
+#            empties a container and refills it, assigns innerHTML by name,
+#            empties an element it fetched from the document, calls a build…
+#            function for its side effect, or writes textContent unguarded
+#   caught   the same inside a closure, whatever declaration sits above it
+#   caught   any of it hung on a timer of its own, because there are two and only
+#            two intervals
+#   NOT      the same shape two hops out: poll → a() → b() → buildBoard()
+#   NOT      `el.textContent = ''` as the emptying primitive inside a build… name,
+#            called with its value used so the side-effect rule passes: nothing
+#            here reads a textContent write as emptying
+#   NOT      innerHTML reached by a computed name: el['inner' + 'HTML'] = markup
+#   NOT      a poll that MOVES a node instead of replacing it — list.append(row)
+#            on a row already on the page keeps the node and loses the selection
+#   NOT      anything about how often a build… function is actually called
+#
+# The NOT list is Task 16's browser checklist, not a list of things that do not
+# matter. What each test cannot see is written in its own docstring.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
@@ -474,12 +503,18 @@ DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 def script_of(html):
     """The dashboard's JavaScript: the document stripped off, and the comments too.
 
+    Every <script> block, joined, not the first one and then stop. Reading one
+    block left anything in a second invisible to every rule below — a poll
+    function that redrew the run list included — and a hole that wide does not
+    need anyone to write into it on purpose.
+
     The rules below are about code. The page explains them in a comment that names
     innerHTML, and saying what the rule is must not read as breaking it — the same
     reason test_the_process_group_is_captured_before_the_pid_can_be_reused reads
     _git_read_only with its comments cut out.
     """
-    src = html.split("<script>", 1)[1].split("</script>", 1)[0]
+    src = "\n".join(re.findall(r"<script[^>]*>(.*?)</script>", html, re.S))
+    assert src.strip(), "the page serves no script"
     src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
     return "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("//"))
 
@@ -492,7 +527,8 @@ def regions(html):
     a function expression that assigned innerHTML would be charged to whichever
     declaration happens to sit above it, which is the hole
     test_innerhtml_is_only_set_on_a_node_the_same_function_just_created closes
-    from the other side, by looking at what is assigned to rather than where.
+    from the other side, by looking at what is assigned to rather than where, and
+    test_a_closure_neither_builds_markup_nor_empties_an_element closes head on.
     """
     src = script_of(html)
     marks = [(m.start(), m.group(1)) for m in DECLARED.finditer(src)]
@@ -505,6 +541,45 @@ def function_source(html, name):
     found = [src[s:e] for n, s, e in regs if n == name]
     assert len(found) == 1, f"expected one `function {name}(`, found {len(found)}"
     return found[0]
+
+
+def closures(src):
+    """The body of every arrow function and function expression written as a block.
+
+    regions() charges these to whichever `function NAME(` declaration sits above
+    them, so a closure written under a build… declaration inherits its name and
+    every rule keyed on that name. This counts braces instead, which is enough
+    for a page with no unbalanced brace inside a string.
+    """
+    out = []
+    for m in re.finditer(r"=>\s*\{|\bfunction\s*\(", src):
+        opening = src.index("{", m.start())
+        depth = 0
+        for i in range(opening, len(src)):
+            depth += (src[i] == "{") - (src[i] == "}")
+            if depth == 0:
+                out.append(src[opening:i + 1])
+                break
+    return out
+
+
+def test_every_script_block_is_read_not_only_the_first():
+    """The hole in this file's own machinery. script_of stopped at the first
+    </script>, so a second block was checked by nothing at all."""
+    two = "<p><script>function buildOne() {}</script><b><script>function patchTwo() {}</script>"
+    assert "patchTwo" in script_of(two), "the second block was never read"
+    assert [n for n, _, _ in regions(two)[1]] == ["buildOne", "patchTwo"], \
+        "a function in the second block owns no region, so no rule below can reach it"
+
+
+def test_closures_are_found_wherever_they_sit():
+    """The other hole, and this is the machinery that closes it: a closure written
+    under a build… declaration inherits that name from regions(), so the rules
+    keyed on the name have to be joined by one that does not read names at all."""
+    src = "function buildA() { el.onclick = () => { x.innerHTML = 'no'; }; }"
+    assert closures(src) == ["{ x.innerHTML = 'no'; }"]
+    assert "buildA" == regions(f"<script>{src}</script>")[1][0][0], \
+        "regions still charges the closure to the declaration above it"
 
 
 def test_innerhtml_lives_only_in_build_functions():
@@ -563,11 +638,196 @@ def test_the_page_clears_children_but_never_swaps_them():
         "replaceChildren(<nodes>) throws away what is already on the page"
 
 
+def poll_path(src, regs):
+    """The names an interval reaches: runs, poll, every patch…, and the plainly
+    named functions those call directly.
+
+    One hop, and deliberately not a call graph. `poll() { resetBoard(); }` with
+    `function resetBoard() { buildBoard(); }` is a rewrite a reviewer served to a
+    browser: the board came back empty every 2 seconds and every rule keyed on the
+    caller's name waved it through, because the name that does the damage is
+    `resetBoard`. One hop catches that. Two hops — poll → a() → b() → buildBoard()
+    — it does not, and nothing here pretends otherwise.
+
+    build… names are left out on purpose. A poll function calling one directly is
+    already test_a_poll_never_calls_a_build_function_for_its_side_effect's job,
+    and dragging buildRunRow onto the poll path would ban the innerHTML it is
+    supposed to have.
+    """
+    named = {n for n, _, _ in regs}
+    direct = {n for n in named if n in ("runs", "poll") or n.startswith("patch")}
+    # Read off `direct` and never off the growing set, so the hop count is one
+    # whatever order the declarations happen to sit in.
+    reached = set(direct)
+    for name, s, e in regs:
+        if name not in direct:
+            continue
+        for called in re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", src[s:e]):
+            if called in named and not called.startswith("build"):
+                reached.add(called)
+    return reached
+
+
+EMPTIED = re.compile(r"(\w+)\.replaceChildren\(\)")
+BUILT = re.compile(r"(\w+)\s*=\s*build\w*\(")
+FETCHED = re.compile(r"\b(\w+)\s+(?:=|of)\s+document\.(?:getElementById|querySelector)")
+# Every way a node reaches a parent. insertAdjacentHTML is not one of them: it
+# takes markup, it only ever adds, and patchOpenPanes is written on it.
+INSERTS = ("append", "appendChild", "prepend", "insertBefore", "replaceWith",
+           "insertAdjacentElement", "before", "after")
+
+
+def test_a_function_never_empties_a_container_and_fills_it_back_up():
+    """The hole the two innerHTML rules leave, and the one the run list sat in.
+
+        el.replaceChildren();
+        for (const r of rows) el.append(buildRunRow(r));
+
+    passes every check above — the emptying is a bare replaceChildren(), the
+    markup is inside a build… function, nothing assigns innerHTML — and it does
+    exactly what innerHTML does. Every node under `el` is thrown away and made
+    again, four seconds at a time, and the reader's selection goes with it. An
+    independent reviewer wrote that bypass against the rules as they stood and it
+    passed all of them; the run list itself was written that way.
+
+    So emptying a container and putting built nodes back into it are two things
+    one function may not both do. Emptying alone stays allowed — a log pane whose
+    file was rewritten under it has to start again — and adding alone stays
+    allowed, which is how a new round card reaches the board without moving the
+    cards already on it.
+    """
+    src, regs = regions(ui.page_html())
+    assert len(EMPTIED.findall(src)) == src.count("replaceChildren("), \
+        "a replaceChildren() whose target is not a plain name, so no rule can follow it"
+    for name, s, e in regs:
+        body = src[s:e]
+        built = set(BUILT.findall(body))
+        for target in EMPTIED.findall(body):
+            for method in INSERTS:
+                for arg in re.findall(rf"\b{target}\.{method}\(\s*([^,)]*)", body):
+                    arg = arg.strip()
+                    assert not (arg.startswith("build") or arg in built), \
+                        f"{name} empties {target} and fills it back up with {arg}"
+
+
+def test_only_a_build_function_empties_an_element_it_looked_up():
+    """The same bug read off what a function does rather than off its name.
+
+    An element found with document.getElementById is one the reader is already
+    looking at. Emptying it is a first-render act — the board is cleared when
+    another run is chosen — so it belongs to a build… function, which the naming
+    contract says runs once per element. Any other function that empties one is
+    redrawing the page, whatever it does next.
+
+    Two ways out of this, both of them things someone writes by accident rather
+    than to get past a test. `replaceChildren()` is the only emptying it knows:
+    `el.textContent = ''` empties exactly as thoroughly and matches nothing here.
+    And a function renamed to start with `build` is exempt by this rule alone —
+    what catches that one is the rule above, which reads no names, and the pinned
+    interval count. No single rule in this section covers the shape; three
+    partial ones do, and each says which part is its own.
+
+    A pane reached from a node the function already holds is not this: that is
+    patchOpenPanes emptying its own body on a truncation signal, which is AC-11.
+    """
+    src, regs = regions(ui.page_html())
+    for name, s, e in regs:
+        if name.startswith("build"):
+            continue
+        body = src[s:e]
+        fetched = set(FETCHED.findall(body))
+        for target in EMPTIED.findall(body):
+            assert target not in fetched, \
+                f"{name} empties {target}, which it fetched out of the document"
+
+
+def test_a_closure_neither_builds_markup_nor_empties_an_element():
+    """regions() charges an arrow function to whichever declaration sits above it,
+    so a closure under a build… name inherits permission it was never given. The
+    two operations the rules govern are banned from closures outright: a click
+    handler that has to clear the board calls a build… function that does it."""
+    src = script_of(ui.page_html())
+    for body in closures(src):
+        for banned in ("innerHTML", "replaceChildren"):
+            assert banned not in body, f"a closure uses {banned}: {body[:60]}"
+    # An arrow with no braces has no body to walk, so it is read off the line.
+    for line in src.splitlines():
+        if "=>" in line:
+            assert "innerHTML" not in line and "replaceChildren" not in line, \
+                f"an arrow function redraws part of the page: {line.strip()}"
+
+
+def test_a_poll_never_calls_a_build_function_for_its_side_effect():
+    """The way round the rules above that the page hands out itself.
+
+    buildBoard() is allowed to empty the board because it is a build… function
+    and choosing a run is a first-render act. `poll() { buildBoard(); ... }` is
+    then a redraw with one extra step, and every check above says yes: the
+    emptying is bare, it is inside a build… name, and the poll function assigns
+    nothing at all. A reviewer served the version with one plainly-named helper
+    in between to a browser — the board came back empty every 2 seconds, with the
+    suite green — which is why this reads one hop out and not only the callers.
+
+    A build… function is called for what it returns. On the poll path the value
+    has to be used — put in a variable or passed to an insert — so a call written
+    for what it does to the document instead stands out on the line.
+
+    Two hops out it is invisible again, and Task 16's checklist carries that.
+    """
+    src, regs = regions(ui.page_html())
+    reached = poll_path(src, regs)
+    for name, s, e in regs:
+        if name not in reached:
+            continue
+        for line in src[s:e].splitlines():
+            for m in re.finditer(r"\bbuild\w*\(", line):
+                before = line[:m.start()].rstrip()
+                assert before.endswith(("=", "(", ",", "return")), \
+                    f"{name} calls {m.group()} for what it does, not for what it hands back"
+
+
+def test_a_poll_writes_text_only_where_the_text_changed():
+    """Assigning textContent builds a NEW text node even when the string has not
+    changed, and the reader's selection lives in the old one. So a run list that
+    finds its rows and writes every field back is still a run list that loses a
+    selection every 4 seconds, and no rule about innerHTML would say a word.
+
+    Every text a poll writes goes through one guarded setter instead. A build…
+    function writes straight to a node it has just made, where there is nothing
+    to lose.
+
+    One hop out as well, because that is where a reviewer put it: patchRunRow
+    calling `writeText(el, t)`, and `function writeText(el, t) { el.textContent =
+    t; }` sitting quietly beside it. In a browser the selection went inside three
+    polls and the text node came away detached, while every rule keyed on
+    patchRunRow's own body stayed green.
+    """
+    src, regs = regions(ui.page_html())
+    assert re.search(r"textContent\s*!==", src), "nothing compares the text before writing it"
+    reached = poll_path(src, regs)
+    for name, s, e in regs:
+        if name in reached:
+            assert ".textContent =" not in src[s:e], \
+                f"{name} runs on every poll and writes text without checking it changed"
+
+
 def test_the_intervals_are_unchanged():
-    """The saving comes from sending less per poll, not from polling less often."""
+    """The saving comes from sending less per poll, not from polling less often.
+
+    And these are the only two. Every rule above is keyed on the name of the
+    function an interval calls, so a third interval calling anything else is a
+    poll path that none of them is looking at: a reviewer wrote four separate
+    redraws that way — rows swapped for freshly built ones, the rail emptied with
+    textContent and refilled, innerHTML reached as el['inner' + 'HTML'], a build…
+    function redrawing the whole rail — and every one of them left the suite green.
+    Counting the intervals closes all four at once, and it is the cheapest line in
+    this file.
+    """
     html = ui.page_html()
     assert "setInterval(runs, 4000)" in html
     assert "setInterval(poll, 2000)" in html
+    assert html.count("setInterval(") == 2, \
+        "a third interval is a poll path no rule above is watching"
 
 
 def test_the_page_polls_log_slices():
@@ -723,6 +983,64 @@ def test_a_pane_follows_the_bottom_only_from_the_bottom():
         "no 4-pixel test of whether the reader was at the bottom"
     line = next(ln for ln in src.splitlines() if "scrollTop =" in ln)
     assert line.strip().startswith("if ("), "the pane scrolls to the bottom unconditionally"
+
+
+# ---------- the run list ----------
+
+
+def test_the_page_reads_run_times():
+    """AC-3 on the page. The left rail used to show five rows all reading
+    example-hello with nothing to tell them apart: no time, no duration, no id.
+
+    Both times null is a run known only from its log files, and it shows no time
+    at all rather than a wrong one.
+    """
+    src = script_of(ui.page_html())
+    assert "start_time" in src, "the page never reads when a run started"
+    assert "close_time" in src, "the page never reads when a run closed"
+    assert "toLocaleString()" in src, "the start time is not shown in the reader's own zone"
+    dur = function_source(ui.page_html(), "duration")
+    assert "3600" in dur, "no hour boundary, so a two-hour run reads as 127 minutes"
+    assert "padStart(2" in dur, "the minutes and seconds are not padded"
+    row = function_source(ui.page_html(), "patchRunRow")
+    assert "start_time" in row and "close_time" in row, "the row shows no time"
+    assert "duration(" in row, "a row shows when its run started and not how long it took"
+    assert row.count("setText(") >= 5, "a field of the row is written some other way"
+
+
+def test_a_row_is_keyed_on_the_workflow_id_and_shows_the_directory():
+    """The other half of AC-3, and the reason the two keys may not be swapped.
+
+    Two workflows of one run directory are two rows: same text, same log files,
+    different ids. Keyed on the directory they collapse into one row, and whichever
+    of the two came second could never be selected at all.
+    """
+    build = function_source(ui.page_html(), "buildRunRow")
+    assert re.search(r"\.dataset\.id\s*=\s*\w+\.id\b", build), \
+        "the row is stamped with something other than the workflow id"
+    assert re.search(r"sel\s*=\s*\{", build), "a click selects something other than {id, dir}"
+    patch = function_source(ui.page_html(), "patchRuns")
+    assert "dataset.id" in patch, "patchRuns finds its rows by something other than the id"
+    assert "/api/logs?dir=" in function_source(ui.page_html(), "poll"), \
+        "the log endpoint takes a run directory, never a workflow id"
+
+
+def test_the_run_list_is_patched_and_never_rebuilt():
+    """AC-14 where the reviewer found it broken: the rail was emptied and every row
+    made again every 4 seconds, so a selection in one lasted 13 seconds at most.
+
+    A row that is already there is found and updated. A row for a run the reply no
+    longer carries is removed. A new one is inserted where the server put it,
+    which moves nothing that is already on screen.
+    """
+    src = function_source(ui.page_html(), "patchRuns")
+    assert "replaceChildren" not in src, "the run list still empties itself"
+    assert "insertBefore" in src, "a new row cannot be put in place without moving the others"
+    assert ".remove()" in src, "a run that has gone from the reply stays on screen for ever"
+    assert "innerHTML" not in src
+    runs_fn = function_source(ui.page_html(), "runs")
+    assert "patchRuns(" in runs_fn, "the poll does not go through the patch"
+    assert "buildRunRow" not in runs_fn, "the poll builds rows itself"
 
 
 # ---------- the host repository behind a run's worktree ----------

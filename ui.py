@@ -52,6 +52,9 @@ PAGE = """<!doctype html>
   .run.sel { background:#1a2231; border-left-color:var(--accent); }
   .run .dir { font:600 12px/1.3 ui-monospace,Menlo,monospace; word-break:break-all; }
   .run .meta { margin-top:5px; display:flex; gap:8px; align-items:center; font-size:11px; color:var(--dim); }
+  /* Tabular figures so a duration counting up does not shuffle the line sideways
+     under a reader trying to select it. */
+  .run .when { margin-top:4px; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; }
   .pill { padding:1px 9px; border-radius:20px; font-size:10.5px; font-weight:700; letter-spacing:.3px; text-transform:uppercase; }
   .green { background:rgba(63,185,80,.15); color:#3fb950; }
   .red { background:rgba(248,81,73,.15); color:#f85149; }
@@ -92,8 +95,24 @@ PAGE = """<!doctype html>
 //           the element — including the one holding the reader's selection, and
 //           the open pane they were reading — and build them all again.
 //
-// tests/test_ui.py holds the rule. It cannot see a browser, so it checks the
+// Two more shapes are innerHTML wearing a hat, and neither of them mentions it:
+//
+//   emptying a container and filling it back up from build… calls, which is what
+//   the run list used to do to itself every 4 seconds; and
+//   writing textContent that has not changed, which makes a new text node just
+//   the same and takes the reader's selection down with the old one.
+//
+// So a container is emptied only by the function that made it or by a build…
+// function, never by one on the poll path, and every word a poll writes goes
+// through setText.
+//
+// tests/test_ui.py holds the rules. It cannot see a browser, so it checks the
 // shape: what the reader actually keeps is checked by hand.
+//
+// The run the reader has chosen: {id, dir}, or null until the first list lands.
+// Both keys, because they are not interchangeable — /api/run and /api/diff take
+// the workflow id, /api/logs and /api/log take the run directory, and two
+// workflows of one directory share the second and not the first.
 let sel = null;
 // Injected from activities/stream.py, so the page cannot drift from the writers.
 const LOG_RE = new RegExp(__LOG_RE__);
@@ -102,6 +121,10 @@ const ROLES = [['executor', 'executor'], ['audit', 'supervisor']];
 const pill = s => ({green:'green',running:'yellow',stopped:'red',failed:'red','merge-ready':'green',
   merged:'green',held:'gray',discarded:'gray',unknown:'gray'}[s]||'gray');
 const esc = t => t.replaceAll('&','&amp;').replaceAll('<','&lt;');
+// Assigning textContent builds a NEW text node even when the string is the one
+// already there, and the reader's selection lives in the old one. Every text a
+// poll writes goes through here, so a row nothing has happened to is not touched.
+const setText = (el, t) => { if (el.textContent !== t) el.textContent = t; };
 function colorize(t) {
   return esc(t).split('\\n').map(l => {
     if (/^\\[[0-9:]+ tool/.test(l)) return `<span class="tool">${l}</span>`;
@@ -109,15 +132,85 @@ function colorize(t) {
     return l.replace(/^(\\[[0-9:]+) /, '<span class="t">$1</span> ');
   }).join('\\n');
 }
-function buildRunRow(r) {
+// Hh MMm from an hour up, Mm SSs below it. Rounded rather than floored, so a
+// duration does not read a second short for the whole second it is on screen.
+function duration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const two = n => String(n).padStart(2, '0');
+  return s >= 3600 ? `${Math.floor(s / 3600)}h ${two(Math.floor(s / 60) % 60)}m`
+                   : `${Math.floor(s / 60)}m ${two(s % 60)}s`;
+}
+function buildRunRow(entry) {
   const div = document.createElement('div');
-  div.className = 'run' + (sel === r.dir ? ' sel' : '');
-  div.innerHTML = `<div class="dir">${esc(r.dir)}</div><div class="meta">
-    <span class="pill ${pill(r.state)}">${esc(r.state)}</span><span>${esc(r.detail||'')}</span></div>`;
-  // The board is emptied here rather than in poll(), so a card from the run just
-  // left can never sit under the run just chosen, not even for one interval.
-  div.onclick = () => { sel = r.dir; document.getElementById('board').replaceChildren(); runs(); poll(); };
+  div.className = 'run';
+  // The row is keyed on the workflow id and shows the directory. Two workflows of
+  // one run directory are two rows reading the same word, and the id is the only
+  // thing that tells them apart — so it is an attribute, not text.
+  div.dataset.id = entry.id;
+  // Empty on purpose. Every word in the row is written by patchRunRow, so there
+  // is one code path for the text instead of two that have to agree, and nothing
+  // a run directory is called can reach the page as markup.
+  div.innerHTML = '<div class="dir"></div><div class="meta"><span class="pill"></span><span></span>'
+                + '</div><div class="when"><span></span><span></span></div>';
+  // The closure keeps the reply this row was first built from, and that is safe
+  // because neither field it reads ever moves: the id is what the row is found by
+  // from here on, and the server works the directory out from the id.
+  div.onclick = () => { sel = {id: entry.id, dir: entry.dir}; patchSelected(); buildBoard(); poll(); };
   return div;
+}
+function patchRunRow(row, entry) {
+  const [dir, meta, when] = row.children;
+  const [state, detail] = meta.children;
+  setText(dir, entry.dir);
+  state.className = 'pill ' + pill(entry.state);
+  setText(state, entry.state);
+  setText(detail, entry.detail || '');
+  // Both times null is a run known only from its log files: it shows no time at
+  // all rather than a wrong one. The two live in separate elements because only
+  // one of them moves — the duration of a running run counts up on every poll,
+  // and a reader with the row's directory selected must not lose it to that.
+  const start = entry.start_time ? new Date(entry.start_time) : null;
+  const end = entry.close_time ? new Date(entry.close_time) : new Date();
+  setText(when.firstElementChild, start ? start.toLocaleString() : '');
+  setText(when.lastElementChild, start ? ' · ' + duration(end - start) : '');
+}
+// The highlight moves here rather than by refetching /api/runs, which is what it
+// used to cost: the reader has clicked, and the row they chose lights up now
+// instead of up to 4 seconds later.
+function patchSelected() {
+  for (const row of document.getElementById('runs').children)
+    row.classList.toggle('sel', !!sel && row.dataset.id === sel.id);
+}
+function patchRuns(entries) {
+  const list = document.getElementById('runs');
+  // Found in a Map rather than with a selector: an id is a workflow id or a run
+  // directory name, and a directory name is whatever the owner typed, which is
+  // not ours to paste into CSS.
+  const rows = new Map([...list.children].map(row => [row.dataset.id, row]));
+  let after = null;  // the last row that was already there, in the server's order
+  for (const entry of entries) {
+    let row = rows.get(entry.id);
+    if (row) {
+      rows.delete(entry.id);
+    } else {
+      row = buildRunRow(entry);
+      // Put where the server has it, in front of nothing already on screen. The
+      // rows that exist keep their places, so a reader with text selected in one
+      // does not have it slide out from under them when a run starts.
+      list.insertBefore(row, after ? after.nextSibling : list.firstChild);
+    }
+    patchRunRow(row, entry);
+    after = row;
+  }
+  // Whatever is left in the map is a run the reply no longer carries.
+  for (const row of rows.values()) row.remove();
+  patchSelected();
+}
+// The board is emptied here rather than in poll(), so a card from the run just
+// left can never sit under the run just chosen, not even for one interval.
+function buildBoard() {
+  const board = document.getElementById('board');
+  board.replaceChildren();
 }
 function buildRoundCard(key) {
   const card = document.createElement('div');
@@ -158,10 +251,10 @@ function patchRounds(dir, names) {
   const keys = Object.keys(rounds).sort().reverse();
   const empty = board.querySelector('.empty');
   if (!keys.length) {
-    if (empty) { empty.textContent = 'no logs yet for this run'; return; }
+    if (empty) { setText(empty, 'no logs yet for this run'); return; }
     const line = document.createElement('div');
     line.className = 'empty';
-    line.textContent = 'no logs yet for this run';
+    setText(line, 'no logs yet for this run');
     board.append(line);
     return;
   }
@@ -236,16 +329,14 @@ async function patchOpenPanes() {
   } finally { panePoll = false; }
 }
 async function runs() {
+  const hdr = document.getElementById('hdr');
   try {
     const d = await (await fetch('/api/runs')).json();
-    const el = document.getElementById('runs');
-    // The run list is still rebuilt row by row. The log panes below it are not,
-    // and they are where the reader's selection and scroll position live.
-    el.replaceChildren();
-    for (const r of d.runs) el.append(buildRunRow(r));
-    if (!sel && d.runs.length) { sel = d.runs[0].dir; poll(); }
-    document.getElementById('hdr').textContent = d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only';
-  } catch(e) { document.getElementById('hdr').textContent = 'server error'; }
+    const rows = d.runs || [];
+    patchRuns(rows);
+    if (!sel && rows.length) { sel = {id: rows[0].id, dir: rows[0].dir}; patchSelected(); poll(); }
+    setText(hdr, d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only');
+  } catch(e) { setText(hdr, 'server error'); }
 }
 async function poll() {
   // The run this poll is about, held before the await rather than read after it.
@@ -256,11 +347,15 @@ async function poll() {
   // the reader reselects or reloads, and opening one asks /api/log for a file
   // that is not in this run's directory — a 404 every 2 seconds, for good,
   // behind a pane that can never fill.
-  const dir = sel;
-  if (!dir) return;
+  //
+  // `sel` is replaced on every click and never edited in place, so comparing the
+  // held object with it by identity asks exactly the question: is this still the
+  // selection this poll was started for.
+  const run = sel;
+  if (!run) return;
   try {
-    const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(dir))).json();
-    if (dir === sel) patchRounds(dir, d.logs || []);
+    const d = await (await fetch('/api/logs?dir=' + encodeURIComponent(run.dir))).json();
+    if (run === sel) patchRounds(run.dir, d.logs || []);
   } catch(e) { /* the board keeps what it has until the next poll */ }
   patchOpenPanes();
 }
