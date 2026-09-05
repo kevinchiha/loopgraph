@@ -1,0 +1,44 @@
+# Working on loopgraph itself
+
+For driving the engine from another project, use the skill in `skills/loopgraph/`.
+This file is for agents changing the engine's own code.
+
+## Layout
+
+- `workflows/run.py` — Temporal workflows. The orchestration between rounds.
+- `activities/` — everything with a side effect: executor, gates, audit,
+  checkpoint, learning, notifications.
+- `graphs/round_graph.py` — the LangGraph loop inside one round.
+- `lg` — the host CLI. No `.py` extension, so tests load it by path.
+- `ui.py` — read-only dashboard on port 8400.
+- `runs/` — run directories. Gitignored except the shipped examples.
+
+## Rules that bite if you ignore them
+
+**Workflow code must be deterministic.** No environment reads, no clocks, no
+randomness, no I/O in `workflows/run.py`. Temporal replays it from history, and a
+non-deterministic workflow breaks on replay, not when you write it. Anything that
+touches the outside world goes in an activity. `telegram_configured` exists for
+exactly this reason.
+
+**Paths in a run's `gates.yaml` are container paths.** `/app/runs/<slug>` for the
+run directory, `/projects/<name>` for a target repo. Host paths silently fail.
+
+**Never hardcode a home directory.** `tests/test_release.py` fails the build if you
+do. Everything machine-specific comes from `.env`, which `install.sh` writes.
+
+**Nothing under `runs/` gets committed** except the named examples in
+`.gitignore`. Real runs hold the user's work, sometimes a client's.
+
+## Checks
+
+```bash
+.venv/bin/python -m pytest -q      # all of it, ~4s
+```
+
+`tests/test_release.py` guards publishing: no credentials or personal paths in
+tracked files, and no real runs tracked. If it goes red, do not work around it.
+
+The engine cannot test itself end to end in CI. The real check is running
+`lg start runs/example-hello /projects/loopgraph-example` and driving it to a
+decision.

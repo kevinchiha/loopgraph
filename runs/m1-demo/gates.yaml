@@ -1,0 +1,4 @@
+- name: always-green
+  cmd: "true"
+- name: repo-readable
+  cmd: "test -f /app/SPEC.md"

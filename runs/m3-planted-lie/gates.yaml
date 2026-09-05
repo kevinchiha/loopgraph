@@ -1,0 +1,3 @@
+- name: tests
+  cmd: "python -m pytest -x -q"
+  timeout: 300

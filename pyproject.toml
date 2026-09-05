@@ -1,0 +1,18 @@
+[project]
+name = "loopgraph-engine"
+version = "0.1.0"
+description = "Durable agent-orchestration: Temporal owns the graph, LangGraph owns the loop, gates are code."
+requires-python = ">=3.13"
+dependencies = [
+    "temporalio>=1.15",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "langgraph>=0.2",
+    "claude-agent-sdk>=0.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.uv]
+package = false

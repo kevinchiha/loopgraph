@@ -1,0 +1,4 @@
+- name: always-green
+  cmd: "true"
+- name: planted-failure
+  cmd: "false"

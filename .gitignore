@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+# install.sh backs up an existing .env before writing a new one, and that copy
+# holds the same credentials.
+.env.backup.*
+.pytest_cache/
+
+# Runs belong to you, not to this project. Everything under runs/ is ignored and
+# the shipped examples below are the only exceptions, so a run you create is
+# invisible to git without anyone having to remember a rule.
+runs/*
+!runs/m1-demo/
+!runs/m2-toy/
+!runs/m3-accept/
+!runs/m3-planted-lie/
+!runs/m4-cards/
+!runs/example-hello/
+
+# ...but never the scratch a run produces, even inside a shipped example.
+runs/*/worktrees/
+runs/*/logs/
+runs/*/target/

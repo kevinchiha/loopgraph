@@ -1,0 +1,374 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Loop-Graph Engine",
+    "output": "architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main-path",
+        "label": "Brief to checkpoint",
+        "focus": [
+          "owner",
+          "lg",
+          "temporal",
+          "run",
+          "execute",
+          "audit",
+          "checkpoint"
+        ],
+        "note": "The path a feature brief takes from the queue to a committed, twice-verified write set."
+      },
+      {
+        "id": "correction-loop",
+        "label": "The loop inside the node",
+        "focus": [
+          "run",
+          "execute",
+          "gate",
+          "claude"
+        ],
+        "note": "LangGraph runs produce, gate and correct inside one Temporal activity, capped at three attempts."
+      },
+      {
+        "id": "owner-loop",
+        "label": "The one human step",
+        "focus": [
+          "run",
+          "telegram",
+          "owner",
+          "checkpoint",
+          "repo"
+        ],
+        "note": "Cards go out on Telegram; the run holds unchanged until a letter comes back."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "temporal",
+      "type": "cloud",
+      "label": "Temporal Server",
+      "sublabel": "auto-setup 1.29.7 :7233",
+      "tag": "Postgres event history",
+      "pos": [
+        250,
+        210
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "claude",
+      "type": "external",
+      "label": "Claude Agent SDK",
+      "sublabel": "headless, CLIProxyAPI :8317",
+      "pos": [
+        670,
+        64
+      ],
+      "size": [
+        150,
+        68
+      ]
+    },
+    {
+      "id": "lg",
+      "type": "frontend",
+      "label": "lg CLI",
+      "sublabel": "start / status / tail",
+      "pos": [
+        40,
+        210
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "run",
+      "type": "backend",
+      "label": "LoopGraphRun",
+      "sublabel": "ledger + verdict branch",
+      "tag": "max 3 rounds",
+      "pos": [
+        460,
+        210
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "execute",
+      "type": "backend",
+      "label": "execute_round",
+      "sublabel": "produce - gate - correct",
+      "tag": "fresh git worktree",
+      "pos": [
+        670,
+        210
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "backend",
+      "label": "audit",
+      "sublabel": "supervisor, fresh context",
+      "tag": "accept / redo / plan / stop / ask",
+      "pos": [
+        880,
+        210
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "owner",
+      "type": "external",
+      "label": "Owner",
+      "sublabel": "brief in, one card out",
+      "pos": [
+        40,
+        370
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "gate",
+      "type": "security",
+      "label": "Gates",
+      "sublabel": "exit code only",
+      "tag": "no model",
+      "pos": [
+        670,
+        370
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "checkpoint",
+      "type": "backend",
+      "label": "checkpoint",
+      "sublabel": "re-gate, stage, commit",
+      "tag": "never pushes",
+      "pos": [
+        880,
+        370
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "repo",
+      "type": "external",
+      "label": "Target repo",
+      "sublabel": "one worktree per round",
+      "pos": [
+        1090,
+        370
+      ],
+      "size": [
+        150,
+        72
+      ],
+      "tag": "/projects mount"
+    },
+    {
+      "id": "telegram",
+      "type": "external",
+      "label": "Telegram bot",
+      "sublabel": "decision / merge-ready",
+      "pos": [
+        40,
+        520
+      ],
+      "size": [
+        150,
+        68
+      ]
+    },
+    {
+      "id": "learn",
+      "type": "backend",
+      "label": "learn",
+      "sublabel": "distils one constraint",
+      "tag": "constraints.md",
+      "pos": [
+        670,
+        520
+      ],
+      "size": [
+        150,
+        68
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "worker container - network_mode: host, task queue loopgraph",
+      "wraps": [
+        "run",
+        "execute",
+        "audit",
+        "gate",
+        "checkpoint",
+        "learn"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "brief",
+      "from": "owner",
+      "to": "lg",
+      "label": "brief.md + gates.yaml",
+      "variant": "emphasis"
+    },
+    {
+      "id": "start",
+      "from": "lg",
+      "to": "temporal",
+      "label": "lg start"
+    },
+    {
+      "id": "schedule",
+      "from": "temporal",
+      "to": "run",
+      "label": "task queue",
+      "variant": "emphasis",
+      "labelDy": 67,
+      "labelDx": 70
+    },
+    {
+      "id": "round",
+      "from": "run",
+      "to": "execute",
+      "label": "round N",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "id": "produce",
+      "from": "execute",
+      "to": "claude",
+      "label": "produce: Write / Edit / Bash",
+      "labelDy": -25
+    },
+    {
+      "id": "check",
+      "from": "execute",
+      "to": "gate",
+      "label": "run gates",
+      "labelDy": 24,
+      "labelDx": -38
+    },
+    {
+      "id": "correct",
+      "from": "gate",
+      "to": "execute",
+      "label": "red - next attempt",
+      "variant": "dashed",
+      "labelDx": -110
+    },
+    {
+      "id": "handoff",
+      "from": "execute",
+      "to": "audit",
+      "label": "claims + diff",
+      "variant": "emphasis",
+      "labelDy": 53,
+      "labelDx": -50
+    },
+    {
+      "id": "read-only",
+      "from": "audit",
+      "to": "claude",
+      "label": "Read / Glob / Grep only",
+      "variant": "security"
+    },
+    {
+      "id": "accept",
+      "from": "audit",
+      "to": "checkpoint",
+      "label": "verdict: accept",
+      "variant": "emphasis",
+      "labelDy": 24
+    },
+    {
+      "id": "commit",
+      "from": "checkpoint",
+      "to": "repo",
+      "label": "commit declared set",
+      "labelDy": 60
+    },
+    {
+      "id": "distil",
+      "from": "checkpoint",
+      "to": "learn",
+      "label": "accepted round"
+    },
+    {
+      "id": "card",
+      "from": "run",
+      "to": "telegram",
+      "label": "send card, poll reply"
+    },
+    {
+      "id": "reply",
+      "from": "telegram",
+      "to": "owner",
+      "label": "A / B / C",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Durable outside",
+      "items": [
+        "Temporal owns the timers, retries and signals between nodes",
+        "The ledger is workflow state, readable live through a query handler",
+        "A reboot mid-run resumes from the event history"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "The loop inside the node",
+      "items": [
+        "LangGraph runs produce, gate and correct inside one activity",
+        "Three attempts, then the round escalates instead of trying again",
+        "Each accepted round appends one line to constraints.md, carried by every later prompt"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "What keeps it honest",
+      "items": [
+        "Gates are commands judged on exit code, never a model",
+        "The supervisor never sees the executor transcript - only claims, write set, diff and gate results, with read-only tools",
+        "checkpoint re-runs the gates, stages only declared paths, and never pushes"
+      ]
+    }
+  ]
+}

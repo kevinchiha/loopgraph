@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""lg — thin CLI for loopgraph-engine.
+
+M1: `lg gate <gates.yaml> [workdir]` runs gates through the GateCheckRun
+workflow; `lg status <workflow-id>` queries gate red/green.
+`lg new` / `lg start <brief>` land with M3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import uuid
+
+from temporalio.client import Client
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+TASK_QUEUE = "loopgraph"
+
+
+def _dotenv() -> dict[str, str]:
+    """The repo's .env, which install.sh writes. Absent before the first install."""
+    out: dict[str, str] = {}
+    path = os.path.join(ROOT, ".env")
+    if not os.path.exists(path):
+        return out
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+
+
+async def _client() -> Client:
+    return await Client.connect(ADDRESS)
+
+
+async def cmd_gate(args: argparse.Namespace) -> int:
+    client = await _client()
+    wf_id = f"gate-{uuid.uuid4().hex[:8]}"
+    handle = await client.start_workflow(
+        "GateCheckRun",
+        args=[args.gates, args.workdir],
+        id=wf_id,
+        task_queue=TASK_QUEUE,
+    )
+    print(f"workflow {wf_id} started")
+    try:
+        result = await handle.result()
+    except Exception:
+        status = await handle.query("status")
+        print(json.dumps(status, indent=2))
+        print(f"BLOCKED: red gates -> {', '.join(status['red'])}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+async def cmd_status(args: argparse.Namespace) -> int:
+    client = await _client()
+    handle = client.get_workflow_handle(args.workflow_id)
+    queries = [args.query] if args.query else ["status", "ledger"]
+    for q in queries:
+        try:
+            print(json.dumps(await handle.query(q), indent=2))
+            return 0
+        except Exception:
+            if q == queries[-1]:
+                raise
+    return 1
+
+
+async def cmd_round(args: argparse.Namespace) -> int:
+    client = await _client()
+    wf_id = f"round-{uuid.uuid4().hex[:8]}"
+    handle = await client.start_workflow(
+        "RoundRun",
+        args=[args.run_dir, args.target_repo, args.work_item, args.round_no],
+        id=wf_id,
+        task_queue=TASK_QUEUE,
+    )
+    print(f"workflow {wf_id} started", flush=True)
+    result = await handle.result()
+    print(json.dumps(result, indent=2))
+    return 0 if result["status"] == "green" else 1
+
+
+def _container(path: str) -> str:
+    """lg runs on the host; workflows speak container paths."""
+    return "/app/" + path if path.startswith("runs/") else path
+
+
+async def cmd_start(args: argparse.Namespace) -> int:
+    client = await _client()
+    run_dir = _container(args.run_dir)
+    target = _container(args.target_repo) if args.target_repo else run_dir + "/target"
+    wf_id = f"run-{run_dir.rsplit('/', 1)[-1]}-{uuid.uuid4().hex[:6]}"
+    handle = await client.start_workflow(
+        "LoopGraphRun",
+        args=[run_dir, target, args.work_item or ""],
+        id=wf_id,
+        task_queue=TASK_QUEUE,
+    )
+    print(f"workflow {wf_id} started", flush=True)
+    ledger = await handle.result()
+    print(json.dumps(ledger, indent=2))
+    return 0 if ledger["status"] == "merge-ready" else 1
+
+
+async def cmd_prompt(args: argparse.Namespace) -> int:
+    """Dry-run: print the exact executor prompt a run would get (no Claude call)."""
+    from activities.execute_round import assemble_prompt
+    from pathlib import Path
+    run = Path(args.run_dir)
+    brief = (run / "brief.md").read_text()
+    constraints = (run / "constraints.md").read_text() if (run / "constraints.md").exists() else ""
+    print(assemble_prompt(brief, constraints, args.work_item or brief))
+    return 0
+
+
+async def cmd_tail(args: argparse.Namespace) -> int:
+    """Follow the live stream logs of a run (executor + supervisor, as they work)."""
+    import os
+    from pathlib import Path
+    logs = sorted(Path(args.run_dir, "logs").glob("r*-*.log"))
+    if not logs:
+        print(f"no logs yet under {args.run_dir}/logs", file=sys.stderr)
+        return 1
+    os.execvp("tail", ["tail", "-n", "+1", "-F", *[str(l) for l in logs]])
+    return 0  # unreachable
+
+
+async def cmd_approve(args: argparse.Namespace) -> int:
+    """Answer a waiting run without Telegram. Same effect as tapping the card."""
+    client = await _client()
+    await client.get_workflow_handle(args.workflow_id).signal("decide", args.value)
+    print(f"sent {args.value!r} to {args.workflow_id}")
+    return 0
+
+
+async def cmd_where(args: argparse.Namespace) -> int:
+    """Where everything is on THIS machine. The skill reads this instead of guessing."""
+    env = _dotenv()
+    projects = env.get("LOOPGRAPH_PROJECTS_DIR", "(unset - run ./install.sh)")
+    telegram = env.get("LOOPGRAPH_TELEGRAM_ENV", "")
+    bot = env.get("LOOPGRAPH_TELEGRAM_BOT", "")
+    on = bool(telegram and os.path.exists(os.path.expanduser(telegram)))
+    info = {
+        "engine_root": ROOT,
+        "projects_dir": projects,
+        "projects_in_container": "/projects",
+        "run_dir_in_container": "/app/runs/<slug>",
+        "docker": env.get("LOOPGRAPH_DOCKER", "docker"),
+        "temporal_address": ADDRESS,
+        "temporal_ui": "http://localhost:8233/namespaces/default/workflows",
+        "dashboard": "http://localhost:8400",
+        "telegram": {"configured": on, "bot": bot or None, "env_file": telegram or None},
+        "answer_a_run": ("tap the card in Telegram, or: lg approve <workflow-id> A"
+                         if on else "lg approve <workflow-id> A"),
+    }
+    print(json.dumps(info, indent=2))
+    return 0
+
+
+async def cmd_ui(args: argparse.Namespace) -> int:
+    import ui
+    ui.serve(args.port)
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="lg")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gate", help="run a gates.yaml through the gate workflow")
+    g.add_argument("gates")
+    g.add_argument("workdir", nargs="?", default="/app")
+    g.set_defaults(fn=cmd_gate)
+    s = sub.add_parser("status", help="query a workflow (tries status, then ledger)")
+    s.add_argument("workflow_id")
+    s.add_argument("query", nargs="?", default=None)
+    s.set_defaults(fn=cmd_status)
+    r = sub.add_parser("round", help="run one executor round on a work item")
+    r.add_argument("run_dir", help="run dir with brief.md/constraints.md/gates.yaml (container path)")
+    r.add_argument("target_repo", help="git repo the round works on (container path)")
+    r.add_argument("work_item")
+    r.add_argument("--round-no", type=int, default=1)
+    r.set_defaults(fn=cmd_round)
+    st = sub.add_parser("start", help="start a full LoopGraphRun on a run dir")
+    st.add_argument("run_dir", help="e.g. runs/2026-09-05-feature (brief.md inside)")
+    st.add_argument("target_repo", nargs="?", help="git repo to work on (default: <run_dir>/target)")
+    st.add_argument("work_item", nargs="?", default="", help="defaults to the whole brief")
+    st.set_defaults(fn=cmd_start)
+    pr = sub.add_parser("prompt", help="dry-run the executor prompt for a run dir")
+    pr.add_argument("run_dir")
+    pr.add_argument("work_item", nargs="?", default="")
+    pr.set_defaults(fn=cmd_prompt)
+    t = sub.add_parser("tail", help="follow a run's live executor/supervisor streams")
+    t.add_argument("run_dir")
+    t.set_defaults(fn=cmd_tail)
+    ap = sub.add_parser("approve", help="answer a waiting run without Telegram")
+    ap.add_argument("workflow_id")
+    ap.add_argument("value", help="a letter (A/B/C) for merge cards, free text for questions")
+    ap.set_defaults(fn=cmd_approve)
+    w = sub.add_parser("where", help="paths, ports and Telegram status on this machine")
+    w.set_defaults(fn=cmd_where)
+    u = sub.add_parser("ui", help="web dashboard → http://localhost:8400")
+    u.add_argument("--port", type=int, default=8400)
+    u.set_defaults(fn=cmd_ui)
+    args = p.parse_args()
+    return asyncio.run(args.fn(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

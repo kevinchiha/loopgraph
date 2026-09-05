@@ -1,0 +1,9 @@
+# Gates are code. Every one must exit 0 or the round is red and the executor gets
+# another go. Paths here resolve INSIDE the worker container: this run dir is
+# /app/runs/example-hello and target repos are under /projects.
+- name: tests
+  cmd: "python -m pytest -x -q"
+  timeout: 300
+- name: scope
+  cmd: "/app/runs/example-hello/check-write-set.sh"
+  timeout: 60
