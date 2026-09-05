@@ -20,7 +20,7 @@ with workflow.unsafe.imports_passed_through():
     from activities.gate import run_gates
     from activities.items import load_work_items
     from activities.learn import learn
-    from activities.notify import send_card, telegram_configured
+    from activities.notify import location_line, send_card, telegram_configured
     from activities.owner import record_owner_answer
 
 
@@ -171,7 +171,7 @@ class LoopGraphRun:
             elif outcome["status"] == "halt":
                 entry.update(status="parked", reason=outcome["reason"])
                 self._ledger.update(status="stopped", reason=outcome["reason"])
-                await self._stopped_note(run_dir, outcome["reason"])
+                await self._stopped_note(run_dir, outcome["reason"], i, len(items))
                 return self._ledger
             else:
                 entry.update(status="parked", reason=outcome["reason"])
@@ -188,7 +188,10 @@ class LoopGraphRun:
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
         if accepted is None:
             self._ledger.update(status="stopped", reason="every work item was parked")
-            await self._stopped_note(run_dir, "every work item was parked")
+            # Nothing was accepted, so there is no item the run stopped "on": it
+            # ran out at the last one, and that is where the note speaks from.
+            await self._stopped_note(run_dir, "every work item was parked",
+                                     len(items), len(items))
             return self._ledger
         self._ledger.update(status="merge-ready")
         await self._owner_card(run_dir, accepted, checkpoint_result, parked)
@@ -301,7 +304,8 @@ class LoopGraphRun:
                 d = verdict["directive"]
                 question = d.get("action", "Supervisor needs an owner decision")
                 options = verdict.get("options") or {}
-                reply = await self._ask_owner(run_dir, question, options)
+                reply = await self._ask_owner(run_dir, question, options, item_no,
+                                              len(self._ledger["items"]), round_no)
                 entry["owner_question"] = question
                 entry["owner_reply"] = reply
                 # Write it where the AUDITOR can read it. The supervisor never sees
@@ -424,29 +428,44 @@ class LoopGraphRun:
         value = self._decisions.pop(i).strip()
         return value.upper() if allowed else value
 
-    async def _ask_owner(self, run_dir: str, question: str, options: dict) -> str:
-        """Supervisor `ask`: a question the owner answers by button, text or signal."""
-        return await self._await_decision(run_dir, "decision", question, None,
+    async def _ask_owner(self, run_dir: str, question: str, options: dict,
+                         item_no: int, total: int, round_no: int) -> str:
+        """Supervisor `ask`: a question the owner answers by button, text or signal.
+
+        The location line is prefixed here, not inside _await_decision, so the
+        string the ledger records and the string the card carries stay one object
+        and cannot drift. `question` itself is left alone: the round entry and
+        `owner-answers.md` keep the supervisor's words with no card furniture.
+
+        The line costs a question over ~1480 characters its tail, because
+        build_card_text cuts the summary at 1500. That cut stays where it is: the
+        card is the alert, and the whole question goes to the ledger, which is
+        what the page and `lg status` read.
+        """
+        summary = location_line(item_no, total, round_no) + "\n\n" + question
+        return await self._await_decision(run_dir, "decision", summary, None,
                                           options, accept_text=True)
 
     async def _park_note(self, run_dir: str, item_no: int, total: int,
                          item: str, reason: str) -> None:
         """Tell the owner an item was parked. Does not wait: the run has already
         moved on to the next item, and their reply is picked up between items."""
-        text = (f"item {item_no} of {total} parked\n\n{item[:600]}\n\n"
+        text = (f"{location_line(item_no, total)} parked\n\n{item[:600]}\n\n"
                 f"why: {reason}\n\nThe run is carrying on with the rest. Reply here "
                 f"with anything the next item should know, or wait for the "
                 f"merge-ready card at the end.")
         self._ledger.setdefault("parked_notes", []).append({"item_no": item_no, "reason": reason})
         await self._note(run_dir, "parked", text)
 
-    async def _stopped_note(self, run_dir: str, reason: str) -> None:
+    async def _stopped_note(self, run_dir: str, reason: str,
+                            item_no: int, total: int) -> None:
         """Tell the owner a run ended. A stop used to return silently, so nobody
         was told the run was over, and any items already committed sat on a branch
         nobody knew about."""
         done = [e for e in self._ledger["items"] if e["status"] == "done"]
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
-        lines = [f"why: {reason}", "",
+        lines = [location_line(item_no, total), "",
+                 f"why: {reason}", "",
                  f"{len(done)} item(s) committed, {len(parked)} parked."]
         if done:
             lines.append("")
@@ -482,8 +501,12 @@ class LoopGraphRun:
     async def _owner_card(self, run_dir: str, result: dict, cp: dict,
                           parked: list[dict] | None = None) -> None:
         """Merge-ready: hold at a safe no-change state until the owner decides."""
-        summary = build_merge_summary(result["summary"], len(self._ledger["items"]),
-                                      parked or [])
+        total = len(self._ledger["items"])
+        # The last item is where the run finished, so that is where this speaks
+        # from. Location line plus merge summary, parked list included, is exactly
+        # what the owner saw, and the page prints it back as it is.
+        summary = location_line(total, total) + "\n\n" + build_merge_summary(
+            result["summary"], total, parked or [])
         letter = await self._await_decision(
             run_dir, "merge-ready", summary, cp["commit"],
             {"A": "merge into " + (result["base_branch"] or "base") + " (local, no push)",
