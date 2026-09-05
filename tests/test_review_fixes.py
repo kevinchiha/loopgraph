@@ -606,3 +606,88 @@ def test_lg_reads_env_the_way_compose_does(tmp_path, monkeypatch, line, key, val
     (tmp_path / ".env").write_text(line + "\n")
     monkeypatch.setattr(lg, "ROOT", str(tmp_path))
     assert lg._dotenv()[key] == value
+
+
+# ---------- regressions the verification pass caught in the fixes above ----------
+
+def test_a_gate_that_closes_its_own_stdout_still_times_out():
+    """The regression: waiting on the output pipe rather than the process meant a
+    gate doing `exec > build.log` hit EOF at once, then blocked in an unbounded
+    proc.wait() with no heartbeat. The declared timeout was not enforced, and
+    Temporal eventually killed and retried the activity, running the executor
+    a second time."""
+    import time
+    from activities.gate import _run_one
+    log = str(ROOT / ".pytest_cache" / "gate-stdout-test.log")
+    t0 = time.time()
+    r = asyncio.run(_run_one(
+        {"name": "g", "cmd": f"exec > {log} 2>&1; echo x; sleep 30",
+         "green_exit": 0, "timeout": 1}, "/tmp"))
+    assert time.time() - t0 < 15, "the timeout was not enforced"
+    assert r["status"] == "red" and r["exit_code"] is None
+    assert "timeout after 1s" in r["note"]
+
+
+def test_a_gate_whose_child_holds_the_pipe_still_finishes_and_keeps_its_output():
+    """A backgrounded child inherits stdout, so EOF never comes. The gate must
+    still complete on process exit, and must not lose what it printed."""
+    import time
+    from activities.gate import _run_one
+    t0 = time.time()
+    r = asyncio.run(_run_one(
+        {"name": "g", "cmd": "echo done; sleep 30 &", "green_exit": 0, "timeout": 20}, "/tmp"))
+    assert time.time() - t0 < 10, "it waited for an EOF that was never coming"
+    assert r["status"] == "green" and r["exit_code"] == 0
+    assert "done" in r["output_tail"], "output was thrown away with the cancelled drain"
+
+
+@pytest.mark.parametrize("reply", [
+    "NONE",
+    "NONE\n\nNothing in this change generalizes beyond this one file.",
+    "none.",
+])
+def test_none_never_becomes_a_binding_constraint(reply):
+    """The regression: the NONE check only looked at the line the scan ended on,
+    so "NONE" followed by an explanation stored the explanation as a rule, and
+    constraints.md is pasted into every later executor prompt."""
+    from activities.learn import clean_distilled
+    assert clean_distilled(reply) is None
+
+
+def test_a_preamble_is_skipped_but_a_trailing_aside_does_not_win():
+    """Taking the first line made a lead-in the constraint; taking the last made a
+    sign-off the constraint. It has to be the first line that is an answer."""
+    from activities.learn import clean_distilled
+    assert clean_distilled("Here is the constraint:\nAlways run pytest from the worktree root.") \
+        == "Always run pytest from the worktree root."
+    assert clean_distilled("Always run pytest from the worktree root.\n\nHope that helps!") \
+        == "Always run pytest from the worktree root."
+
+
+def test_a_new_file_with_a_non_ascii_name_does_not_kill_the_audit(worktree):
+    """The regression: `git ls-files --others` C-quotes non-ASCII paths just like
+    status does, and the quoted string was handed straight to `git add
+    --intent-to-add`, which raised and failed the whole workflow — no card, no
+    stopped note, and committed items left on a branch nobody was told about."""
+    from activities.audit import diff_including_new_files
+    (worktree / "données.csv").write_text("a,b\n1,2\n")
+    diff = asyncio.run(diff_including_new_files(str(worktree)))
+    assert "données.csv" in diff, "the auditor sees an escaped path it has to decode"
+    assert "a,b" in diff, "and it must see the contents it is judging"
+    # and the index is left as it was found
+    assert subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=worktree,
+                          capture_output=True, text=True).stdout.strip() == ""
+
+
+def test_the_auditor_loads_nothing_from_the_tree_it_is_judging():
+    """The hole the tool restrictions left open: cwd is the worktree the executor
+    just wrote to, so the CLI would read .claude/settings.json and CLAUDE.md from
+    it. The audited party could plant a hook that runs shell during its own audit,
+    and instructions telling the auditor to accept."""
+    import inspect
+
+    from activities import audit, learn
+    for mod in (audit, learn):
+        src = inspect.getsource(mod)
+        assert "setting_sources=[]" in src, \
+            f"{mod.__name__} would load settings from the tree under audit"

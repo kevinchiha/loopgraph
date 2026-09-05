@@ -60,17 +60,21 @@ def load_gates(gates_path: str) -> list[dict]:
     return entries
 
 
-async def _drain(stream, keep: int) -> bytearray:
-    """Read a gate's output keeping only the last `keep` bytes.
+async def _drain(stream, keep: int, buf: bytearray) -> None:
+    """Read a gate's output into `buf`, keeping only the last `keep` bytes.
 
     Buffering the whole thing grew the worker's heap without bound: a gate that
     prints continuously (a watch mode, a chatty build) would eventually take the
-    worker down, and only the tail is ever used anyway."""
-    buf = bytearray()
+    worker down, and only the tail is ever used anyway.
+
+    The buffer belongs to the caller so that cancelling this keeps what it has
+    already read. A process that exits while a forked child still holds the pipe
+    never reaches EOF, and returning the buffer only at EOF meant those gates
+    reported no output at all."""
     while True:
         chunk = await stream.read(65536)
         if not chunk:
-            return buf
+            return
         buf.extend(chunk)
         if len(buf) > keep * 2:
             del buf[:-keep]
@@ -89,15 +93,21 @@ async def _run_one(gate: dict, workdir: str, heartbeat=None) -> dict:
     )
     # Poll instead of a bare wait_for so long gates (next build, npm ci) keep
     # heartbeating — a silent 10-minute gate would be declared dead by Temporal.
-    # asyncio.wait returns the instant the task finishes, so fast gates stay fast.
-    task = asyncio.create_task(_drain(proc.stdout, OUTPUT_TAIL * 4))
+    #
+    # The timeout has to govern the PROCESS, not the pipe. Waiting on the drain
+    # instead meant a gate that redirects its own output (`exec > build.log`, a
+    # normal way to keep a noisy build quiet) hit EOF at once, and the code then
+    # blocked in an unbounded `proc.wait()` with no heartbeat: the declared
+    # timeout was silently not enforced and Temporal eventually killed and
+    # retried the activity, running the executor a second time.
+    out = bytearray()
+    drain = asyncio.create_task(_drain(proc.stdout, OUTPUT_TAIL * 4, out))
+    waiter = asyncio.create_task(proc.wait())
     step = min(20, gate["timeout"])
     elapsed = 0
-    timed_out = False
     while True:
-        done, _ = await asyncio.wait({task}, timeout=step)
+        done, _ = await asyncio.wait({waiter}, timeout=step)
         if done:
-            await proc.wait()
             exit_code, note = proc.returncode, ""
             break
         elapsed += step
@@ -105,19 +115,15 @@ async def _run_one(gate: dict, workdir: str, heartbeat=None) -> dict:
             heartbeat(f"gate {gate['name']} running ({elapsed}s)")
         if elapsed >= gate["timeout"]:
             _kill_group(proc)
-            timed_out = True
             exit_code, note = None, f"timeout after {gate['timeout']}s"
             break
-    if timed_out:
-        # Keep whatever it printed before it hung. Throwing the output away left
-        # the owner no diagnostics for the failure that most needs them.
-        try:
-            out = await asyncio.wait_for(task, timeout=10)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            task.cancel()
-            out = bytearray()
-    else:
-        out = task.result()
+    # Let the last of the output arrive, then stop waiting. A child that outlived
+    # the shell holds the pipe open and EOF never comes; the process is already
+    # finished, so whatever it wrote is in the buffer by now.
+    try:
+        await asyncio.wait_for(asyncio.shield(drain), timeout=2)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        drain.cancel()
     green = exit_code == gate["green_exit"]
     return {
         "name": gate["name"],

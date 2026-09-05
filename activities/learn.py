@@ -49,9 +49,15 @@ def clean_distilled(text: str) -> str | None:
     """
     lines = [" ".join(l.split()) for l in text.strip().splitlines()]
     lines = [l for l in lines if l and not l.startswith(("```", "#"))]
-    for line in reversed(lines):
-        if line.upper().rstrip(".") == "NONE":
-            return None
+    # NONE anywhere means no lesson. Checking only one end let a reply of
+    # "NONE\n\nNothing here generalizes" store the explanation as a binding rule
+    # that every later executor prompt then carried.
+    if any(l.upper().rstrip(".") == "NONE" for l in lines):
+        return None
+    # First substantial line that is not a lead-in. Taking the first blindly made
+    # a preamble the constraint; taking the last made a trailing aside the
+    # constraint. The answer is the first line that is actually an answer.
+    for line in lines:
         if len(line) >= 12 and not _PREAMBLE.match(line):
             return line[:LINE_CAP]
     return None
@@ -78,6 +84,7 @@ async def distil_constraint(brief: str, claims: list[str], reasons: list[str]) -
         # but removes nothing, and bypassPermissions approves everything anyway.
         # This step only distils a sentence; it needs no tools at all.
         tools=[], allowed_tools=[],
+        setting_sources=[],  # same reason as the auditor: cwd is the audited tree
         disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
                           "BashOutput", "KillShell", "Task", "WebFetch", "WebSearch"],
         max_turns=1,

@@ -135,6 +135,13 @@ async def run_supervisor(prompt: str, worktree: str, log_path: str) -> dict:
         allowed_tools=["Read", "Glob", "Grep"],
         disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
                           "BashOutput", "KillShell", "Task", "WebFetch", "WebSearch"],
+        # Load nothing from disk. cwd is the worktree the executor just wrote to,
+        # so without this the CLI reads .claude/settings.json and CLAUDE.md from
+        # the tree under audit: the audited party could plant a hook that runs
+        # shell during its own audit, and instructions telling the auditor to
+        # accept. The executor still loads its project's settings; it is the one
+        # being supervised, not the supervisor.
+        setting_sources=[],
     ), log_path)
     return parse_verdict(text)
 
@@ -149,13 +156,19 @@ async def diff_including_new_files(worktree: str) -> str:
     the diff; the reset afterwards leaves the index exactly as it was found, so the
     scope gate and the checkpoint see what they expect.
     """
+    # -z, for the same reason parse_porcelain needs it: without it git C-quotes any
+    # path that is not plain ASCII, and handing that quoted string back to
+    # `git add` fails with a pathspec error that took the whole run down.
     untracked = [f for f in (await _git(
-        "ls-files", "--others", "--exclude-standard", cwd=worktree)).split("\n") if f.strip()]
+        "ls-files", "--others", "--exclude-standard", "-z", cwd=worktree)).split("\0") if f]
+    # quotePath=false so a non-ASCII filename reaches the auditor as itself rather
+    # than as "donn\303\251es.csv", which it would have to decode to judge.
+    diff = ("-c", "core.quotePath=false", "diff", "HEAD")
     if not untracked:
-        return await _git("diff", "HEAD", cwd=worktree)
+        return await _git(*diff, cwd=worktree)
     await _git("add", "--intent-to-add", "--", *untracked, cwd=worktree)
     try:
-        return await _git("diff", "HEAD", cwd=worktree)
+        return await _git(*diff, cwd=worktree)
     finally:
         await _git("reset", "-q", "--", *untracked, cwd=worktree)
 
