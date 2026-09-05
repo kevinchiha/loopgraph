@@ -1,9 +1,10 @@
 # Installing loopgraph
 
-This is the supported install path. Open this repo in Claude Code, or any coding
-agent that reads files and runs commands, and say:
+This is the supported install path. Paste this into Claude Code, or any coding
+agent that reads files and runs commands. It works from an empty directory:
 
-> Install loopgraph. Follow INSTALL_WITH_AGENT.md.
+> Install loopgraph from https://github.com/kevinchiha/loopgraph.
+> Clone it, then follow INSTALL_WITH_AGENT.md in the repo.
 
 Everything below is written for the agent.
 
@@ -47,9 +48,16 @@ walk them through @BotFather: `/newbot`, pick a name, pick a username ending in
 `bot`, and then **press Start in the new bot's chat**, because a bot cannot send
 the first message. The script takes the token and finds the chat id itself.
 
-## 2. Run the script
+## 2. Clone if you need to, then run the script
+
+If you are not already inside a checkout, clone it somewhere sensible first. Ask
+where if the user has a preference; `~/projects/loopgraph` is a reasonable default,
+and note that the engine's own checkout does not have to live under the projects
+tree it mounts.
 
 ```bash
+git clone https://github.com/kevinchiha/loopgraph.git
+cd loopgraph
 ./install.sh
 ```
 

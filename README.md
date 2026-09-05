@@ -55,10 +55,12 @@ reach Claude, whether Docker needs `sudo` here, which uid the container has to
 write as. A coding agent can look all of that up and ask you about the rest, so
 that is the supported path.
 
-Open the repo in Claude Code (or any coding agent) and say:
+Paste this into Claude Code, or any coding agent that reads files and runs
+commands. It works from an empty directory; the agent clones the repo itself.
 
 ```
-Install loopgraph. Follow INSTALL_WITH_AGENT.md.
+Install loopgraph from https://github.com/kevinchiha/loopgraph.
+Clone it, then follow INSTALL_WITH_AGENT.md in the repo.
 ```
 
 It collects three answers from you, runs `./install.sh` with them, then proves the
@@ -69,10 +71,15 @@ will do before you let it.
 <details>
 <summary>No agent to hand?</summary>
 
-`./install.sh` asks the same questions in a terminal, and `./install.sh --yes`
-takes every default and skips Telegram, for scripted installs. It works. You are
-just on your own when your machine disagrees with its assumptions, which is what
-the agent is there for.
+```bash
+git clone https://github.com/kevinchiha/loopgraph.git && cd loopgraph
+./install.sh
+```
+
+It asks the same questions in a terminal, and `./install.sh --yes` takes every
+default and skips Telegram, for scripted installs. It works. You are just on your
+own when your machine disagrees with its assumptions, which is what the agent is
+there for.
 
 </details>
 
