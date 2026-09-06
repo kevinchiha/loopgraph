@@ -6,11 +6,12 @@ really has commits, tags and an origin. So `clone_repo` builds one: a clone on
 `main` with a single commit, and a bare repository beside it standing in for
 GitHub. Nothing here reaches the network — the "remote" is a directory.
 
-The identity and the config files come from environment variables set for the
-whole test, not from `-c` flags on these commands, because the code under test
-spawns its own git. A signing key, a hook or an `init.defaultBranch` in the
-user's config would otherwise decide what these tests assert, and the run would
-pass or fail depending on whose machine it was on.
+The identity, the config files, the language and the search ceiling come from
+environment variables set for the whole test, not from `-c` flags on these
+commands, because the code under test spawns its own git. A signing key, a hook,
+an `init.defaultBranch` or a translated error message would otherwise decide what
+these tests assert, and the run would pass or fail depending on whose machine it
+was on.
 
 The fixture is `clone_repo` and not `repo`: tests/test_queue.py already has a
 `repo` fixture that hands back a plain Path, and two names with two shapes in one
@@ -35,6 +36,12 @@ def clone_repo(tmp_path, monkeypatch):
         "GIT_AUTHOR_EMAIL": "lg@example.invalid",
         "GIT_COMMITTER_NAME": "lg",
         "GIT_COMMITTER_EMAIL": "lg@example.invalid",
+        # git ships translations of its own error messages, so a test that reads
+        # one is reading the machine's language unless the language is pinned.
+        "LC_ALL": "C",
+        # Nothing above tmp_path is ours: with TMPDIR inside a checkout, git
+        # would walk out of the temporary tree and answer about that repository.
+        "GIT_CEILING_DIRECTORIES": str(tmp_path),
     }.items():
         monkeypatch.setenv(name, value)
 

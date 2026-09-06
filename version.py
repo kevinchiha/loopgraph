@@ -183,10 +183,11 @@ def _git(root: str | os.PathLike, argv: list[str],
          timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     """One git command in `root`, which never raises on a non-zero exit.
 
-    check=True is deliberately absent, because every caller below has its own
-    answer to a failure: a checkout with no tag is not an error, a directory that
-    is not a checkout is not one either, and the remote read wants git's own
-    message rather than a CalledProcessError nobody would want to read.
+    Nothing here asks subprocess to raise on one, deliberately, because every
+    caller below has its own answer to a failure: a checkout with no tag is not
+    an error, a directory that is not a checkout is not one either, and the
+    remote read wants git's own message rather than a CalledProcessError nobody
+    would want to read.
     """
     return subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=timeout)
 

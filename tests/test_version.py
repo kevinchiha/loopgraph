@@ -330,9 +330,14 @@ def test_installed_names_the_nearest_v_tag_and_counts_commits_past_it(clone_repo
     assert here["ahead"] == 2
 
 
-def test_installed_on_a_directory_that_is_not_a_repository(tmp_path):
+def test_installed_on_a_directory_that_is_not_a_repository(tmp_path, monkeypatch):
     """A tree unpacked from an archive instead of cloned. `lg version` still has
-    to print something about it, so nothing here may raise."""
+    to print something about it, so nothing here may raise.
+
+    The ceiling is what makes that a fact rather than a machine's opinion: git
+    searches upwards for a .git, and a TMPDIR that sits inside a checkout would
+    otherwise have it answer about that repository instead of this directory."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     unpacked = tmp_path / "unpacked"
     unpacked.mkdir()
     assert installed(unpacked) == {"tag": None, "commit": None, "ahead": 0}
