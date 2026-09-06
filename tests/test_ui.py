@@ -609,6 +609,21 @@ def test_the_injected_pattern_survives_javascript():
 #     That box is `display:inline-block`, the same shape as the rule that beat
 #     `hidden` in item 3, and the command is the highest-stakes text on the page:
 #     it is the only thing here that changes what a run does.
+#
+# 10. The sweep section, which needs a sweep run, and there was none on this machine
+#     the day this was written — so like item 9 this goes unrun more often than not.
+#     Until there is one, serve a hand-written ledger instead: `ui.make_server(8410,
+#     Path('runs'), temporal_addr=None, feed=FakeFeed(rows=[...], ledgers={id:
+#     {"status": "running", "sweep": {"passes": [...], "ended": None}, "items": [...]}}))`,
+#     with the FakeFeed from this file and a `kind` on an item or two.
+#     See: a `sweep` block above the work items, one line per pass, the failed
+#     detectors named in brackets on an incomplete one, the ending reason under them
+#     once the run has one, and the word `sweep` or `convergence` beside the status
+#     of every item that carries one.
+#     Then click a brief run.
+#     See: no sweep block at all and not one kind word in the items. Every run before
+#     this phase is that run, and a label on every row of them would be this change
+#     costing something and giving nothing back.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
@@ -1250,6 +1265,83 @@ def test_an_item_row_shows_a_short_commit_or_a_parked_reason():
     assert "'done'" in src and "'parked'" in src, "the two statuses with a detail"
     assert re.search(r"slice\(0,\s*10\)", src), "the commit is not cut to 10 characters"
     assert ".reason" in src, "a parked item says nothing about why"
+
+
+def test_the_items_row_has_a_kind_slot_written_by_the_patch():
+    """AC-29 and AC-11. A sweep item and a convergence item are the engine's own
+    work, and nothing else in the row says so: same number, same pill, same line of
+    text as an item the owner wrote. A brief item gets no word at all — every run
+    before this phase is brief items end to end, and a label on every row of every
+    one of them is noise — and an entry from one of those runs carries no `kind`
+    key, which reads as `brief` here exactly as it does in `lg status`.
+
+    The word goes in a span the builder puts there, so the patch writes text into a
+    node that is already on screen rather than markup into a row the reader may
+    have a selection in.
+    """
+    html = ui.page_html()
+    assert 'class="kind"' in function_source(html, "buildItemRow"), \
+        "the row has no slot for the kind, so a patch would have to write markup to say it"
+    src = function_source(html, "patchItemRow")
+    assert re.search(r"setText\(kind,", src), "the kind is written some way other than setText"
+    assert re.search(r"!==\s*'brief'", src), \
+        "a brief item is labelled `brief`, or a missing kind reaches the page as `undefined`"
+
+
+def test_the_sweep_copy_is_pinned():
+    """Every word the sweep section says that was not read off a ledger, plus the
+    two ends of it: the section is made once with the board, and a poll fills it."""
+    html = ui.page_html()
+    assert 'id="sweep"' in function_source(html, "buildBoard"), \
+        "the sweep section is not built with the board, so a poll would have to make it"
+    for line in ("(no passes yet)", "candidates", "(incomplete: ", "ended: "):
+        assert line in html, f"the page no longer says {line!r}"
+    assert "patchSweep(" in function_source(html, "patchBoard"), \
+        "the section is built with the board and then filled by nothing"
+    src = function_source(html, "patchSweep")
+    assert re.search(r"\.hidden\s*=\s*!\w+;", src), \
+        "the section's visibility does not follow the ledger's sweep key"
+
+
+def test_the_page_and_lg_status_share_the_sweep_lines():
+    """AC-28 and AC-29 are the same four lines written twice, the way the no-card
+    line above is: `lg` cannot import a page string and `ui.py` cannot import from a
+    file with no extension without loading it.
+
+    So the templates are read out of `lg` and never typed again here — a copy in
+    this test would pin the page to the test and let the terminal drift away from
+    both. Every piece outside a `{...}` placeholder is fixed text the page has to
+    say, ` candidates (incomplete: ` included: that one is what stops the incomplete
+    clause being pasted on as a second string, which is a line the two files could
+    then word differently.
+    """
+    lg = load_lg()
+    html = ui.page_html()
+    for key, template in lg.SWEEP_LINES.items():
+        for piece in re.split(r"\{[^}]*\}", template):
+            assert piece in html, \
+                f"the page does not say {piece!r}, which lg status's {key} line does"
+    assert "', '" in function_source(html, "patchSweep"), \
+        "the failed detectors are joined with something other than lg status's separator"
+
+
+def test_pass_rows_are_keyed_and_built_once():
+    """Passes only grow, so the section is never emptied and filled back up. A row
+    already on screen is found by its pass number and written over, and a new one is
+    inserted where the ledger has it — the map diff the items list is written on,
+    for the reason it is written on it: a reader with a line selected keeps it.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchSweep")
+    assert "buildPassRow(" in src, "the rows come from somewhere other than the builder"
+    for m in re.finditer(r"\bbuildPassRow\(", src):
+        assert src[:m.start()].rstrip().endswith("="), \
+            "patchSweep calls buildPassRow for what it does, not for the row it hands back"
+    assert "insertBefore" in src, "a new pass row cannot arrive without moving the rows above it"
+    assert ".remove()" in src, "a row whose pass the reply no longer carries stays for ever"
+    build = function_source(html, "buildPassRow")
+    assert re.search(r"dataset\.pass\s*=", build), \
+        "a pass row carries no key, so its text could only be matched to it by position"
 
 
 def test_the_question_is_left_out_when_it_was_never_recorded():
