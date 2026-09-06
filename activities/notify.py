@@ -7,7 +7,7 @@ poll for themselves, which meant concurrent runs fought over the one getUpdates
 connection Telegram allows and stole each other's text replies.
 
 No reply → the run holds at a safe no-change state, waiting on workflow state
-rather than on a retrying activity, per SPEC.
+rather than on a retrying activity.
 
 Creds come from a file mounted by compose (LOOPGRAPH_TELEGRAM_ENV) and are never
 copied. Give loopgraph its own bot: getUpdates consumes an update, so sharing one

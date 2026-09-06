@@ -3,7 +3,7 @@
 Every executor/supervisor call writes runs/<slug>/logs/i<item>-r<round>-<role>.log
 as it streams, so `lg tail runs/<slug>` shows what the nodes are doing right now —
 the thing watching Claude Code gave for free. Logs are bounded: head-truncated
-past LOG_CAP, per the SPEC's bounded-durable-sections rule.
+past LOG_CAP, so a long run cannot grow a log without limit.
 """
 
 from __future__ import annotations

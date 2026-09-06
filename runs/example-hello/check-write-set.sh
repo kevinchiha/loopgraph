@@ -1,5 +1,5 @@
 #!/bin/sh
-# Scope gate (SPEC §5): fail if anything outside the declared write set changed.
+# Scope gate: fail if anything outside the declared write set changed.
 # Copy this for your own runs and edit the two names in the case statement.
 #
 # -z and the read loop are not decoration: iterating `$(git status --porcelain)`

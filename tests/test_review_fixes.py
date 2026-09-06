@@ -132,7 +132,7 @@ def test_the_dashboard_ships_a_real_pattern():
 
 # ---------- every gate example in the docs must actually parse ----------
 
-DOCS = ["README.md", "SPEC.md", "skills/loopgraph/SKILL.md", "INSTALL_WITH_AGENT.md", "AGENTS.md"]
+DOCS = ["README.md", "skills/loopgraph/SKILL.md", "INSTALL_WITH_AGENT.md", "AGENTS.md"]
 
 
 @pytest.mark.parametrize("doc", DOCS)

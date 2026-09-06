@@ -406,12 +406,6 @@ The two red dashed marks are the parts worth knowing about. Temporal is bound to
 `Read`, `Glob` and `Grep` and nothing else, so it cannot quietly fix the thing it
 is supposed to be judging.
 
-[SPEC.md](SPEC.md) is the original design doctrine and still the best explanation
-of why the pieces are arranged this way. It predates the dispatcher, so it shows a
-run reading Telegram for itself, which is how it worked until one poller replaced
-per-run polling. The shape everywhere else is unchanged. `dispatcher.py` and this
-README are the current word on that part.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -1,6 +1,6 @@
 """Deterministic gate runner. Gates are code, never model.
 
-gates.yaml format (SPEC.md §5):
+gates.yaml format:
 
     - name: tests
   cmd: "pytest -x -q"
