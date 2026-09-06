@@ -4,3 +4,5 @@
 - Verify scope independently with `git status --porcelain` — check-write-set.sh is #!/bin/sh but uses bashism `read -r -d ""`, so it passes vacuously.
 - Don't trust check-write-set.sh — it's `#!/bin/sh` yet uses bashism `read -r -d`, so it passes vacuously; verify scope yourself with `git status --porcelain`.
 - Don't trust check-write-set.sh: its `read -r -d ""` bashism no-ops under dash and exits 0 always — verify scope yourself via `git status --porcelain`.
+- In cli.py give each flag its own independent `if args.<flag>:` block (never elif) so flags compose; verify output byte-for-byte.
+- Don't trust check-write-set.sh (it errors `read: Illegal option -d` yet exits 0) — verify scope independently with `git status --porcelain` against the write set.

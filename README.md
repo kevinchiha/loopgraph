@@ -13,12 +13,18 @@ brief + gates  →  executor round  →  gates (code, no model)  →  audit (fre
                                                               decision → you
 ```
 
+![One real run: two work items, gates, an audit on each, then a card on my phone](screenshots/demo.gif)
+
+<p align="center">
+  <em>Thirty seconds of a real run, sped up. Nothing here is a mock-up.</em>
+</p>
+
 <p align="center">
   <img src="screenshots/telegram-card.jpg" width="330" alt="A loopgraph merge card in Telegram, with A, B and C buttons">
 </p>
 
 <p align="center">
-  <em>The end of a run. It found me on my phone, said what it had checked and how,<br>
+  <em>The end of it. It found me on my phone, said what it had checked and how,<br>
   and waited. A is the only thing between that branch and main.</em>
 </p>
 
