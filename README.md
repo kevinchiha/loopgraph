@@ -19,15 +19,6 @@ brief + gates  →  executor round  →  gates (code, no model)  →  audit (fre
   <em>Thirty seconds of a real run, sped up. Nothing here is a mock-up.</em>
 </p>
 
-<p align="center">
-  <img src="screenshots/telegram-card.jpg" width="330" alt="A loopgraph merge card in Telegram, with A, B and C buttons">
-</p>
-
-<p align="center">
-  <em>The end of it. It found me on my phone, said what it had checked and how,<br>
-  and waited. A is the only thing between that branch and main.</em>
-</p>
-
 ## What actually happens
 
 If you have never run anything like this, here is one job from start to finish.
