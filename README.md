@@ -97,8 +97,8 @@ grinding.
 
 ## What you need
 
-Linux, Docker with the Compose v2 plugin, Python 3.13+, a way to reach Claude, and
-a Telegram bot. Nobody has tried this on macOS.
+Docker with the Compose v2 plugin, Python 3.13+, a way to reach Claude, and a
+Telegram bot.
 
 The bot is not decoration. A run stops and asks you things, and the engine refuses
 to start without a way to reach you, because a run nobody is told about waits
@@ -391,7 +391,6 @@ never use it: it is the shortest description of how to drive this thing properly
   safe.
 - Three rounds, then it escalates. It does not grind forever, and it does not
   quietly give up either.
-- Linux and Docker only.
 - A Telegram bot is required, not optional. If you want a different channel, the
   place to add one is `activities/notify.py`, which is about ninety lines.
 
