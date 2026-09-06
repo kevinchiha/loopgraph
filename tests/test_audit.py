@@ -84,3 +84,27 @@ def test_kind_is_the_last_parameter_of_audit_and_the_prompt():
     assert list(inspect.signature(audit).parameters) == [
         "run_dir", "round_result", "round_no", "item_no", "work_item", "item_total", "kind"]
     assert list(inspect.signature(assemble_audit_prompt).parameters)[-1] == "kind"
+
+
+def _section(prompt: str, heading: str) -> list[str]:
+    """The lines of one `## ` section of a contract, heading included."""
+    lines = prompt.splitlines()
+    body = lines[lines.index(heading) + 1:]
+    end = next((i for i, line in enumerate(body) if line.startswith("## ")), len(body))
+    section = [heading, *body[:end]]
+    while not section[-1].strip():
+        section.pop()
+    return section
+
+
+def test_the_supervisor_contract_explains_generated_items():
+    """The scope block names the kind, but nothing tells the auditor what that
+    kind is worth: that an empty diff can be an accept, that a sweep which
+    removed nothing is not, and that net lines is code's job and not its own.
+    Short on purpose — a contract nobody finishes is a contract nobody follows."""
+    p = assemble_audit_prompt("BRIEF", "", _rr(), "d")
+    assert "## Convergence and sweep items" in p
+    section = _section(p, "## Convergence and sweep items")
+    assert len(section) < 20, "\n".join(section)
+    body = "\n".join(section)
+    assert "convergence item" in body and "sweep item" in body

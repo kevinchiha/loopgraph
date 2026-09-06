@@ -1,9 +1,11 @@
 import inspect
+import json
+import re
 
 import pytest
 
 from activities.discover import discover
-from activities.execute_round import (CANDIDATE_CAP, assemble_prompt, clean_candidates,
+from activities.execute_round import (CANDIDATE_CAP, PROMPTS, assemble_prompt, clean_candidates,
                                       execute_round, parse_final_json, parse_porcelain,
                                       run_paths)
 
@@ -99,3 +101,43 @@ def test_generated_items_get_the_executor_prompt_a_brief_item_gets():
         p = assemble_prompt("BRIEF", "C", item)
         assert _headings(p) == _headings(plain)
         assert p.split("# Work item for this round\n\n")[1].strip() == item
+
+
+def _section(prompt: str, heading: str) -> list[str]:
+    """The lines of one `## ` section of a contract, heading included."""
+    lines = prompt.splitlines()
+    body = lines[lines.index(heading) + 1:]
+    end = next((i for i, line in enumerate(body) if line.startswith("## ")), len(body))
+    section = [heading, *body[:end]]
+    while not section[-1].strip():
+        section.pop()
+    return section
+
+
+def test_the_executor_contract_explains_generated_items():
+    """An engine-written item carries rules no brief states: net lines is checked
+    in code at commit time, an empty diff can be the right answer, and a
+    detector's list contains things that are really used. The executor reads them
+    here or nowhere. Short on purpose — a contract nobody finishes is a contract
+    nobody follows."""
+    p = assemble_prompt("BRIEF", "C", "ITEM")
+    assert "## Convergence and sweep items" in p
+    section = _section(p, "## Convergence and sweep items")
+    assert len(section) < 20, "\n".join(section)
+    body = "\n".join(section)
+    assert "git diff --numstat" in body and "detector" in body
+
+
+def test_the_executor_contract_asks_for_candidates():
+    """Nothing tells the executor where a thing it found by hand goes unless the
+    output contract has a slot for it."""
+    assert '"candidates": []' in assemble_prompt("BRIEF", "C", "ITEM")
+
+
+def test_the_output_contract_json_still_parses():
+    """`candidates` was added by hand to a block the executor copies, so a comma
+    left on the wrong line ships an example that parses for nobody."""
+    text = (PROMPTS / "executor.md").read_text()
+    block = re.search(r"```json\n(.*?)\n```", text, re.DOTALL).group(1)
+    assert json.loads(block).keys() == {
+        "claims", "files_changed", "summary", "blocked", "candidates"}

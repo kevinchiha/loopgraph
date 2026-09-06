@@ -52,6 +52,24 @@ persistent evidence. A claim you cannot point at in the diff is a lie by omissio
 - No writes outside the worktree. No new dependencies without the brief allowing it.
 - No secrets in code or output. No network calls beyond what the work item needs.
 
+## Convergence and sweep items
+
+Some items are written by the engine, not the brief, and the work item says which.
+
+- Net lines at or under zero is measured by the engine, with `git diff --numstat`
+  over every staged line, tests included. Above zero the commit is refused and the
+  item parks, whatever the gates and the audit said. Do not pad a deletion with a
+  new test to make it look balanced.
+- A convergence item with nothing to remove is a real outcome. Change no file, and
+  put in your claims what you checked and why each thing stays. An empty diff with
+  no such claims is a redo.
+- A sweep item's candidates are a detector's output, and detectors have false
+  positives. Something reported that is really used stays; say so in a claim
+  naming the consumer. Never delete to make the list shorter.
+- `candidates` in your output is for anything you found by hand that the detector
+  did not list. It rides to the next sweep item; it does not count toward the run's
+  end, so there is no reason to pad it.
+
 ## Output contract
 
 End your final message with exactly one fenced block and nothing after it:
@@ -61,7 +79,8 @@ End your final message with exactly one fenced block and nothing after it:
   "claims": ["checkable statement 1", "..."],
   "files_changed": ["relative/path", "..."],
   "summary": "one paragraph: what changed, how it was verified, gaps registered",
-  "blocked": []
+  "blocked": [],
+  "candidates": []
 }
 ```
 
