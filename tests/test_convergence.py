@@ -144,7 +144,11 @@ def test_an_empty_brief_or_sweep_item_still_parks_at_checkpoint(kind):
     fake = ScriptedWorkflow(rounds=[dict(GREEN_ROUND, files=[])],
                             checkpoints=[{"committed": False, "reason": "empty write set"}])
     outcome, _wf = drive_item(fake, kind=kind)
-    assert outcome == {"status": "parked", "reason": "checkpoint refused: empty write set"}
+    assert outcome["status"] == "parked"
+    assert outcome["reason"] == "checkpoint refused: empty write set"
+    # Every outcome carries its round result: a sweep harvests the executor's
+    # candidates off a parked item as well as an accepted one.
+    assert outcome["result"]["files"] == []
     assert "checkpoint" in _names(fake)
 
 

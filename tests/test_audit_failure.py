@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,6 +75,12 @@ class _FakeWorkflow:
 
     def info(self):
         return SimpleNamespace(workflow_id="run-x-ab12cd")
+
+    def now(self) -> datetime:
+        """Where `run` takes a sweep's start from, on its first line. A fixed
+        instant: nothing here depends on time passing, and a real clock inside a
+        workflow fake is the replay bug the determinism pin exists to catch."""
+        return datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
 
     async def execute_activity(self, fn, args=None, **kwargs):
         name = fn.__name__

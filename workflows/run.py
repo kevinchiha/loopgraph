@@ -7,7 +7,7 @@ The full LoopGraphRun (rounds, cadences, signals) lands in M3 — same file.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -17,6 +17,7 @@ with workflow.unsafe.imports_passed_through():
     from activities.audit import audit
     from activities.checkpoint import checkpoint, discard, merge
     from activities.config import load_run_config
+    from activities.discover import discover
     from activities.execute_round import execute_round, run_baseline
     from activities.gate import run_gates
     from activities.items import load_work_items
@@ -218,6 +219,42 @@ def build_sweep_item(detector: dict, pass_no: int, extras: list[str]) -> str:
     ])
 
 
+EXTRAS_CAP = 20   # candidates an earlier item found, carried to the next one
+STALL_LIMIT = 3   # sweep items parked in a row before the run gives up
+
+
+def sweep_end_reason(passes: list[dict], sweep: dict, elapsed: float, items_run: int,
+                     parked_streak: int) -> str | None:
+    """Why this sweep is over, or None to build another item.
+
+    The order is the whole of it. Two conditions can land on the same pass, and
+    a fixed order is what stops the same run reporting a different ending
+    depending on which check happened to run first. Detector failure comes
+    before everything else, because a zero from a detector that died is not a
+    zero: the run would converge on a number the repo never had.
+    """
+    latest = passes[-1]
+    if latest["total"] == 0 and not latest["complete"]:
+        failed = ", ".join(d["name"] for d in latest["detectors"] if d["note"])
+        return f"detectors failed: {failed}"
+    if latest["complete"] and latest["total"] == 0:
+        return "converged: nothing reported"
+    floor = sweep["yield_floor"]
+    # Complete passes only: an incomplete one is a count nobody can trust.
+    counted = [p["total"] for p in passes if p["complete"]]
+    if len(counted) >= 2 and counted[-2] <= floor and counted[-1] <= floor:
+        return f"converged: two passes at or under {floor} ({counted[-2]}, {counted[-1]})"
+    # `is not None`, because 0 is a deadline that has already passed and
+    # truthiness would read it as a run with no deadline at all.
+    if sweep["deadline_seconds"] is not None and elapsed >= sweep["deadline_seconds"]:
+        return f"deadline reached after {items_run} items"
+    if items_run >= sweep["max_items"]:
+        return f"item cap {sweep['max_items']} reached"
+    if parked_streak >= STALL_LIMIT:
+        return f"sweep stalled: {STALL_LIMIT} consecutive items parked"
+    return None
+
+
 @workflow.defn
 class LoopGraphRun:
     """The full run: round → audit → verdict branch. The ledger is workflow state.
@@ -246,7 +283,14 @@ class LoopGraphRun:
         An item that will not go green is parked and the run carries on, so one
         bad item does not throw away the ones that worked. The owner hears about
         a park immediately and their reply is picked up before the next item.
+
+        A sweep run has no brief items and takes its work from the detectors
+        instead; `_run_sweep` is that half of the loop.
         """
+        # Where a sweep's deadline counts from, and the only clock this module
+        # may read: Temporal replays `workflow.now()` to the same instant, so the
+        # run that resumes after a worker restart is not suddenly four days old.
+        start = workflow.now()
         self._target_repo = target_repo
         # run.yaml first, and once. A knob the schema does not know is an error,
         # not a default taken quietly, and finding it after the baseline would
@@ -272,6 +316,12 @@ class LoopGraphRun:
             start_to_close_timeout=timedelta(minutes=2),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
+        if self._config["sweep"] is not None:
+            # The detectors are the item source, so there is no brief list to
+            # load and no convergence item to inject: a sweep item is already
+            # held to net zero, and a removal pass would be the same item twice.
+            return await self._run_sweep(run_dir, target_repo, self._config["sweep"],
+                                         start)
         items = await workflow.execute_activity(
             load_work_items,
             args=[run_dir],
@@ -373,6 +423,122 @@ class LoopGraphRun:
         await self._owner_card(run_dir, accepted, checkpoint_result, parked)
         return self._ledger
 
+    async def _run_sweep(self, run_dir: str, target_repo: str, sweep: dict,
+                         start: datetime) -> dict:
+        """The other item source: a detector pass, one item, another pass.
+
+        A pass runs before the first item so the run has a baseline to measure
+        against, and again after every item, because the detectors are the only
+        thing allowed to say the work is finished. The executor may add work —
+        what it found by hand rides on the next item as `extras` — but nothing it
+        reports moves a total or an end condition. An agent deciding when its own
+        job is done is exactly what the engine exists to prevent.
+        """
+        self._ledger["sweep"] = {"passes": [], "ended": None}
+        # Every detector's own timeout, plus 20 seconds each because the runner
+        # polls in 20-second steps and can only kill on a step boundary (a
+        # detector with `timeout: 30` dies at 40), plus two minutes for the
+        # worktree and the reset to the last checkpoint. The bare sum would kill
+        # the pass while its last detector was still being killed, and report
+        # the whole thing as a Temporal failure rather than a timed-out detector.
+        pass_timeout = timedelta(
+            seconds=sum(d["timeout"] + 20 for d in sweep["detectors"]) + 120)
+
+        carried: str | None = None    # an owner reply, handed to the next item
+        accepted: dict | None = None  # last accepted round result, for the final card
+        checkpoint_result: dict | None = None
+        extras: list[str] = []        # candidates earlier items found by hand
+        items_run = 0
+        parked_streak = 0             # parked in a row; STALL_LIMIT ends the run
+        used = -1                     # index of the detector the last item came from
+        pass_no = 0
+
+        while True:
+            pass_no += 1
+            found = await workflow.execute_activity(
+                discover,
+                args=[run_dir, target_repo, self._run_token(), self._base_commit],
+                start_to_close_timeout=pass_timeout,
+                heartbeat_timeout=timedelta(minutes=3),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+            self._ledger["sweep"]["passes"].append({**found, "pass": pass_no})
+            elapsed = (workflow.now() - start).total_seconds()
+            reason = sweep_end_reason(self._ledger["sweep"]["passes"], sweep, elapsed,
+                                      items_run, parked_streak)
+            if reason:
+                break
+
+            # Round-robin from the detector after the one the last item used,
+            # skipping any that reported nothing this pass. A detector's list is
+            # often the same corner of the repo every pass, and always taking the
+            # first would pin the run there while the others go unworked. A pass
+            # with nothing to hand over has already ended the run above, so there
+            # is always one left to find.
+            entries = found["detectors"]
+            order = [(used + 1 + step) % len(entries) for step in range(len(entries))]
+            used = next(i for i in order if entries[i]["count"])
+            item = build_sweep_item(entries[used], pass_no, extras)
+            entry = {"n": items_run + 1, "item": item, "status": "running",
+                     "kind": "sweep"}
+            self._ledger["items"].append(entry)
+            items_run += 1
+            total = len(self._ledger["items"])
+            outcome = await self._run_item(run_dir, target_repo, item, items_run,
+                                           carried, "sweep")
+            carried = None
+            if outcome["status"] == "accepted":
+                cp = outcome["checkpoint"]
+                entry.update(status="done", commit=cp.get("commit"), net=cp.get("net"))
+                accepted, checkpoint_result = outcome["result"], cp
+                parked_streak = 0
+            elif outcome["status"] == "halt":
+                entry.update(status="parked", reason=outcome["reason"])
+                self._ledger.update(status="stopped", reason=outcome["reason"])
+                # Not one of the five end conditions, but it is still why the
+                # sweep ended, and that is the one key `lg status` reads.
+                self._ledger["sweep"]["ended"] = outcome["reason"]
+                await self._stopped_note(run_dir, outcome["reason"], items_run, total)
+                return self._ledger
+            else:
+                entry.update(status="parked", reason=outcome["reason"])
+                parked_streak += 1
+                await self._park_note(run_dir, items_run, total, item, outcome["reason"])
+            # A parked item read the code too, so its candidates count. They are
+            # text for the next item and nothing else: counting them would hand
+            # the executor the number the run ends on.
+            for candidate in outcome["result"]["candidates"]:
+                if candidate not in extras:
+                    extras.append(candidate)
+            extras = extras[-EXTRAS_CAP:]
+
+            # Anything the owner sent while that item ran is steering for the
+            # next one. It is already in workflow state: the dispatcher signalled
+            # it.
+            notes = self._drain_decisions()
+            if notes:
+                entry.setdefault("owner_notes", []).extend(notes)
+                carried = ("The owner sent this mid-run, after item "
+                           f"{items_run}: {' / '.join(notes)}")
+
+        self._ledger["sweep"]["ended"] = reason
+        self._ledger["reason"] = reason
+        parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
+        if accepted is None:
+            self._ledger.update(status="stopped")
+            # A sweep that converged on its baseline pass ran no item and has
+            # nowhere to speak from; `item 0 of 0` is a wrong answer to where the
+            # run is.
+            if items_run:
+                await self._stopped_note(run_dir, reason, items_run,
+                                         len(self._ledger["items"]))
+            else:
+                await self._stopped_note(run_dir, reason, None, None)
+            return self._ledger
+        self._ledger.update(status="merge-ready")
+        await self._owner_card(run_dir, accepted, checkpoint_result, parked)
+        return self._ledger
+
     def _run_token(self) -> str:
         """The tail of the workflow id, e.g. "ab12cd". It makes this run's branch
         and worktree its own: deriving them from the run-dir name alone meant a
@@ -386,7 +552,9 @@ class LoopGraphRun:
 
         Returns accepted (with the result and its checkpoint), parked (the run
         carries on to the next item), or halt (the supervisor said stop, which is
-        the one verdict that ends the whole run).
+        the one verdict that ends the whole run). Every one of them carries the
+        round result, because a sweep harvests the executor's candidates off a
+        parked item too: it read the code either way.
 
         `kind` says what sort of item this is. The auditor is told, because the
         supervisor sees only what the prompt hands it and would otherwise judge a
@@ -430,7 +598,7 @@ class LoopGraphRun:
             }
             self._ledger["rounds"].append(entry)
             if result["status"] != "green":
-                return {"status": "parked",
+                return {"status": "parked", "result": result,
                         "reason": "gates red after the correction cap"}
 
             try:
@@ -454,7 +622,8 @@ class LoopGraphRun:
                 # `lg status`, which is the line the owner checks first.
                 entry["verdict"] = "audit failed"
                 entry["verdict_reasons"] = [why]
-                return {"status": "parked", "reason": f"audit failed: {why}"}
+                return {"status": "parked", "result": result,
+                        "reason": f"audit failed: {why}"}
             entry["verdict"] = verdict["verdict"]
             entry["verdict_reasons"] = verdict["reasons"]
 
@@ -477,7 +646,7 @@ class LoopGraphRun:
                 if cp.get("commit"):
                     self._base_commit = cp["commit"]
                 if not cp["committed"]:
-                    return {"status": "parked",
+                    return {"status": "parked", "result": result,
                             "reason": f"checkpoint refused: {cp['reason']}"}
                 # Convergence fires on lines added since the last removal item, so
                 # the number has to survive the round it was measured in.
@@ -498,14 +667,15 @@ class LoopGraphRun:
                 return {"status": "accepted", "result": result, "checkpoint": cp}
 
             if verdict["verdict"] == "stop":
-                return {"status": "halt",
+                return {"status": "halt", "result": result,
                         "reason": f"supervisor said stop: {'; '.join(verdict['reasons'])[:300]}"}
             if verdict["verdict"] == "plan":
-                return {"status": "parked",
+                return {"status": "parked", "result": result,
                         "reason": f"supervisor asked to replan: {'; '.join(verdict['reasons'])[:300]}"}
             if verdict["verdict"] == "ask":
                 if asks >= MAX_ASKS:
-                    return {"status": "parked", "reason": "owner-question cap reached"}
+                    return {"status": "parked", "result": result,
+                            "reason": "owner-question cap reached"}
                 asks += 1
                 d = verdict["directive"]
                 question = d.get("action", "Supervisor needs an owner decision")
@@ -533,7 +703,7 @@ class LoopGraphRun:
                 continue
             over = budget_spent(spent, asks)
             if over:
-                return {"status": "parked", "reason": over}
+                return {"status": "parked", "result": result, "reason": over}
             d = verdict["directive"]
             directive = (
                 f"Context: {d.get('context', '')}\nAction: {d.get('action', '')}\n"

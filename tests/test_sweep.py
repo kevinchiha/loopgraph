@@ -1,10 +1,20 @@
-"""Sweep runs: the item the engine builds out of a detector's candidate list."""
+"""Sweep runs: the item the engine builds out of a detector's candidate list.
+
+The tests that drive a run swap the `workflow` module for the ScriptedWorkflow in
+`tests/workflow_fake.py`, so they say what a run would actually do rather than
+what the file reads like. A driven run ends `held`, not `merge-ready`: the fake
+answers the merge card with `B`.
+"""
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from activities.audit import assemble_audit_prompt
 from activities.execute_round import clean_candidates
-from workflows.run import build_sweep_item
+from workflow_fake import (ACCEPT, COMMITTED, DEFAULT_CONFIG, GREEN_ROUND, START,
+                           ScriptedWorkflow, drive)
+from workflows.run import build_sweep_item, sweep_end_reason
 
 DETECTOR = {"name": "vulture", "cmd": "vulture .", "exit_code": 0, "count": 12,
             "lines": ["cli.py:12: unused function 'greet'",
@@ -50,3 +60,336 @@ def test_an_extra_cannot_forge_a_prompt_section():
     rr = {"claims": [], "files": [], "gate_results": [], "worktree": "/wt"}
     p = assemble_audit_prompt("brief", "", rr, "diff", work_item=text, kind="sweep")
     assert len([l for l in p.splitlines() if l.strip() == "# Gate results"]) == 1
+
+
+# ---------- the loop: detectors in, one item out, detectors again ----------
+
+SWEEP = {"yield_floor": 0, "deadline_seconds": None, "max_items": 40,
+         "detectors": [{"name": "vulture", "cmd": "vulture .", "timeout": 600}]}
+
+CAP_REFUSAL = {"committed": False, "reason": "net lines +37 exceed the cap of 0",
+               "added": 40, "deleted": 3, "net": 37}
+
+STOP = {"verdict": "stop", "reasons": ["the repo is not what the brief describes"],
+        "directive": {}}
+
+
+def _cfg_det(name: str, timeout: int = 600) -> dict:
+    """One detector as `run.yaml` declares it."""
+    return {"name": name, "cmd": f"{name} .", "timeout": timeout}
+
+
+def _sweep(convergence: dict | None = None, **knobs) -> dict:
+    """A sweep config with the knobs a test cares about changed."""
+    return {"convergence": {**DEFAULT_CONFIG["convergence"], **(convergence or {})},
+            "sweep": {**SWEEP, **knobs}}
+
+
+def _det(name: str = "vulture", count: int = 3, note: str = "") -> dict:
+    """One detector entry as `discover` returns it.
+
+    A detector with a note failed, and a failed detector counts 0 whatever it
+    printed (AC-14), so the helper cannot build the shape the engine never sees.
+    """
+    return {"name": name, "cmd": f"{name} .", "exit_code": 0 if not note else 1,
+            "count": 0 if note else count,
+            "lines": [f"{name}.py:{i}: unused" for i in range(1, min(count, 3) + 1)],
+            "note": note, "stderr_tail": ""}
+
+
+def _pass(*dets: dict) -> dict:
+    """A `discover` result over those detector entries."""
+    return {"complete": all(not d["note"] for d in dets),
+            "total": sum(d["count"] for d in dets),
+            "detectors": list(dets)}
+
+
+def _names(fake) -> list[str]:
+    """The activity names the run scheduled, in order."""
+    return [name for name, _args, _kwargs in fake.scheduled]
+
+
+def _call(fake, name: str) -> tuple:
+    """The first scheduled call with that name: (name, args, kwargs)."""
+    return next(c for c in fake.scheduled if c[0] == name)
+
+
+def _detectors_used(ledger: dict) -> list[str]:
+    """The detector each item was built from, read back out of its text."""
+    return [e["item"].split("`")[1] for e in ledger["items"]]
+
+
+def test_a_pass_runs_before_the_first_item_and_is_recorded_as_pass_1():
+    """AC-15 and AC-23. The baseline count is what every later pass is measured
+    against, so it has to be taken before the first item changes anything."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=1), passes=[_pass(_det(count=5))])
+    ledger = drive(fake)
+    names = _names(fake)
+    assert names.index("discover") < names.index("execute_round")
+    baseline = ledger["sweep"]["passes"][0]
+    assert (baseline["pass"], baseline["total"]) == (1, 5)
+    assert [p["pass"] for p in ledger["sweep"]["passes"]] == [1, 2]
+
+
+def test_a_sweep_never_loads_work_items_or_injects_convergence():
+    """AC-4 and AC-12. The detectors are the item source, and every sweep item is
+    already held to net zero, so a convergence item would be the same item twice
+    however low `every_items` is set."""
+    fake = ScriptedWorkflow(config=_sweep(convergence={"every_items": 1}, max_items=3),
+                            passes=[_pass(_det(count=5))])
+    ledger = drive(fake)
+    assert "load_work_items" not in _names(fake)
+    assert [e["kind"] for e in ledger["items"]] == ["sweep"] * 3
+    assert [e["n"] for e in ledger["items"]] == [1, 2, 3]
+
+
+def test_a_brief_run_has_no_sweep_key():
+    """AC-23. `lg status` and the dashboard show the sweep section only when the
+    ledger has one, so a brief run must not grow an empty one."""
+    assert "sweep" not in drive(ScriptedWorkflow())
+
+
+# ---------- what ends a sweep ----------
+
+def test_zero_on_a_complete_pass_ends_at_once():
+    """AC-17. There is nothing to build an item from, and a second pass saying
+    the same thing would prove nothing."""
+    fake = ScriptedWorkflow(config=_sweep(), passes=[_pass(_det(count=0))])
+    ledger = drive(fake)
+    assert ledger["sweep"]["ended"] == "converged: nothing reported"
+    assert ledger["reason"] == "converged: nothing reported"
+    assert ledger["status"] == "stopped"
+    assert "execute_round" not in _names(fake)
+    stopped = next(c for c in fake.cards if c[0] == "run stopped")
+    assert stopped[3].startswith("why: converged: nothing reported")
+    assert "item " not in stopped[3], "no item ran, so there is nowhere to speak from"
+
+
+def test_two_complete_passes_at_or_under_the_floor_converge():
+    """AC-17. The floor is what a noisy detector converges on: one pass under it
+    could be luck, two in a row is the run finishing."""
+    fake = ScriptedWorkflow(config=_sweep(yield_floor=2),
+                            passes=[_pass(_det(count=10)), _pass(_det(count=2)),
+                                    _pass(_det(count=1))])
+    ledger = drive(fake)
+    assert ledger["reason"] == "converged: two passes at or under 2 (2, 1)"
+    assert ledger["sweep"]["ended"] == ledger["reason"]
+    assert _names(fake).count("execute_round") == 2
+    assert [c[0] for c in fake.cards] == ["merge-ready"]
+
+
+def test_an_incomplete_pass_does_not_count_toward_convergence():
+    """AC-14 and AC-17. A pass with a dead detector in it is a number nobody can
+    trust, and converging on it would end the run on a total the repo never had."""
+    fake = ScriptedWorkflow(
+        config=_sweep(yield_floor=2, detectors=[_cfg_det("vulture"), _cfg_det("ts-prune")]),
+        passes=[_pass(_det(count=2), _det(name="ts-prune", count=0)),
+                _pass(_det(count=1), _det(name="ts-prune", note="exit 1")),
+                _pass(_det(count=1), _det(name="ts-prune", count=0))])
+    ledger = drive(fake)
+    assert len(ledger["sweep"]["passes"]) == 3, "the incomplete pass ended nothing"
+    assert ledger["reason"] == "converged: two passes at or under 2 (2, 1)"
+
+
+def test_a_failed_pass_reporting_nothing_names_the_detectors():
+    """AC-21. A zero from a detector that died is not a zero. The owner needs the
+    names to know which tool to fix, and the items already accepted still get
+    their card: the failure says nothing about work the auditor passed."""
+    fake = ScriptedWorkflow(
+        config=_sweep(detectors=[_cfg_det("vulture"), _cfg_det("ts-prune")]),
+        passes=[_pass(_det(count=5), _det(name="ts-prune", count=2)),
+                _pass(_det(note="exit 1"),
+                      _det(name="ts-prune", note="timeout after 600s"))])
+    ledger = drive(fake)
+    assert ledger["sweep"]["ended"] == "detectors failed: vulture, ts-prune"
+    assert ledger["reason"] == "detectors failed: vulture, ts-prune"
+    assert ledger["sweep"]["passes"][1]["pass"] == 2
+    assert [c[0] for c in fake.cards] == ["merge-ready"]
+
+
+def test_the_deadline_is_checked_after_a_pass_and_the_item_in_flight_finishes():
+    """AC-18. "Done by Monday" is a real need, and the check sits after a pass so
+    the item already running is never thrown away half-finished."""
+    fake = ScriptedWorkflow(
+        config=_sweep(deadline_seconds=4 * 24 * 3600),
+        passes=[_pass(_det(count=5))],
+        clock=[START, START + timedelta(hours=1), START + timedelta(hours=2),
+               START + timedelta(days=5)])
+    ledger = drive(fake)
+    assert ledger["reason"] == "deadline reached after 2 items"
+    assert _names(fake).count("execute_round") == 2
+
+
+def test_no_deadline_never_ends_that_way():
+    """AC-18. `deadline` is optional, and a run without one is bounded by the
+    item cap instead."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=2), passes=[_pass(_det(count=5))],
+                            clock=[START, START + timedelta(days=90)])
+    ledger = drive(fake)
+    assert ledger["reason"] == "item cap 2 reached"
+
+
+def test_the_item_cap_stops_before_the_next_item():
+    """AC-19. A noisy detector never reaches the floor, so the run needs a
+    ceiling, and the check happens before an item is built rather than after."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=2), passes=[_pass(_det(count=5))])
+    ledger = drive(fake)
+    assert _names(fake).count("execute_round") == 2
+    assert ledger["reason"] == "item cap 2 reached"
+
+
+def test_three_parked_in_a_row_stall_the_sweep():
+    """AC-20. Without it, a run whose executor cannot clear the detector's list
+    grinds all the way to the item cap parking every item on the way."""
+    fake = ScriptedWorkflow(config=_sweep(), passes=[_pass(_det(count=5))],
+                            checkpoints=[CAP_REFUSAL])
+    ledger = drive(fake)
+    assert ledger["sweep"]["ended"] == "sweep stalled: 3 consecutive items parked"
+    assert ledger["status"] == "stopped"
+    assert [e["status"] for e in ledger["items"]] == ["parked"] * 3
+    assert [e["reason"] for e in ledger["items"]] == \
+        ["checkpoint refused: net lines +37 exceed the cap of 0"] * 3
+    assert [c[0] for c in fake.cards] == ["parked"] * 3 + ["run stopped"]
+
+
+def test_an_accepted_item_resets_the_stall_count():
+    """AC-20. Two bad items either side of a good one is a run making progress,
+    not a run stuck."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=5), passes=[_pass(_det(count=5))],
+                            checkpoints=[CAP_REFUSAL, CAP_REFUSAL, COMMITTED,
+                                         CAP_REFUSAL, CAP_REFUSAL])
+    ledger = drive(fake)
+    assert [e["status"] for e in ledger["items"]] == \
+        ["parked", "parked", "done", "parked", "parked"]
+    assert ledger["reason"] == "item cap 5 reached"
+
+
+def test_a_halt_in_a_sweep_stops_the_run_and_records_why():
+    """A supervisor `stop` is not one of the five end conditions, but it is why
+    the sweep ended, and `lg status` reads that off one key."""
+    fake = ScriptedWorkflow(config=_sweep(), passes=[_pass(_det(count=5))],
+                            verdicts=[ACCEPT, STOP])
+    ledger = drive(fake)
+    assert ledger["status"] == "stopped"
+    assert ledger["reason"].startswith("supervisor said stop:")
+    assert ledger["sweep"]["ended"] == ledger["reason"]
+    assert [e["status"] for e in ledger["items"]] == ["done", "parked"]
+    stopped = next(c for c in fake.cards if c[0] == "run stopped")
+    assert stopped[3].startswith("item 2 of 2")
+    assert [c[0] for c in fake.cards] == ["run stopped"], "a halt sends no merge card"
+
+
+def test_end_conditions_are_checked_in_the_spec_order():
+    """AC-15. Two conditions that land on the same pass have to produce the same
+    reason every time, or the same run reports a different ending depending on
+    which check happened to run first."""
+    sweep = {"yield_floor": 2, "deadline_seconds": 60, "max_items": 2, "detectors": []}
+    past = 999  # seconds elapsed, well past the deadline
+    assert sweep_end_reason([_pass(_det(note="exit 1"))], sweep, past, 0, 0) == \
+        "detectors failed: vulture"
+    assert sweep_end_reason([_pass(_det(count=0))], sweep, past, 0, 0) == \
+        "converged: nothing reported"
+    assert sweep_end_reason([_pass(_det(count=2)), _pass(_det(count=1))],
+                            sweep, past, 1, 0) == \
+        "converged: two passes at or under 2 (2, 1)"
+    busy = _pass(_det(count=9))
+    assert sweep_end_reason([busy], sweep, past, 2, 3) == "deadline reached after 2 items"
+    assert sweep_end_reason([busy], sweep, 0, 2, 3) == "item cap 2 reached"
+    assert sweep_end_reason([busy], sweep, 0, 1, 3) == \
+        "sweep stalled: 3 consecutive items parked"
+    assert sweep_end_reason([busy], sweep, 0, 1, 2) is None
+
+
+def test_a_zero_second_deadline_is_still_a_deadline():
+    """`deadline_seconds` is tested with `is not None`: 0 is a deadline that has
+    already passed, and truthiness would read it as no deadline at all."""
+    sweep = {"yield_floor": 0, "deadline_seconds": 0, "max_items": 40, "detectors": []}
+    assert sweep_end_reason([_pass(_det(count=9))], sweep, 0, 0, 0) == \
+        "deadline reached after 0 items"
+
+
+# ---------- which detector each item comes from ----------
+
+def test_round_robin_skips_empty_detectors_and_continues_from_the_last():
+    """AC-15. One detector's list is often the same corner of the repo every
+    pass, and taking it every time pins the run there while the others go
+    unworked. A detector that reported nothing this pass has nothing to hand
+    over, so it is skipped rather than turned into an empty item."""
+    passes = [_pass(_det(name="a", count=3), _det(name="b", count=0),
+                    _det(name="c", count=2))]
+    fake = ScriptedWorkflow(
+        config=_sweep(max_items=3, detectors=[_cfg_det(n) for n in ("a", "b", "c")]),
+        passes=passes)
+    ledger = drive(fake)
+    assert _detectors_used(ledger) == ["a", "c", "a"]
+
+
+# ---------- what the executor found by hand ----------
+
+def test_extras_ride_on_the_next_item_and_never_move_the_count():
+    """AC-24. The executor may add work and never moves the number the run ends
+    on: an agent that decided when its own job was finished is the thing the
+    engine exists to prevent. A parked item's candidates count too — it looked at
+    the code either way."""
+    fake = ScriptedWorkflow(
+        config=_sweep(max_items=3), passes=[_pass(_det(count=5))],
+        rounds=[dict(GREEN_ROUND, candidates=["x", "y"]),
+                dict(GREEN_ROUND, candidates=["y", "z"]), GREEN_ROUND],
+        checkpoints=[COMMITTED, CAP_REFUSAL, COMMITTED])
+    ledger = drive(fake)
+    first, _second, third = (e["item"] for e in ledger["items"])
+    assert "(none)" in first.splitlines(), "the first item has no extras yet"
+    assert [line for line in third.splitlines() if line in ("x", "y", "z")] == \
+        ["x", "y", "z"]
+    assert [p["total"] for p in ledger["sweep"]["passes"]] == [5, 5, 5, 5]
+    assert ledger["reason"] == "item cap 3 reached", "extras end nothing"
+
+
+def test_only_the_last_twenty_extras_are_carried():
+    """AC-24. They ride in the item text, which lands in the executor prompt and
+    in the auditor's scope block; an unbounded list would push the detector's own
+    candidates out of both."""
+    fake = ScriptedWorkflow(
+        config=_sweep(max_items=2), passes=[_pass(_det(count=5))],
+        rounds=[dict(GREEN_ROUND, candidates=[f"c{i}" for i in range(25)]), GREEN_ROUND])
+    ledger = drive(fake)
+    carried = [line for line in ledger["items"][1]["item"].splitlines()
+               if line.startswith("c")]
+    assert len(carried) == 20
+    assert carried[0] == "c5" and carried[-1] == "c24", "the oldest five are dropped"
+
+
+# ---------- every outcome writes its entry ----------
+
+def test_every_sweep_outcome_writes_its_entry():
+    """AC-22 and AC-23. The entries are what `lg status`, the dashboard and the
+    merge card's parked list all read; an item that finished without writing its
+    own is a row that says `running` after the run is over."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=2), passes=[_pass(_det(count=5))],
+                            checkpoints=[COMMITTED, CAP_REFUSAL])
+    ledger = drive(fake)
+    done, parked = ledger["items"]
+    assert (done["status"], done["commit"], done["net"]) == ("done", "c1", 2)
+    assert parked["status"] == "parked"
+    assert parked["reason"].startswith("checkpoint refused: net lines +")
+    merge = next(c for c in fake.cards if c[0] == "merge-ready")
+    assert "- item 2: Sweep item." in merge[3]
+    assert "net lines +37 exceed the cap of 0" in merge[3]
+
+
+# ---------- the pass is given time to finish ----------
+
+def test_the_discover_timeout_covers_every_detector():
+    """AC-13. The bare sum is not enough: the detector runner polls in 20-second
+    steps and only kills on a step boundary, so a detector with `timeout: 30`
+    dies at 40, and an activity deadline set to the sum would be gone first."""
+    dets = [_cfg_det("a", 300), _cfg_det("b", 30)]
+    fake = ScriptedWorkflow(config=_sweep(detectors=dets), passes=[_pass(_det(count=0))])
+    drive(fake)
+    _name, args, kwargs = _call(fake, "discover")
+    assert args == ["runs/x", "/projects/x", "ab12cd", "base1234"]
+    assert kwargs["start_to_close_timeout"] >= timedelta(seconds=330), "the bare sum"
+    assert kwargs["start_to_close_timeout"] >= timedelta(seconds=330 + 40), \
+        "and the 20-second step each detector's kill is rounded up to"
+    assert kwargs["heartbeat_timeout"] == timedelta(minutes=3)
+    assert kwargs["retry_policy"].maximum_attempts == 2
