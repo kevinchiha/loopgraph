@@ -13,10 +13,12 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tomllib
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
@@ -37,6 +39,14 @@ TEMPORAL_TIMEOUT = 10
 # whatever network the user has, and it is the only thing standing between them
 # and knowing whether there is a release.
 FETCH_TIMEOUT = 60.0
+# The one streamed compose command in `lg update`. Long, because a --build pulls
+# base images and compiles wheels on whatever machine the user has.
+STACK_TIMEOUT = 1800.0
+# Each captured compose read: the `ps` and one log poll.
+POLL_TIMEOUT = 60.0
+# The wait between log polls, named so a test can make it a no-op. Sixty tries
+# two seconds apart is the two minutes a restarted stack gets to say it is up.
+_sleep = asyncio.sleep
 
 
 def _dotenv() -> dict[str, str]:
@@ -474,13 +484,139 @@ async def _open_runs() -> list:
     return [wf async for wf in client.list_workflows('ExecutionStatus = "Running"')]
 
 
-def _changelog(root: str) -> str:
-    """The checkout's CHANGELOG.md, empty when the release did not ship one."""
-    path = os.path.join(root, "CHANGELOG.md")
+def _said(text: str) -> str:
+    """The first line of a command's output worth showing a person.
+
+    Empty when there is nothing to show, which the callers answer for
+    themselves: a streamed command has already put its output on the terminal
+    and has only its exit code left to report.
+    """
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")
+
+
+def _file(path: str) -> str:
+    """A file from the checkout, empty when the release did not ship it."""
     if not os.path.exists(path):
         return ""
     with open(path, encoding="utf-8") as f:
         return f.read()
+
+
+def _changelog(root: str) -> str:
+    """The checkout's CHANGELOG.md, empty when the release did not ship one."""
+    return _file(os.path.join(root, "CHANGELOG.md"))
+
+
+def _dep_name(spec: str) -> str:
+    """The package a dependency string names, without its version or its extras."""
+    for i, ch in enumerate(spec):
+        if ch in ">=<!~ [;":
+            return spec[:i]
+    return spec
+
+
+def _host_deps(pyproject: str) -> list[str]:
+    """What the host venv installs of a release's dependencies.
+
+    claude-agent-sdk is left out: the executor runs inside the worker container,
+    which installs its own copy, and pulling the sdk onto the host would drag in
+    a node runtime nobody on this side uses. A pyproject.toml nothing could read
+    leaves the list empty rather than raising — the refresh is already running
+    after a merge that succeeded.
+    """
+    try:
+        project = tomllib.loads(pyproject).get("project", {})
+    except tomllib.TOMLDecodeError:
+        return []
+    return [d for d in project.get("dependencies", []) if _dep_name(d) != "claude-agent-sdk"]
+
+
+def _refresh_venv(root: str, new_pyproject: str) -> subprocess.CompletedProcess[str]:
+    """Bring the host venv in line with the dependencies the release ships.
+
+    uv when the machine has one, because that is what install.sh built the venv
+    with. The fallback runs `.venv/bin/python -m pip` and never `.venv/bin/pip`:
+    a venv uv built has no pip script in it at all.
+    """
+    if shutil.which("uv"):
+        return _run(["uv", "sync"], root)
+    python = os.path.join(root, ".venv", "bin", "python")
+    deps = _host_deps(new_pyproject)
+    return _run([python, "-m", "pip", "install", "--quiet", "--upgrade", *deps, "pytest"],
+                root)
+
+
+async def _restart_stack(root: str, docker: str, action: str, tag: str) -> int:
+    """Put the running stack on the new code, and wait until it says it is there.
+
+    Every compose command runs from `root`, because compose reads
+    docker-compose.yml from the directory it is called in. The one that changes
+    the stack is streamed, so a --build shows its progress and a `sudo docker`
+    can ask for a password; the reads around it are captured, because their
+    output is what this function is reading.
+    """
+    compose = [*docker.split(), "compose"]
+    listed = _run([*compose, "ps", "--services", "--status", "running"], root,
+                  timeout=POLL_TIMEOUT)
+    if listed.returncode != 0:
+        # Never read as "nothing is running": docker-compose.yml guards its
+        # required settings with ${VAR:?}, which fails every subcommand with an
+        # empty stdout, and exiting 0 here would leave a worker on the old code
+        # under a message saying the stack was down.
+        print(f"compose failed: {_said(listed.stderr)}", file=sys.stderr)
+        return 1
+    if "worker" not in listed.stdout.split():
+        build = " --build" if action == "build" else ""
+        print(f"the stack is not running; start it with: "
+              f"cd {root} && {docker} compose up -d{build}")
+        return 0
+
+    # Taken before the command that changes the stack, so the polls below read
+    # this restart's banners and not the ones from the last time it came up.
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    argv = {
+        "build": [*compose, "up", "-d", "--build", "worker", "dispatcher"],
+        # No --build: compose recreates the containers whose configuration
+        # moved, which is what a docker-compose.yml change needs and what
+        # `restart` — the old container, re-run as it was created — cannot do.
+        "recreate": [*compose, "up", "-d", "worker", "dispatcher"],
+        "restart": [*compose, "restart", "worker", "dispatcher"],
+    }[action]
+    started = _run(argv, root, timeout=STACK_TIMEOUT, stream=True)
+    if started.returncode != 0:
+        reason = _said(started.stderr) or f"exit {started.returncode}"
+        print(f"compose failed: {reason}", file=sys.stderr)
+        return 1
+
+    # What each service prints when it is ready: worker.py's line, and the one
+    # dispatcher.py prints once Telegram has answered it.
+    banners = {"worker": "worker up on task queue", "dispatcher": "dispatcher up"}
+    waiting = list(banners)
+    # Tries with a wait between them rather than a wall-clock deadline, so the
+    # timeout is testable in milliseconds. Sixty of them is the two minutes.
+    for _ in range(60):
+        for service in list(waiting):
+            logs = _run([*compose, "logs", "--since", stamp, service], root,
+                        timeout=POLL_TIMEOUT)
+            if logs.returncode != 0:
+                print(f"compose failed: {_said(logs.stderr)}", file=sys.stderr)
+                return 1
+            if banners[service] in logs.stdout:
+                waiting.remove(service)
+        if not waiting:
+            print(f"now on {tag}")
+            return 0
+        await _sleep(2)
+
+    # No --since here: when the restart never took, that window holds nothing
+    # and "log above" would sit over an empty space. install.sh prints the
+    # unfiltered log at the same moment for the same reason.
+    tail = _run([*compose, "logs", "--tail", "20", "worker", "dispatcher"], root,
+                timeout=POLL_TIMEOUT)
+    print(tail.stdout, end="")
+    print(f"the {' and '.join(waiting)} did not come up after the update (log above)",
+          file=sys.stderr)
+    return 1
 
 
 async def cmd_update(args: argparse.Namespace) -> int:
@@ -569,7 +705,46 @@ async def cmd_update(args: argparse.Namespace) -> int:
     print(f"updated {old} → {tag}")
     notes = version.changelog_between(_changelog(root), old_tag, tag)
     print(notes or f"(no changelog entry for {tag})")
-    return 0
+
+    def shown(path: str) -> str:
+        """That file as the old commit had it, empty when it had none."""
+        done = git("show", f"{old_commit}:{path}")
+        return done.stdout if done.returncode == 0 else ""
+
+    changed = git("diff", "--name-only", old_commit, tag).stdout.splitlines()
+    old_pyproject = shown("pyproject.toml")
+    new_pyproject = _file(os.path.join(root, "pyproject.toml"))
+    # What the stack needs is decided by what moved inside pyproject.toml, never
+    # by its being in the diff: release.sh rewrites its version line every time.
+    action = version.stack_action(changed, old_pyproject, new_pyproject)
+
+    if version.needs_venv(old_pyproject, new_pyproject):
+        refreshed = _refresh_venv(root, new_pyproject)
+        if refreshed.returncode != 0:
+            # The merge already happened, and the stack is deliberately left
+            # alone: a worker restarted onto code the venv cannot import is
+            # worse off than one still running the release before it.
+            reason = _said(refreshed.stderr) or _said(refreshed.stdout)
+            print(f"venv refresh failed: {reason}", file=sys.stderr)
+            return 1
+
+    # The settings check comes after the venv refresh, not before it: install.sh
+    # only builds a venv when there is none, so stopping here first would leave
+    # the host lg short of a dependency this release just started importing.
+    env = _dotenv()
+    docker = env.get("LOOPGRAPH_DOCKER", "docker")
+    keys = version.new_settings(shown(".env.example"),
+                               _file(os.path.join(root, ".env.example")), env)
+    if keys:
+        # Exit 2, and no compose command: the code is on the new release and the
+        # `updated ...` line above says so. What is missing is the user's answer
+        # to a question this release started asking.
+        print(f"new settings since {old}: {', '.join(keys)}. "
+              f"Add them to .env (see .env.example for what each means), "
+              f"then start the stack: cd {root} && {docker} compose up -d")
+        return 2
+
+    return await _restart_stack(root, docker, action, tag)
 
 
 async def cmd_ui(args: argparse.Namespace) -> int:

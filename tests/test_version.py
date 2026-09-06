@@ -639,12 +639,18 @@ def _update(lg, root, monkeypatch, capsys, runner=None) -> tuple[int, str, str]:
 
     Temporal is fenced off unless the test called _temporal: a check that stopped
     running in the right order would otherwise dial the machine's real
-    localhost:7233 instead of failing.
+    localhost:7233 instead of failing. The wait between log polls goes the same
+    way, as a no-op: the poll is sixty tries two seconds apart, and no test has
+    two minutes to spend proving it.
     """
     if not getattr(lg._client, "faked", False):
         async def never_asked():
             raise AssertionError("lg update reached Temporal with no fake client installed")
         monkeypatch.setattr(lg, "_client", never_asked)
+
+    async def no_wait(seconds):
+        pass
+    monkeypatch.setattr(lg, "_sleep", no_wait)
     monkeypatch.setattr(lg, "ROOT", str(root))
     monkeypatch.setattr(lg, "_run", runner if runner is not None else fake_run())
     code = asyncio.run(lg.cmd_update(types.SimpleNamespace()))
@@ -924,3 +930,380 @@ def test_update_never_runs_a_git_command_that_could_lose_work(
     assert git
     assert not [argv for argv in git if argv[1] in ("checkout", "reset", "stash", "pull")]
     assert all("--ff-only" in argv for argv in git if argv[1] == "merge")
+
+
+# ------------------------------------- lg update: the venv, the .env, the stack ---
+
+# Both banners the poll waits for, in one text: worker.py prints the first and
+# dispatcher.py the second, and `compose logs <service>` shows only that
+# service's, so one string answers either poll.
+BANNERS = "worker up on task queue\ndispatcher up\n"
+
+# The three shapes a release commit leaves pyproject.toml in: a floor that
+# moved, the same dependencies under a new version line, and a floor that moved
+# beside the one dependency the host is never asked to install.
+NEW_DEPS = bumped(PYPROJECT.replace("temporalio>=1.15", "temporalio>=1.16"), "0.2.0")
+SAME_DEPS = bumped(PYPROJECT, "0.2.0")
+WITH_SDK = NEW_DEPS.replace('"pyyaml>=6.0",', '"pyyaml>=6.0",\n    "claude-agent-sdk>=0.1",')
+
+
+def _ps(*services: str, code: int = 0, stderr: str = "") -> dict:
+    """What `compose ps --services --status running` answers, as a table entry."""
+    argv = ["docker", "compose", "ps", "--services", "--status", "running"]
+    listed = "".join(f"{s}\n" for s in services)
+    return {tuple(argv): subprocess.CompletedProcess(argv, code, listed, stderr)}
+
+
+def stack_run(table=None, logs: str = BANNERS):
+    """fake_run, plus the one docker read whose argv a test cannot spell out.
+
+    Every log poll carries the timestamp the update took a moment earlier, so no
+    table can name it: any `--since` poll is answered with `logs`, which by
+    default holds both banners and ends the poll on its first try. The closing
+    `--tail` read is not a poll and stays the table's to answer.
+    """
+    inner = fake_run(table)
+
+    def run(argv, cwd, timeout=None, stream=False):
+        done = inner(argv, cwd, timeout, stream)
+        if "logs" in argv and "--since" in argv:
+            return subprocess.CompletedProcess(argv, 0, logs, "")
+        return done
+
+    run.table, run.calls = inner.table, inner.calls
+    return run
+
+
+def _ran(runner, *words: str) -> list[list[str]]:
+    """Every argv the update ran that holds all of these words, in order."""
+    return [argv for argv, _, _, _ in runner.calls if all(w in argv for w in words)]
+
+
+def _behind_a_release(lg, clone_repo, monkeypatch, before: dict, after: dict) -> None:
+    """A checkout on v0.1.0 holding `before`, one release behind a v0.2.0 that
+    changed it to `after`. Temporal answers here too: every test in this section
+    is about what happens after the open-run check, so all of them get past it.
+    """
+    clone_repo.commit("before the release", before)
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", after)
+    _temporal(lg, monkeypatch, ListingClient())
+
+
+def test_update_refreshes_the_venv_with_uv_when_a_dependency_floor_changed(
+        clone_repo, monkeypatch, capsys):
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": NEW_DEPS})
+    monkeypatch.setattr(lg.shutil, "which", lambda name: "/usr/bin/uv")
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[-1] == "now on v0.2.0"
+    assert [(argv, cwd) for argv, cwd, _, _ in runner.calls if argv[0] == "uv"] == [
+        (["uv", "sync"], str(clone_repo.root))]
+
+
+def test_a_version_only_bump_skips_the_venv_and_restarts(clone_repo, monkeypatch, capsys):
+    """release.sh rewrites the version line of every release, so pyproject.toml
+    is in every update's diff. What was installed is what decides, not the path."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": SAME_DEPS})
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[-1] == "now on v0.2.0"
+    assert not [argv for argv, _, _, _ in runner.calls if argv[0] == "uv" or "pip" in argv]
+    assert _ran(runner, "compose", "restart") == [
+        ["docker", "compose", "restart", "worker", "dispatcher"]]
+
+
+def test_the_venv_falls_back_to_python_m_pip_without_claude_agent_sdk(
+        clone_repo, monkeypatch, capsys):
+    """A machine with no uv. `.venv/bin/pip` is not used: a venv uv built has no
+    pip script. claude-agent-sdk is dropped because the host never runs the
+    executor — the worker container does, and it has its own install."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": WITH_SDK})
+    monkeypatch.setattr(lg.shutil, "which", lambda name: None)
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    installed_with = _ran(runner, "pip")
+    assert len(installed_with) == 1
+    assert installed_with[0] == [str(clone_repo.root / ".venv" / "bin" / "python"),
+                                 "-m", "pip", "install", "--quiet", "--upgrade",
+                                 "temporalio>=1.16", "pyyaml>=6.0", "pytest"]
+
+
+def test_a_missing_pip_is_a_venv_refresh_failure_not_a_traceback(
+        clone_repo, monkeypatch, capsys):
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": NEW_DEPS})
+    monkeypatch.setattr(lg.shutil, "which", lambda name: None)
+    python = str(clone_repo.root / ".venv" / "bin" / "python")
+    argv = [python, "-m", "pip", "install", "--quiet", "--upgrade",
+            "temporalio>=1.16", "pyyaml>=6.0", "pytest"]
+    missing = f"[Errno 2] No such file or directory: '{python}'"
+    runner = stack_run({tuple(argv): subprocess.CompletedProcess(argv, 127, "", missing)})
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (1, f"venv refresh failed: {missing}\n")
+
+
+def test_a_venv_refresh_failure_exits_1_after_the_code_moved(
+        clone_repo, monkeypatch, capsys):
+    """The merge already happened, and saying so matters: the checkout is on the
+    new release with an old venv, and the stack must not be restarted onto it."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": NEW_DEPS})
+    monkeypatch.setattr(lg.shutil, "which", lambda name: "/usr/bin/uv")
+    argv = ["uv", "sync"]
+    runner = stack_run({("uv", "sync"): subprocess.CompletedProcess(
+        argv, 1, "", "\nerror: no solution found for temporalio>=1.16\n")})
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (1, "venv refresh failed: error: no solution found "
+                              "for temporalio>=1.16\n")
+    assert out.splitlines()[0] == "updated v0.1.0 → v0.2.0"
+    assert clone_repo.git("rev-parse", "HEAD") == clone_repo.git("rev-parse", "v0.2.0^{commit}")
+    assert not _ran(runner, "compose")
+
+
+def test_the_venv_refresh_runs_before_the_settings_message(clone_repo, monkeypatch, capsys):
+    """Order, read off the exit code: install.sh only builds a venv when there is
+    none, so stopping at the settings message first would leave the host lg
+    missing a dependency it now imports."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT,
+                       ".env.example": "LOOPGRAPH_OLD=1\n"},
+                      {"pyproject.toml": NEW_DEPS,
+                       ".env.example": "LOOPGRAPH_OLD=1\nLOOPGRAPH_NEW=\n"})
+    monkeypatch.setattr(lg.shutil, "which", lambda name: "/usr/bin/uv")
+    argv = ["uv", "sync"]
+    runner = stack_run({("uv", "sync"): subprocess.CompletedProcess(argv, 1, "", "boom\n")})
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (1, "venv refresh failed: boom\n")
+    assert "new settings" not in out
+
+
+def test_new_settings_exit_2_and_never_reach_docker(clone_repo, monkeypatch, capsys):
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT,
+                       ".env.example": "LOOPGRAPH_OLD=1\n"},
+                      {"pyproject.toml": PYPROJECT,
+                       ".env.example": "LOOPGRAPH_OLD=1\nLOOPGRAPH_NEW=\n"})
+    (clone_repo.root / ".env").write_text("LOOPGRAPH_DOCKER=sudo docker\n", encoding="utf-8")
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (2, "")
+    assert out.splitlines() == [
+        "updated v0.1.0 → v0.2.0",
+        "(no changelog entry for v0.2.0)",
+        f"new settings since v0.1.0: LOOPGRAPH_NEW. Add them to .env (see .env.example "
+        f"for what each means), then start the stack: cd {clone_repo.root} "
+        "&& sudo docker compose up -d",
+    ]
+    assert not _ran(runner, "compose")
+
+
+def test_commented_out_example_keys_are_not_new_settings(clone_repo, monkeypatch, capsys):
+    """The example carries the route the user did not take as commented lines.
+    Nagging about those would mean nagging on every single update."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT,
+                       ".env.example": "LOOPGRAPH_OLD=1\n"},
+                      {"pyproject.toml": PYPROJECT,
+                       ".env.example": "LOOPGRAPH_OLD=1\n# ANTHROPIC_API_KEY=sk-ant-...\n"})
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[-1] == "now on v0.2.0"
+
+
+def test_a_key_that_moves_from_commented_to_uncommented_is_a_new_setting(
+        clone_repo, monkeypatch, capsys):
+    """The release just turned that key into a decision the user has to make."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT,
+                       ".env.example": "# LOOPGRAPH_NEW=\n"},
+                      {"pyproject.toml": PYPROJECT,
+                       ".env.example": "LOOPGRAPH_NEW=\n"})
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert code == 2
+    assert out.splitlines()[-1].startswith("new settings since v0.1.0: LOOPGRAPH_NEW.")
+
+
+@pytest.mark.parametrize("changed,tail", [
+    ({"ui.py": "# released\n"}, ""),
+    ({"Dockerfile": "FROM python:3.13-slim\n"}, " --build"),
+])
+def test_a_stack_that_is_not_running_prints_the_start_command(
+        clone_repo, monkeypatch, capsys, changed, tail):
+    """Nothing is restarted, because nothing is up. The user gets the one command
+    that starts it, with the --build a changed image needs."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT, **changed})
+    runner = stack_run(_ps("temporal"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[-1] == (
+        f"the stack is not running; start it with: cd {clone_repo.root} "
+        f"&& docker compose up -d{tail}")
+    assert _ran(runner, "compose") == [
+        ["docker", "compose", "ps", "--services", "--status", "running"]]
+
+
+def test_a_failing_compose_ps_is_compose_failed_not_a_stopped_stack(
+        clone_repo, monkeypatch, capsys):
+    """docker-compose.yml guards every required key with ${VAR:?}, so a missing
+    one fails every subcommand with empty stdout. Reading that as "not running"
+    would leave a worker on the old code and say nothing was up."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT,
+                       "ui.py": "# released\n"})
+    runner = stack_run(_ps(code=1, stderr="\nrequired variable LOOPGRAPH_UID is missing\n"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (1, "compose failed: required variable LOOPGRAPH_UID is missing\n")
+    assert "not running" not in out
+    assert not _ran(runner, "compose", "restart")
+
+
+@pytest.mark.parametrize("changed,expected", [
+    ({"ui.py": "# released\n"}, ["restart", "worker", "dispatcher"]),
+    ({"docker-compose.yml": "services: {}\n"}, ["up", "-d", "worker", "dispatcher"]),
+    ({"Dockerfile": "FROM python:3.13-slim\n"}, ["up", "-d", "--build", "worker", "dispatcher"]),
+])
+def test_restart_recreate_and_build_pick_the_compose_command(
+        clone_repo, monkeypatch, capsys, changed, expected):
+    """A restart re-runs a container with the configuration it was created from,
+    which is exactly what a compose change needs it not to do."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT, **changed})
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[-1] == "now on v0.2.0"
+    assert _ran(runner, "compose", expected[0], "worker") == [["docker", "compose", *expected]]
+
+
+def test_the_stack_command_is_streamed_and_the_reads_are_not(
+        clone_repo, monkeypatch, capsys):
+    """A --build takes minutes and a sudo docker may ask for a password, so that
+    one command gets the terminal. ps and the polls are read, so they are not."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT,
+                       "ui.py": "# released\n"})
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, _, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    compose = [(argv, timeout, stream) for argv, _, timeout, stream in runner.calls
+               if "compose" in argv]
+    assert [(t, s) for argv, t, s in compose if "restart" in argv] == [(1800.0, True)]
+    assert [(t, s) for argv, t, s in compose if "restart" not in argv] == [(60.0, False)] * 3
+
+
+@pytest.mark.parametrize("said,line", [
+    ("", "compose failed: exit 1"),
+    ("Error response from daemon: no such image\n", "compose failed: Error response "
+                                                   "from daemon: no such image"),
+])
+def test_a_failing_stack_command_is_compose_failed(
+        clone_repo, monkeypatch, capsys, said, line):
+    """A streamed command has already put its own output on the terminal, so an
+    empty stderr is the ordinary case and the exit code is what is left to say."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT,
+                       "ui.py": "# released\n"})
+    argv = ["docker", "compose", "restart", "worker", "dispatcher"]
+    table = _ps("worker", "dispatcher")
+    table[tuple(argv)] = subprocess.CompletedProcess(argv, 1, "", said)
+    runner = stack_run(table)
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (1, f"{line}\n")
+    assert not _ran(runner, "logs")
+
+
+def test_now_on_the_tag_once_both_banners_appear(clone_repo, monkeypatch, capsys):
+    """Each service is polled until its own banner shows and not once after, so
+    a worker that came up first is not asked again while the dispatcher starts."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT,
+                       "ui.py": "# released\n"})
+    inner = fake_run(_ps("worker", "dispatcher"))
+    polled: dict[str, int] = {}
+    banner = {"worker": "worker up on task queue", "dispatcher": "dispatcher up"}
+
+    def runner(argv, cwd, timeout=None, stream=False):
+        done = inner(argv, cwd, timeout, stream)
+        if "logs" in argv and "--since" in argv:
+            service = argv[-1]
+            polled[service] = polled.get(service, 0) + 1
+            up = polled[service] >= (2 if service == "worker" else 3)
+            return subprocess.CompletedProcess(argv, 0, banner[service] if up else "", "")
+        return done
+
+    runner.table, runner.calls = inner.table, inner.calls
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[-1] == "now on v0.2.0"
+    assert polled == {"worker": 2, "dispatcher": 3}
+    since = _ran(runner, "logs", "worker")[0]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", since[since.index("--since") + 1])
+
+
+def test_the_poll_times_out_naming_the_service_that_never_came_up(
+        clone_repo, monkeypatch, capsys):
+    """Sixty tries two seconds apart. The closing log has no --since: when the
+    restart did not take, that window is empty and "log above" sits over nothing."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT,
+                       "ui.py": "# released\n"})
+    tail = ["docker", "compose", "logs", "--tail", "20", "worker", "dispatcher"]
+    table = _ps("worker", "dispatcher")
+    table[tuple(tail)] = subprocess.CompletedProcess(
+        tail, 0, "dispatcher  | Traceback (most recent call last)\n", "")
+    inner = fake_run(table)
+
+    def runner(argv, cwd, timeout=None, stream=False):
+        done = inner(argv, cwd, timeout, stream)
+        if "logs" in argv and "--since" in argv:
+            said = "worker up on task queue\n" if argv[-1] == "worker" else ""
+            return subprocess.CompletedProcess(argv, 0, said, "")
+        return done
+
+    runner.table, runner.calls = inner.table, inner.calls
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (
+        1, "the dispatcher did not come up after the update (log above)\n")
+    assert len(_ran(runner, "logs", "--since", "dispatcher")) == 60
+    assert len(_ran(runner, "logs", "--since", "worker")) == 1
+    assert _ran(runner, "logs", "--tail") == [tail]
+    assert out.splitlines()[-1] == "dispatcher  | Traceback (most recent call last)"
