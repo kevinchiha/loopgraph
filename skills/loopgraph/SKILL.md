@@ -21,7 +21,10 @@ lg where                    # engine root, projects dir, docker command
 cd <engine_root> && <docker> compose ps
 ```
 
-- The worker must be `Up`. If not: `<docker> compose up -d`, wait ~10s.
+- The worker **and the dispatcher** must both be `Up`. If not: `<docker> compose
+  up -d`, wait ~10s and look again. Nothing in the stack restarts itself, so a
+  container that died stays dead. A missing dispatcher is the quiet failure:
+  cards still reach the user's phone, and nothing they answer ever comes back.
 - **The target repo must live under `projects_dir`.** That tree is the only thing
   mounted into the container, as `/projects`. If the user's project is somewhere
   else, say so and stop. Do not improvise a mount without asking.
