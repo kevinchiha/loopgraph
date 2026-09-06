@@ -80,3 +80,22 @@ def test_a_candidate_cannot_carry_a_heading():
 def test_the_round_result_carries_candidates():
     """Cleaned at the call site, so nothing downstream ever stores a raw one."""
     assert '"candidates": clean_candidates(' in inspect.getsource(execute_round)
+
+
+def _headings(prompt: str) -> list[str]:
+    return [line for line in prompt.splitlines() if line.startswith("# ")]
+
+
+def test_generated_items_get_the_executor_prompt_a_brief_item_gets():
+    """An item the engine wrote is a work item like any other: same sections in
+    the same order, and the generated text under the work-item heading. Giving
+    one a section of its own would hand the executor a second contract to
+    reconcile with the first."""
+    from workflows.run import build_convergence_item, build_sweep_item
+    plain = assemble_prompt("BRIEF", "C", "Add a --hello flag")
+    generated = [build_sweep_item({"name": "vulture", "count": 2, "lines": ["a", "b"]}, 1, []),
+                 build_convergence_item(["cli.py"])]
+    for item in generated:
+        p = assemble_prompt("BRIEF", "C", item)
+        assert _headings(p) == _headings(plain)
+        assert p.split("# Work item for this round\n\n")[1].strip() == item

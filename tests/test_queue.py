@@ -105,6 +105,18 @@ def test_long_item_text_is_trimmed_so_the_card_still_fits():
     assert "x" * 121 not in out
 
 
+def test_the_merge_summary_says_how_a_sweep_ended():
+    """A sweep stops on a condition rather than on a list running out, so the
+    card has to say which one landed: converged, capped and out of time all
+    reach the owner as the same merge-ready card otherwise."""
+    out = build_merge_summary("did the thing", 4, [], "converged: nothing reported")
+    assert out == "did the thing\n\nsweep ended: converged: nothing reported"
+    parked = build_merge_summary("done", 3, [{"n": 2, "item": "a", "reason": "r"}],
+                                 "item cap 3 reached")
+    assert "NOT in this branch" in parked
+    assert parked.endswith("\n\nsweep ended: item cap 3 reached")
+
+
 # ---------- an executor that commits its own work ----------
 
 import asyncio

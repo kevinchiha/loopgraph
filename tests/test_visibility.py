@@ -91,6 +91,13 @@ def test_location_line_between_items():
     assert location_line(2, 3) == "item 2 of 3"
 
 
+def test_location_line_without_a_total():
+    """AC-26. A sweep builds its items as it goes, so there is no total to count
+    towards, and `item 7 of 7` would tell the owner the run is on its last one."""
+    assert location_line(7, None) == "item 7"
+    assert location_line(7, None, 2) == "item 7 · round 2"  # U+00B7 between
+
+
 def test_a_card_whose_summary_starts_with_a_location_still_routes():
     """The line goes in the summary, under the headers, so routing still reads
     the id back out of the card."""

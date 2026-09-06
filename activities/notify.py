@@ -40,15 +40,17 @@ def build_card_text(kind: str, wf_id: str, run_dir: str, summary: str,
     return "\n".join(lines)[:4000]  # telegram message cap is 4096
 
 
-def location_line(item_no: int, total: int, round_no: int | None = None) -> str:
+def location_line(item_no: int, total: int | None, round_no: int | None = None) -> str:
     """Where in a run a card speaks from, e.g. `item 2 of 3 · round 2`.
 
     A multi-item run sends several cards that otherwise read alike, and the
     owner cannot tell which item is asking. Cards sent between items or at the
-    end have no round to name, so they get the short form. The one place this
-    format lives, so every card reads the same.
+    end have no round to name, so they get the short form. A sweep builds its
+    items as it goes and passes no total, because `item 7 of 7` would say the
+    run is on its last one when nothing yet knows how many there are. The one
+    place this format lives, so every card reads the same.
     """
-    where = f"item {item_no} of {total}"
+    where = f"item {item_no}" if total is None else f"item {item_no} of {total}"
     return f"{where} · round {round_no}" if round_no is not None else where
 
 

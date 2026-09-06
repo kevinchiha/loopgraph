@@ -127,18 +127,73 @@ def audit_failure_reason(e: BaseException) -> str:
     return " <- ".join(parts)[:AUDIT_REASON_CAP]
 
 
-def build_merge_summary(summary: str, total: int, parked: list[dict]) -> str:
+def build_merge_summary(summary: str, total: int, parked: list[dict],
+                        ended: str | None = None) -> str:
     """The merge card's text when some items did not make it.
 
     Says plainly what merging does and does not include, because the one thing
-    the owner must not think is that a green card means everything got done."""
-    if not parked:
-        return summary
-    lines = "\n".join(f"- item {e['n']}: {str(e['item'])[:120]} ({e['reason']})" for e in parked)
-    kept = total - len(parked)
-    return (f"{summary}\n\nParked, NOT in this branch:\n{lines}\n\n"
-            f"Merging takes the {kept} item(s) that passed. The parked ones need "
-            f"another run.")
+    the owner must not think is that a green card means everything got done. A
+    sweep also says which condition stopped it: converged, out of items and out
+    of time all arrive as the same merge-ready card otherwise.
+    """
+    text = summary
+    if parked:
+        lines = "\n".join(f"- item {e['n']}: {str(e['item'])[:120]} ({e['reason']})" for e in parked)
+        kept = total - len(parked)
+        text = (f"{summary}\n\nParked, NOT in this branch:\n{lines}\n\n"
+                f"Merging takes the {kept} item(s) that passed. The parked ones need "
+                f"another run.")
+    return f"{text}\n\nsweep ended: {ended}" if ended else text
+
+
+def build_convergence_item(files: list[str]) -> str:
+    """The removal item the engine writes for itself once a run has added enough.
+
+    Nobody wrote this item by hand, so the text is the whole instruction: what
+    the executor may not do, how the cap is measured, which files the last
+    accepted items touched, and what to do when there is genuinely nothing to
+    remove. It says "net lines", not "net production lines", because the engine
+    counts every staged line: a text that excluded tests would invite the
+    executor to buy its removals back with new ones.
+    """
+    return "\n".join([
+        "Convergence item. No new behaviour, no new files, no new public surface.",
+        "Net lines for this item must be at or under zero; the engine measures it with",
+        "git diff --numstat over every staged line, tests included, and refuses the",
+        "commit if it is not.",
+        "Look at what the last items added:",
+        *files,
+        "Remove dead code, merge duplicates you introduced, delete anything with no consumer.",
+        "Every gate stays green. If there is genuinely nothing to remove, change no file and",
+        "say in your claims what you checked and why each thing stays.",
+    ])
+
+
+def build_sweep_item(detector: dict, pass_no: int, extras: list[str]) -> str:
+    """One sweep item: what a detector reported, and what to do about it.
+
+    The count and the sample both come from the detector entry, so they cannot
+    disagree. They are different numbers on purpose: a detector reports
+    everything it found and hands over only the first few, and an executor told
+    the sample was the list would think the job was nearly done. `extras` are
+    things an earlier item found by hand; they get worked, but no detector
+    counts them, so the text says they do not move the run's end.
+    """
+    lines = detector["lines"]
+    return "\n".join([
+        f"Sweep item. Detector `{detector['name']}` (pass {pass_no}) reported "
+        f"{detector['count']} candidates. The first",
+        f"{len(lines)} follow, one per line, printed from the repo root:",
+        *lines,
+        "Take the largest safe family of these that shares one behaviour claim, one write set",
+        "and one gate. Remove or merge it. Leave the rest for a later item. Net lines for",
+        "this item must be at or under zero; the engine measures it and refuses the commit",
+        "if it is not. Every gate stays green.",
+        "Also reported by an earlier item, not by a detector (work them if they are real; they do",
+        "not count toward the run's end):",
+        *(extras or ["(none)"]),
+        "Register anything you find by hand under `candidates` in your output.",
+    ])
 
 
 @workflow.defn
