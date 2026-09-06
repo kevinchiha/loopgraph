@@ -23,6 +23,10 @@ runs/*/worktrees/
 runs/*/logs/
 runs/*/target/
 
+# Playwright MCP drops console logs and screenshots here whenever a browser is
+# driven from this directory. Scratch, and it carries whatever site was open.
+.playwright-mcp/
+
 # docs/ is a scratch pad: phase specs, plans, gap reports, and the generated
 # architecture diagram. They are how a change got built, not part of the engine,
 # and they run to megabytes of machine-generated text nobody reads. Kept on disk,
