@@ -4,15 +4,19 @@ Here for the reason `envfile.py` is here: `lg` has no `.py` extension, so
 nothing can import from it, and both the command and the dashboard need the same
 answer to "is there a newer release than this checkout".
 
-Every rule in this module is a function over text — a tag name, the changelog,
-two `pyproject.toml` texts, two `.env.example` texts — so the awkward cases can
-be tested against the file shapes the repo really produces without a repository
-to run them in.
+Most of it is a function over text — a tag name, the changelog, two
+`pyproject.toml` texts, two `.env.example` texts — so the awkward cases can be
+tested against the file shapes the repo really produces without a repository to
+run them in. The two that do read git, `installed` and `remote_newest`, take the
+checkout to read as an argument and run every command with `cwd=root`, so
+nothing in here decides where the checkout is.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import tomllib
 from collections.abc import Iterable
 
@@ -169,3 +173,67 @@ def is_behind(installed: str | None, latest: str | None) -> bool:
         return False
     here = parse_version(installed) if installed else None
     return here is None or there > here
+
+
+class RemoteError(Exception):
+    """Why the remote could not be asked what it has, in one line for a person."""
+
+
+def _git(root: str | os.PathLike, argv: list[str],
+         timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    """One git command in `root`, which never raises on a non-zero exit.
+
+    check=True is deliberately absent, because every caller below has its own
+    answer to a failure: a checkout with no tag is not an error, a directory that
+    is not a checkout is not one either, and the remote read wants git's own
+    message rather than a CalledProcessError nobody would want to read.
+    """
+    return subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=timeout)
+
+
+def installed(root: str | os.PathLike) -> dict:
+    """What this checkout is: its nearest release tag, its commit, its distance.
+
+    `ahead` is the commits HEAD has past that tag, which is what tells a checkout
+    sitting on a release apart from one someone has been committing to since.
+
+    Nothing here raises. `lg version` prints this and the dashboard's header
+    shows it, and neither has anywhere useful to put an exception; a tree
+    unpacked from an archive rather than cloned answers None to both names.
+    """
+    described = _git(root, ["git", "describe", "--tags", "--abbrev=0", "--match", "v*"])
+    tag = described.stdout.strip() if described.returncode == 0 else None
+    head = _git(root, ["git", "rev-parse", "--short", "HEAD"])
+    commit = head.stdout.strip() if head.returncode == 0 else None
+    ahead = 0
+    if tag is not None:
+        counted = _git(root, ["git", "rev-list", "--count", f"{tag}..HEAD"])
+        if counted.returncode == 0:
+            ahead = int(counted.stdout)
+    return {"tag": tag, "commit": commit, "ahead": ahead}
+
+
+def remote_newest(root: str | os.PathLike, timeout: float) -> str | None:
+    """The highest release tag origin has, or None when it has none yet.
+
+    ls-remote rather than the GitHub API: it needs no token and no rate limit,
+    and it answers from the same remote the update would fetch from. It is also
+    the only thing in this module that touches the network, which is why it is
+    the only one with a deadline — a host that swallows packets keeps git waiting
+    until the TCP stack gives up, and one caller is a dashboard thread.
+    """
+    try:
+        listed = _git(root, ["git", "ls-remote", "--tags", "--refs", "origin"], timeout)
+    except subprocess.TimeoutExpired:
+        raise RemoteError(f"timed out after {timeout:g}s") from None
+    if listed.returncode != 0:
+        said = next((ln.strip() for ln in listed.stderr.splitlines() if ln.strip()), "")
+        raise RemoteError(said or f"git ls-remote exited {listed.returncode}")
+    tags = []
+    for line in listed.stdout.splitlines():
+        # <hash><tab><ref> per line, and --refs has already dropped the peeled
+        # `^{}` entry an annotated tag would otherwise add beside its own.
+        columns = line.split()
+        if len(columns) > 1:
+            tags.append(columns[1].removeprefix("refs/tags/"))
+    return newest(tags)

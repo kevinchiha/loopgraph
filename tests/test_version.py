@@ -1,30 +1,39 @@
 """The rules `lg version`, `lg update` and the dashboard all read releases by.
 
-Everything here is a pure function over text: a tag name, a changelog, two
-`pyproject.toml` texts, two `.env.example` texts. Nothing runs git. The point of
-keeping the rules here rather than inside the commands is that a rule the user
-can hit — "does this update need a rebuild", "is this key new" — can be tested
-against the exact file shapes the repo really produces, and there is only ever
-one copy of it.
+Most of it is pure functions over text: a tag name, a changelog, two
+`pyproject.toml` texts, two `.env.example` texts. The point of keeping those
+rules here rather than inside the commands is that a rule the user can hit —
+"does this update need a rebuild", "is this key new" — can be tested against the
+exact file shapes the repo really produces, and there is only ever one copy of
+it.
+
+The last section is the two that do run git, `installed` and `remote_newest`.
+Those are tested against a real repository with a real origin, both under
+tmp_path, because what they have to get right is git's own output and exit codes.
 """
 
 from __future__ import annotations
 
 import inspect
+import re
+import subprocess
 
 import pytest
 
 import version
 from envfile import parse_env, read_env
 from version import (
+    RemoteError,
     changelog_between,
     changelog_has,
     deps_changed,
+    installed,
     is_behind,
     needs_venv,
     new_settings,
     newest,
     parse_version,
+    remote_newest,
     stack_action,
 )
 
@@ -297,3 +306,86 @@ def test_behind_is_the_ordering_of_the_two_triples():
     assert is_behind("v0.4.0", "v0.5.0") is True
     assert is_behind("v0.5.0", "v0.5.0") is False
     assert is_behind("v0.10.0", "v0.9.0") is False
+
+
+# ------------------------------------------------------------- what git says ---
+
+def test_installed_on_an_untagged_clone(clone_repo):
+    """Every checkout cloned before the first release looks like this."""
+    here = installed(clone_repo.root)
+    assert here["tag"] is None
+    assert here["ahead"] == 0
+    assert re.fullmatch(r"[0-9a-f]{7}", here["commit"])
+
+
+def test_installed_names_the_nearest_v_tag_and_counts_commits_past_it(clone_repo):
+    """`lg version` prints `v0.1.0 +2 commits`, so both halves have to be right,
+    and a tag that is not a release must become neither of them."""
+    clone_repo.tag("v0.1.0")
+    clone_repo.commit("second", {"a.txt": "a\n"})
+    clone_repo.commit("third", {"b.txt": "b\n"})
+    clone_repo.tag("release-1")
+    here = installed(clone_repo.root)
+    assert here["tag"] == "v0.1.0"
+    assert here["ahead"] == 2
+
+
+def test_installed_on_a_directory_that_is_not_a_repository(tmp_path):
+    """A tree unpacked from an archive instead of cloned. `lg version` still has
+    to print something about it, so nothing here may raise."""
+    unpacked = tmp_path / "unpacked"
+    unpacked.mkdir()
+    assert installed(unpacked) == {"tag": None, "commit": None, "ahead": 0}
+
+
+def test_remote_newest_picks_the_highest_tag_on_origin_not_the_local_one(clone_repo):
+    """The release a user is offered has to be one they can actually fetch, and
+    the comparison is the one a string sort gets wrong: v0.10.0 beats v0.9.0."""
+    clone_repo.tag("v0.9.0")
+    clone_repo.commit("second", {"a.txt": "a\n"})
+    clone_repo.tag("v0.10.0")
+    clone_repo.push()
+    clone_repo.commit("third", {"b.txt": "b\n"})
+    clone_repo.tag("v1.0.0")  # made here, never pushed: nobody else can fetch it
+    assert remote_newest(clone_repo.root, 10) == "v0.10.0"
+
+
+def test_remote_newest_is_none_when_origin_has_no_tags(clone_repo):
+    """A repository that has never released. Silence, not an error."""
+    assert remote_newest(clone_repo.root, 10) is None
+
+
+def test_remote_newest_raises_with_gits_first_stderr_line(clone_repo, tmp_path):
+    """An origin nobody can reach: offline, moved, or a URL that never worked.
+    The message is printed on one line beside `latest:`, so it has to be one."""
+    clone_repo.git("remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    with pytest.raises(RemoteError) as raised:
+        remote_newest(clone_repo.root, 10)
+    assert "does not appear to be a git repository" in str(raised.value)
+    assert "\n" not in str(raised.value)
+
+
+def test_remote_newest_raises_on_timeout(clone_repo, monkeypatch):
+    """git against an unreachable host waits for the TCP stack to give up, which
+    is minutes. The dashboard's checker gets a message in ten seconds instead."""
+    passed = {}
+
+    def times_out(argv, **kwargs):
+        passed.update(kwargs)
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(version.subprocess, "run", times_out)
+    with pytest.raises(RemoteError, match="timed out after 10s"):
+        remote_newest(clone_repo.root, 10)
+    assert passed["timeout"] == 10, "the deadline never reached git itself"
+
+
+def test_remote_newest_names_the_exit_code_when_git_said_nothing(clone_repo, monkeypatch):
+    """git usually explains itself, but this message is shown to a person, and an
+    empty one would print `latest: unknown ()`."""
+    def quiet_failure(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 128, "", "")
+
+    monkeypatch.setattr(version.subprocess, "run", quiet_failure)
+    with pytest.raises(RemoteError, match="git ls-remote exited 128"):
+        remote_newest(clone_repo.root, 10)
