@@ -97,7 +97,7 @@ grinding.
 
 ## What you need
 
-Docker with the Compose v2 plugin, Python 3.13+, a way to reach Claude, and a
+Docker with the Compose v2 plugin, Python 3.13+, a way to reach a model, and a
 Telegram bot.
 
 The bot is not decoration. A run stops and asks you things, and the engine refuses
@@ -107,29 +107,29 @@ the installer does the rest.
 
 For the model, you have two routes:
 
-- **CLIProxyAPI plus a Claude subscription (recommended).**
-  [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) runs locally, signs in
-  with the subscription you already pay for, and speaks the Anthropic API. A single
-  run can spend three executor rounds plus an audit pass, so per-token billing adds
-  up faster than you would guess.
-- **A plain Anthropic API key.** Simpler to start, metered.
+- **CLIProxyAPI plus a subscription you already pay for (recommended).**
+  [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) runs on your machine,
+  signs in with a subscription you already hold, and answers in the format the
+  engine speaks. Which providers and models that covers is CLIProxyAPI's business,
+  not this project's. A single run can spend three executor rounds plus an audit
+  pass, so per-token billing adds up faster than you would guess.
+- **A plain API key.** Simpler to start, metered.
 
 ## Install
 
 Installing this means wiring it to your machine: where your repos live, how you
-reach Claude, whether Docker needs `sudo` here, which uid the container has to
+reach a model, whether Docker needs `sudo` here, which uid the container has to
 write as. A coding agent can look all of that up and ask you about the rest, so
 that is the supported path.
 
-Paste this into Claude Code, or any coding agent that reads files and runs
-commands. It works from an empty directory; the agent clones the repo itself.
+Paste this into any coding agent that reads files and runs commands. It works from an empty directory; the agent clones the repo itself.
 
 ```
 Install loopgraph from https://github.com/kevinchiha/loopgraph.
 Clone it, then follow INSTALL_WITH_AGENT.md in the repo.
 ```
 
-It asks where your repos live, how you reach Claude, and walks you through
+It asks where your repos live, how you reach a model, and walks you through
 @BotFather. Then it runs `./install.sh` with your answers and proves the install by
 driving the example run to a decision. Read
 [INSTALL_WITH_AGENT.md](INSTALL_WITH_AGENT.md) if you want to know exactly what it

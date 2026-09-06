@@ -88,20 +88,21 @@ PROJECTS="$(ask "Your projects directory" "${PREV_PROJECTS:-$HOME/projects}")"
 PROJECTS="${PROJECTS/#\~/$HOME}"
 [ -d "$PROJECTS" ] || { mkdir -p "$PROJECTS"; echo "  created $PROJECTS"; }
 
-say "How the engine talks to Claude"
+say "How the engine reaches a model"
 cat <<'TXT'
-  1) CLIProxyAPI with a Claude subscription  (recommended)
-     Runs locally, signs in with your existing subscription, speaks the Anthropic
-     API. A run can spend three executor rounds plus an audit pass, so metered
-     billing adds up fast. https://github.com/router-for-me/CLIProxyAPI
-  2) A plain Anthropic API key
+  1) CLIProxyAPI with a subscription you already pay for  (recommended)
+     Runs on your machine, signs in with that subscription, and answers in the
+     format the engine speaks, so which provider is behind it is CLIProxyAPI's
+     business. A run can spend three executor rounds plus an audit pass, so
+     metered billing adds up fast. https://github.com/router-for-me/CLIProxyAPI
+  2) A plain API key, straight to the Anthropic endpoint
      Simpler to start, billed per token.
 TXT
 ROUTE="$(ask "Route (1 or 2)" "$([ -n "$PREV_KEY" ] && echo 2 || echo 1)")"
 MODEL="$(ask "Model id" "${PREV_MODEL:-claude-opus-5}")"
 AUTH_LINES=""
 if [ "$ROUTE" = "2" ]; then
-  KEY="$(ask_secret "  Anthropic API key" "$PREV_KEY")"
+  KEY="$(ask_secret "  API key" "$PREV_KEY")"
   AUTH_LINES="ANTHROPIC_API_KEY=$KEY"
 else
   BASE="$(ask "CLIProxyAPI base url" "${PREV_BASE:-http://127.0.0.1:8317}")"

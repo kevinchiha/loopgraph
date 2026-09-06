@@ -1,7 +1,7 @@
 # Installing loopgraph
 
-This is the supported install path. Paste this into Claude Code, or any coding
-agent that reads files and runs commands. It works from an empty directory:
+This is the supported install path. Paste this into any coding agent that reads
+files and runs commands. It works from an empty directory:
 
 > Install loopgraph from https://github.com/kevinchiha/loopgraph.
 > Clone it, then follow INSTALL_WITH_AGENT.md in the repo.
@@ -31,11 +31,13 @@ tree and can reach nothing outside it, so every repo you want the engine to work
 on has to live under it. Default `~/projects`. Say this constraint out loud when
 you ask, because it decides where they put future projects.
 
-**How you reach Claude.** Two routes:
+**How you reach a model.** Two routes:
 
-- CLIProxyAPI with a Claude subscription. Ask for the base URL (usually
-  `http://127.0.0.1:8317`) and its local api-key. Recommended.
-- A plain Anthropic API key.
+- CLIProxyAPI with a subscription they already pay for. It runs on their machine
+  and answers in the format the engine speaks, so which provider is behind it is
+  CLIProxyAPI's business. Ask for the base URL (usually `http://127.0.0.1:8317`)
+  and its local api-key. Recommended.
+- A plain API key, straight to the Anthropic endpoint.
 
 Tell them why it matters, in one line: a single run can spend three executor
 rounds plus an audit pass, so per-token billing adds up faster than they expect.
