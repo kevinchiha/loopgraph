@@ -301,6 +301,18 @@ def test_activity_argument_counts_are_pinned():
     assert len(_args(note)) == 7
 
 
+def test_the_audit_and_the_checkpoint_are_told_what_kind_of_item_this_is():
+    """AC-7 and AC-36, pinned where a live run replays them. `kind` and `max_net`
+    go on the end of the argument lists they already had, because a run waiting
+    at a card replays this workflow from recorded history and an argument that
+    moved would replay as a different call."""
+    src = _flat(_method("_run_item"))
+    assert ('args=[run_dir, result, round_no, item_no, work_item, '
+            'len(self._ledger["items"]), kind],') in src
+    assert ('args=[run_dir, result["worktree"], result["files"], round_no, '
+            'result["summary"], item_no, max_net],') in src
+
+
 def test_owner_question_stays_bare():
     """AC-22. The location line is card furniture; `owner-answers.md` and the
     round entry keep the supervisor's question exactly as it was asked."""

@@ -79,6 +79,11 @@ class _FakeWorkflow:
         name = fn.__name__
         if name in self._fails:
             raise self._fails[name]
+        if name == "load_run_config":
+            # AC-1's defaults: what a run with no run.yaml gets. The catch-all
+            # below answers `{"sent": True}`, which is not a config.
+            return {"convergence": {"enabled": True, "every_items": 5, "net_lines": 400},
+                    "sweep": None}
         if name == "run_baseline":
             return "base1234"
         if name == "load_work_items":

@@ -16,6 +16,7 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from activities.audit import audit
     from activities.checkpoint import checkpoint, discard, merge
+    from activities.config import load_run_config
     from activities.execute_round import execute_round, run_baseline
     from activities.gate import run_gates
     from activities.items import load_work_items
@@ -127,6 +128,27 @@ def audit_failure_reason(e: BaseException) -> str:
     return " <- ".join(parts)[:AUDIT_REASON_CAP]
 
 
+def config_error_reason(e: BaseException) -> str:
+    """Why the run cannot start, in the words run.yaml's own checker used.
+
+    The ActivityError on top says "Activity task failed", which is no help to
+    anyone about to edit a file; the line naming the offending key is on
+    `__cause__`, wrapped as an ApplicationError. Anything else that can go wrong
+    scheduling the activity has no such line, so it is reported whole.
+    """
+    cur: BaseException | None = e
+    seen = 0
+    while cur is not None and seen < 4:  # bounded: __cause__ chains can cycle
+        # Temporal keeps the raw message on `.message`; str() prepends the type
+        # the activity raised, which would push `run.yaml:` off the front.
+        text = " ".join((getattr(cur, "message", None) or str(cur)).split())
+        if text.startswith("run.yaml:"):
+            return text
+        cur = cur.__cause__
+        seen += 1
+    return audit_failure_reason(e)
+
+
 def build_merge_summary(summary: str, total: int, parked: list[dict],
                         ended: str | None = None) -> str:
     """The merge card's text when some items did not make it.
@@ -208,6 +230,9 @@ class LoopGraphRun:
     def __init__(self) -> None:
         self._ledger: dict = {"status": "running", "items": [], "rounds": [], "checkpoint": None}
         self._target_repo: str = ""
+        # run.yaml, read once before anything else runs. The convergence knobs and
+        # the sweep block both live here.
+        self._config: dict = {}
         self._decisions: list[str] = []
         # The last checkpoint this run committed. Rounds reset to it rather than to
         # HEAD, so a commit the executor made during a failed attempt can never
@@ -223,6 +248,22 @@ class LoopGraphRun:
         a park immediately and their reply is picked up before the next item.
         """
         self._target_repo = target_repo
+        # run.yaml first, and once. A knob the schema does not know is an error,
+        # not a default taken quietly, and finding it after the baseline would
+        # mean the run had already started work on a config nobody could trust.
+        # Retrying would only ask the same broken file the same question.
+        try:
+            self._config = await workflow.execute_activity(
+                load_run_config,
+                args=[run_dir],
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except Exception as e:  # noqa: BLE001 - a broken run.yaml ends the run, cleanly
+            reason = config_error_reason(e)
+            self._ledger.update(status="stopped", reason=reason)
+            await self._stopped_note(run_dir, reason, None, None)
+            return self._ledger
         # Capture the starting commit before anything runs, so the very first round
         # already has a baseline to reset to rather than trusting HEAD.
         self._base_commit = await workflow.execute_activity(
@@ -239,7 +280,9 @@ class LoopGraphRun:
         )
         if not items:
             items = [work_item or ""]  # no work-items section: the whole brief, one item
-        self._ledger["items"] = [{"n": i, "item": it, "status": "pending"}
+        # The kind is set when the entry is made, not when it finishes: an entry
+        # with no kind while it runs is one the dashboard cannot label.
+        self._ledger["items"] = [{"n": i, "item": it, "status": "pending", "kind": "brief"}
                                  for i, it in enumerate(items, start=1)]
 
         carried: str | None = None   # an owner reply, handed to the next item
@@ -292,13 +335,20 @@ class LoopGraphRun:
         return workflow.info().workflow_id.rsplit("-", 1)[-1][:12]
 
     async def _run_item(self, run_dir: str, target_repo: str, work_item: str,
-                        item_no: int, carried: str | None) -> dict:
+                        item_no: int, carried: str | None, kind: str = "brief") -> dict:
         """One work item: rounds until the supervisor accepts, or it is parked.
 
         Returns accepted (with the result and its checkpoint), parked (the run
         carries on to the next item), or halt (the supervisor said stop, which is
-        the one verdict that ends the whole run)."""
+        the one verdict that ends the whole run).
+
+        `kind` says what sort of item this is. The auditor is told, because the
+        supervisor sees only what the prompt hands it and would otherwise judge a
+        removal item as a feature. The checkpoint is told as a number: a sweep or
+        convergence item may not grow the repo, and the engine measures that
+        rather than asking."""
         directive = carried
+        max_net = 0 if kind in ("sweep", "convergence") else None
         spent = 0       # executor passes charged to the correction budget
         asks = 0        # owner questions, which are not charged to it
         round_no = 0    # every pass, for the ledger and the log file names
@@ -341,7 +391,7 @@ class LoopGraphRun:
                 verdict = await workflow.execute_activity(
                     audit,
                     args=[run_dir, result, round_no, item_no, work_item,
-                          len(self._ledger["items"])],
+                          len(self._ledger["items"]), kind],
                     start_to_close_timeout=timedelta(minutes=30),
                     heartbeat_timeout=timedelta(minutes=3),
                     retry_policy=RetryPolicy(maximum_attempts=2),
@@ -363,10 +413,16 @@ class LoopGraphRun:
             entry["verdict_reasons"] = verdict["reasons"]
 
             if verdict["verdict"] == "accept":
+                if kind == "convergence" and not result["files"]:
+                    # The one item allowed to finish having changed nothing: the
+                    # auditor looked and agreed there was nothing left to remove.
+                    # Checkpoint would park it on `empty write set`, which would
+                    # end a clean run as a failed one.
+                    return {"status": "accepted", "result": result, "checkpoint": None}
                 cp = await workflow.execute_activity(
                     checkpoint,
                     args=[run_dir, result["worktree"], result["files"], round_no,
-                          result["summary"], item_no],
+                          result["summary"], item_no, max_net],
                     start_to_close_timeout=timedelta(minutes=45),  # gate re-run may be a full build
                     heartbeat_timeout=timedelta(minutes=3),
                     retry_policy=RetryPolicy(maximum_attempts=2),
@@ -377,6 +433,9 @@ class LoopGraphRun:
                 if not cp["committed"]:
                     return {"status": "parked",
                             "reason": f"checkpoint refused: {cp['reason']}"}
+                # Convergence fires on lines added since the last removal item, so
+                # the number has to survive the round it was measured in.
+                entry["net"] = cp["net"]
                 # Best effort, and it runs AFTER the commit. Letting it raise
                 # failed the whole workflow over a distilled sentence, throwing
                 # away a run whose work was already safely on the branch.
@@ -530,7 +589,7 @@ class LoopGraphRun:
         return value.upper() if allowed else value
 
     async def _ask_owner(self, run_dir: str, question: str, options: dict,
-                         item_no: int, total: int, round_no: int) -> str:
+                         item_no: int, total: int | None, round_no: int) -> str:
         """Supervisor `ask`: a question the owner answers by button, text or signal.
 
         The location line is prefixed here, not inside _await_decision, so the
@@ -547,7 +606,7 @@ class LoopGraphRun:
         return await self._await_decision(run_dir, "decision", summary, None,
                                           options, accept_text=True)
 
-    async def _park_note(self, run_dir: str, item_no: int, total: int,
+    async def _park_note(self, run_dir: str, item_no: int, total: int | None,
                          item: str, reason: str) -> None:
         """Tell the owner an item was parked. Does not wait: the run has already
         moved on to the next item, and their reply is picked up between items."""
@@ -559,13 +618,17 @@ class LoopGraphRun:
         await self._note(run_dir, "parked", text)
 
     async def _stopped_note(self, run_dir: str, reason: str,
-                            item_no: int, total: int) -> None:
+                            item_no: int | None, total: int | None) -> None:
         """Tell the owner a run ended. A stop used to return silently, so nobody
         was told the run was over, and any items already committed sat on a branch
-        nobody knew about."""
+        nobody knew about.
+
+        A run that ended before any item ran has nowhere to speak from and gets no
+        location line: `item 0 of 0` is a wrong answer to where the run is."""
         done = [e for e in self._ledger["items"] if e["status"] == "done"]
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
-        lines = [location_line(item_no, total), "",
+        where = [location_line(item_no, total), ""] if item_no is not None else []
+        lines = [*where,
                  f"why: {reason}", "",
                  f"{len(done)} item(s) committed, {len(parked)} parked."]
         if done:
