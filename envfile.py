@@ -11,6 +11,32 @@ from __future__ import annotations
 import os
 
 
+def parse_env(text: str) -> dict[str, str]:
+    """The settings in the text of a .env file, read the way compose reads it.
+
+    Split out of read_env because not every .env-shaped text comes from a file:
+    `lg update` compares the .env.example of two commits, and the older one
+    arrives from `git show` as a string with no path to open.
+    """
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip().removeprefix("export ").strip()
+        v = v.strip()
+        # Match what compose does with the same file. Quotes are stripped
+        # before the comment cut is even considered, so a quoted value keeps
+        # a `#` that belongs to it.
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        elif " #" in v:
+            v = v.split(" #", 1)[0].strip()
+        out[k] = v
+    return out
+
+
 def read_env(path: str | os.PathLike) -> dict[str, str]:
     """The settings in one .env file, read the way compose reads the same file.
 
@@ -18,23 +44,7 @@ def read_env(path: str | os.PathLike) -> dict[str, str]:
     Nothing else is consulted — no os.environ, no defaults. What a missing key
     means is the caller's to decide.
     """
-    out: dict[str, str] = {}
     if not os.path.exists(path):
-        return out
+        return {}
     with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip().removeprefix("export ").strip()
-            v = v.strip()
-            # Match what compose does with the same file. Quotes are stripped
-            # before the comment cut is even considered, so a quoted value keeps
-            # a `#` that belongs to it.
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-                v = v[1:-1]
-            elif " #" in v:
-                v = v.split(" #", 1)[0].strip()
-            out[k] = v
-    return out
+        return parse_env(fh.read())
