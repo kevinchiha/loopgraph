@@ -4,17 +4,27 @@ The tests that drive a run swap the `workflow` module for the ScriptedWorkflow i
 `tests/workflow_fake.py`, so they say what a run would actually do rather than
 what the file reads like. A driven run ends `held`, not `merge-ready`: the fake
 answers the merge card with `B`.
+
+The last section is copy: what the skill, `AGENTS.md` and the README teach about
+sweeps, and whether the example the skill hands people to paste really parses.
 """
 
 from __future__ import annotations
 
+import textwrap
 from datetime import timedelta
+from pathlib import Path
+
+import pytest
 
 from activities.audit import assemble_audit_prompt
+from activities.config import parse_run_config
 from activities.execute_round import clean_candidates
 from workflow_fake import (ACCEPT, COMMITTED, DEFAULT_CONFIG, GREEN_ROUND, START,
                            ScriptedWorkflow, drive)
 from workflows.run import build_sweep_item, sweep_end_reason
+
+ROOT = Path(__file__).resolve().parent.parent
 
 DETECTOR = {"name": "vulture", "cmd": "vulture .", "exit_code": 0, "count": 12,
             "lines": ["cli.py:12: unused function 'greet'",
@@ -446,3 +456,59 @@ def test_the_discover_timeout_covers_every_detector():
         "and the 20-second step each detector's kill is rounded up to"
     assert kwargs["heartbeat_timeout"] == timedelta(minutes=3)
     assert kwargs["retry_policy"].maximum_attempts == 2
+
+
+# ---------- what the skill and the docs teach ----------
+
+WORK_ITEMS_RULE = ("A sweep brief must not carry a `## Work items` heading; "
+                   "the detectors are the work list.")
+
+
+@pytest.mark.parametrize("doc, phrase", [
+    ("skills/loopgraph/SKILL.md", "## Sweep runs"),
+    ("skills/loopgraph/SKILL.md", "yield_floor"),
+    ("skills/loopgraph/SKILL.md", "one candidate per line"),
+    ("skills/loopgraph/SKILL.md", "enabled: false"),
+    ("skills/loopgraph/SKILL.md", WORK_ITEMS_RULE),
+    ("AGENTS.md", "comes from `discover`"),
+    ("AGENTS.md", "net zero"),
+    ("README.md", "**Sweep**"),
+    ("README.md", "**Detector**"),
+    ("README.md", "**Convergence item**"),
+])
+def test_the_docs_teach_sweeps(doc, phrase):
+    """AC-32. The skill is what an agent in another project reads before it
+    writes a run dir, so a rule that lives only in the engine's code is a rule
+    nobody follows. `## Work items` on its own proves nothing here: step 1's
+    example brief already shows one, so the whole sentence forbidding it in a
+    sweep is what the assertion asks for. Every document is compared with its
+    whitespace collapsed, because that sentence wraps across two lines and the
+    rule is the wording, not the line breaks."""
+    text = " ".join((ROOT / doc).read_text().split())
+    assert phrase in text, f"{doc} never says {phrase!r}"
+
+
+def sweep_example() -> str:
+    """The `run.yaml` block from the skill's `## Sweep runs` section.
+
+    Read from the heading down, because the first ```yaml fence in the file is
+    the gates example, a bare list that `parse_run_config` refuses at the top
+    level. Dedented for the same reason the whole test exists: this block is
+    what people paste into their own run dir, so it has to parse as it stands.
+    """
+    text = (ROOT / "skills/loopgraph/SKILL.md").read_text()
+    body = text.split("## Sweep runs", 1)[1].split("```yaml", 1)[1].split("```", 1)[0]
+    return textwrap.dedent(body)
+
+
+def test_the_skill_example_parses_as_a_sweep(tmp_path):
+    """AC-32. The example carries comments on the same lines as the keys, and a
+    block that only reads well is a block that costs somebody a refused run."""
+    run_yaml = tmp_path / "run.yaml"
+    run_yaml.write_text(sweep_example())
+    config = parse_run_config(run_yaml.read_text())
+    assert config["convergence"]["enabled"] is True
+    sweep = config["sweep"]
+    assert [d["name"] for d in sweep["detectors"]] == ["vulture", "ts-prune"]
+    assert sweep["deadline_seconds"] == 345600, "4d"
+    assert (sweep["yield_floor"], sweep["max_items"]) == (3, 40)

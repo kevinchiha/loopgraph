@@ -63,6 +63,13 @@ do. Everything machine-specific comes from `.env`, which `install.sh` writes.
 **Nothing under `runs/` gets committed** except the named examples in
 `.gitignore`. Real runs hold the user's work, sometimes a client's.
 
+**The yield number comes from `discover` and nowhere else.** A sweep ends when the
+detectors stop reporting, never when the executor says it is done; the
+`candidates` it reports ride along to the next item and move no count. And a
+convergence or sweep item's commit is refused by `checkpoint_write_set` when the
+staged diff is above net zero, tests included. Both are code. The prompts only
+tell the models the checks exist, so they do not duplicate them.
+
 ## Checks
 
 ```bash
