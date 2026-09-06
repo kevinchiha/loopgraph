@@ -95,6 +95,38 @@ def budget_spent(spent: int, asks: int) -> str | None:
     return None
 
 
+AUDIT_REASON_CAP = 300  # chars of failure text on the card and in the ledger
+
+
+def audit_failure_reason(e: BaseException) -> str:
+    """Why the audit activity died, in one line the owner can act on.
+
+    ActivityError's own message is "Activity task failed" and says nothing; what
+    actually happened is on `__cause__`. For a timeout that is the deadline's
+    name, and the name is the whole diagnosis. HEARTBEAT means the model session
+    went quiet, because `stream_query` pings on every streamed message and only
+    silence stops them. START_TO_CLOSE means the opposite: the auditor streamed
+    the entire half hour and never closed with a verdict packet. Opposite bugs
+    wanting opposite fixes, so the string has to say which one happened.
+    """
+    parts: list[str] = []
+    cur: BaseException | None = e
+    while cur is not None and len(parts) < 4:  # bounded: __cause__ chains can cycle
+        name = type(cur).__name__
+        # Temporal's TimeoutError carries the deadline on `.type`; an
+        # ApplicationError's `.type` is a plain string with no `.name`.
+        deadline = getattr(getattr(cur, "type", None), "name", "")
+        text = " ".join(str(cur).split())
+        if deadline:
+            parts.append(f"{name} {deadline}")
+        elif text:
+            parts.append(f"{name}: {text}")
+        else:
+            parts.append(name)
+        cur = cur.__cause__
+    return " <- ".join(parts)[:AUDIT_REASON_CAP]
+
+
 def build_merge_summary(summary: str, total: int, parked: list[dict]) -> str:
     """The merge card's text when some items did not make it.
 
@@ -250,14 +282,28 @@ class LoopGraphRun:
                 return {"status": "parked",
                         "reason": "gates red after the correction cap"}
 
-            verdict = await workflow.execute_activity(
-                audit,
-                args=[run_dir, result, round_no, item_no, work_item,
-                      len(self._ledger["items"])],
-                start_to_close_timeout=timedelta(minutes=30),
-                heartbeat_timeout=timedelta(minutes=3),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
+            try:
+                verdict = await workflow.execute_activity(
+                    audit,
+                    args=[run_dir, result, round_no, item_no, work_item,
+                          len(self._ledger["items"])],
+                    start_to_close_timeout=timedelta(minutes=30),
+                    heartbeat_timeout=timedelta(minutes=3),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            # An auditor that cannot produce a verdict parks the item, the way a
+            # red gate and a refused checkpoint already do. Letting it raise was
+            # the one failure in this loop that killed the whole run: the ledger
+            # was never written on the way out, so the `ledger` query — which
+            # Temporal still answers for a closed workflow — went on saying
+            # `running` long after the run was dead, and no card ever went out.
+            except Exception as e:  # noqa: BLE001 - the item is lost, the run is not
+                why = audit_failure_reason(e)
+                # Without this the round keeps reading as `audit running` in
+                # `lg status`, which is the line the owner checks first.
+                entry["verdict"] = "audit failed"
+                entry["verdict_reasons"] = [why]
+                return {"status": "parked", "reason": f"audit failed: {why}"}
             entry["verdict"] = verdict["verdict"]
             entry["verdict_reasons"] = verdict["reasons"]
 
