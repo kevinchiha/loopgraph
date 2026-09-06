@@ -621,15 +621,30 @@ class ListingClient:
         return gen()
 
 
-def _temporal(lg, monkeypatch, client) -> None:
-    """Point lg at a Temporal that is not there. Nothing here opens a connection."""
+def _temporal(lg, monkeypatch, answer) -> None:
+    """What Temporal does when lg update asks: hand back this client, raise this
+    exception, or, for None, never answer at all. Nothing here opens a socket."""
     async def connect():
-        return client
+        if answer is None:
+            await asyncio.Event().wait()
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    connect.faked = True
     monkeypatch.setattr(lg, "_client", connect)
 
 
 def _update(lg, root, monkeypatch, capsys, runner=None) -> tuple[int, str, str]:
-    """`lg update` against a checkout under tmp_path, as (code, stdout, stderr)."""
+    """`lg update` against a checkout under tmp_path, as (code, stdout, stderr).
+
+    Temporal is fenced off unless the test called _temporal: a check that stopped
+    running in the right order would otherwise dial the machine's real
+    localhost:7233 instead of failing.
+    """
+    if not getattr(lg._client, "faked", False):
+        async def never_asked():
+            raise AssertionError("lg update reached Temporal with no fake client installed")
+        monkeypatch.setattr(lg, "_client", never_asked)
     monkeypatch.setattr(lg, "ROOT", str(root))
     monkeypatch.setattr(lg, "_run", runner if runner is not None else fake_run())
     code = asyncio.run(lg.cmd_update(types.SimpleNamespace()))
@@ -745,6 +760,17 @@ def test_update_refuses_when_the_fetch_hangs(clone_repo, monkeypatch, capsys):
     assert deadlines == [_lg().FETCH_TIMEOUT]
 
 
+def test_a_fetch_that_failed_silently_still_names_a_reason(clone_repo, monkeypatch, capsys):
+    """`refuse: could not reach origin: ` with nothing after the colon is not an
+    answer, so the exit code stands in when git said nothing."""
+    quiet = subprocess.CompletedProcess(["git", "fetch", "--tags", "--quiet", "origin"],
+                                        128, "", "")
+    runner = fake_run({("git", "fetch", "--tags", "--quiet", "origin"): quiet})
+    code, _, err = _update(_lg(), clone_repo.root, monkeypatch, capsys, runner)
+    assert code == 1
+    assert err == "refuse: could not reach origin: git fetch exited 128\n"
+
+
 def test_update_refuses_when_origin_has_no_releases(clone_repo, monkeypatch, capsys):
     code, out, err = _update(_lg(), clone_repo.root, monkeypatch, capsys)
     assert (code, out) == (1, "")
@@ -752,30 +778,23 @@ def test_update_refuses_when_origin_has_no_releases(clone_repo, monkeypatch, cap
 
 
 def test_already_on_the_newest_tag_never_reaches_temporal(clone_repo, monkeypatch, capsys):
+    """No _temporal here on purpose: asking about a checkout that is already
+    there would hit _update's fence and fail."""
     lg = _lg()
     clone_repo.tag("v0.1.0")
     clone_repo.push()
-
-    async def refuse_to_connect():
-        raise AssertionError("Temporal was asked about a checkout that is already there")
-    monkeypatch.setattr(lg, "_client", refuse_to_connect)
-
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
     assert (code, out, err) == (0, "already on v0.1.0\n", "")
 
 
 def test_already_past_the_newest_tag_reports_how_far(clone_repo, monkeypatch, capsys):
-    """A maintainer's checkout, mid-phase. It is not offered a move backwards."""
+    """A maintainer's checkout, mid-phase. It is not offered a move backwards,
+    and it does not reach Temporal either: _update's fence proves that."""
     lg = _lg()
     clone_repo.tag("v0.1.0")
     clone_repo.push()
     clone_repo.commit("after the release", {"one.txt": "1\n"})
     clone_repo.commit("and another", {"two.txt": "2\n"})
-
-    async def refuse_to_connect():
-        raise AssertionError("Temporal was asked about a checkout that is already past")
-    monkeypatch.setattr(lg, "_client", refuse_to_connect)
-
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
     assert (code, out, err) == (0, "already past v0.1.0 (HEAD is 2 commits ahead)\n", "")
 
@@ -790,15 +809,13 @@ def test_update_refuses_when_temporal_cannot_be_reached_or_hangs(
                     "Start the stack so lg update can check for open runs.\n")
     was = clone_repo.git("rev-parse", "HEAD")
 
-    async def connection_refused():
-        raise OSError("[Errno 111] Connection refused")
-    monkeypatch.setattr(lg, "_client", connection_refused)
+    _temporal(lg, monkeypatch, OSError("[Errno 111] Connection refused"))
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
     assert (code, out, err) == (1, "", cannot_reach)
 
-    async def never_answers():
-        await asyncio.Event().wait()
-    monkeypatch.setattr(lg, "_client", never_answers)
+    # A server that accepts the connection and then says nothing: the deadline is
+    # the only thing that ends this, and the user reads the same line either way.
+    _temporal(lg, monkeypatch, None)
     monkeypatch.setattr(lg, "TEMPORAL_TIMEOUT", 0.05)
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
     assert (code, out, err) == (1, "", cannot_reach)
@@ -852,10 +869,13 @@ def test_update_fast_forwards_and_prints_the_changelog_slice(
     _temporal(lg, monkeypatch, ListingClient())
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
     assert (code, err) == (0, "")
-    assert out.splitlines() == ["updated v0.1.0 → v0.2.0",
-                                "## 0.2.0 - 2026-09-07",
-                                "",
-                                "- the newest thing"]
+    # The first four lines and no more: what follows the changelog is what the
+    # update does next, and this test is about the move and the notes.
+    assert out.splitlines()[:4] == ["updated v0.1.0 → v0.2.0",
+                                    "## 0.2.0 - 2026-09-07",
+                                    "",
+                                    "- the newest thing"]
+    assert "the first thing" not in out
     assert clone_repo.git("rev-parse", "HEAD") == clone_repo.git("rev-parse", "v0.2.0^{commit}")
 
 
@@ -869,8 +889,8 @@ def test_update_says_when_the_tag_has_no_changelog_entry(clone_repo, monkeypatch
     _temporal(lg, monkeypatch, ListingClient())
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
     assert (code, err) == (0, "")
-    assert out.splitlines() == ["updated v0.1.0 → v0.2.0",
-                                "(no changelog entry for v0.2.0)"]
+    assert out.splitlines()[:2] == ["updated v0.1.0 → v0.2.0",
+                                    "(no changelog entry for v0.2.0)"]
 
 
 def test_update_refuses_a_diverged_main_and_moves_nothing(clone_repo, monkeypatch, capsys):

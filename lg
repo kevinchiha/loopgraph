@@ -517,7 +517,11 @@ async def cmd_update(args: argparse.Namespace) -> int:
     fetched = git("fetch", "--tags", "--quiet", "origin", timeout=FETCH_TIMEOUT)
     if fetched.returncode != 0:
         said = next((ln.strip() for ln in fetched.stderr.splitlines() if ln.strip()), "")
-        print(f"refuse: could not reach origin: {said}", file=sys.stderr)
+        # A git that failed silently still has to say something, the way
+        # version.remote_newest falls back for the same case: a refusal whose
+        # reason is the empty string tells the user nothing at all.
+        reason = said or f"git fetch exited {fetched.returncode}"
+        print(f"refuse: could not reach origin: {reason}", file=sys.stderr)
         return 1
 
     tag = version.newest(git("tag", "--list", "v*").stdout.split())
