@@ -167,6 +167,105 @@ def test_no_card_says_lg_approve_is_the_only_way(lg):
     assert line not in lg.format_status({"status": "running", "awaiting": awaiting})
 
 
+# ---------- the kind word and the sweep section ----------
+
+def test_a_non_brief_item_prints_its_kind(lg):
+    """AC-28. A removal item and a detector's item read exactly like the items
+    the owner wrote, so nothing says which of them the engine made up. An entry
+    from a run older than `kind` has no key at all, and those runs were briefs."""
+    out = lg.format_status({"status": "running", "items": [
+        {"n": 1, "item": "one", "status": "done", "commit": "3f2a1b0c9d5e",
+         "kind": "convergence"},
+        {"n": 2, "item": "two", "status": "parked", "reason": "gates red",
+         "kind": "sweep"},
+        {"n": 3, "item": "three", "status": "pending", "kind": "brief"},
+        {"n": 4, "item": "four", "status": "pending"},
+    ]}).splitlines()
+    assert "  1 done convergence 3f2a1b0c9d" in out
+    assert "  2 parked sweep gates red" in out
+    assert "  3 pending" in out
+    assert "  4 pending" in out
+
+
+def test_the_sweep_section_sits_between_items_and_rounds(lg):
+    """AC-28, the whole printout. The passes are the only thing that says whether
+    a sweep is getting anywhere, so they sit under the items they produced and
+    above the rounds that produced them."""
+    ledger = {
+        "status": "stopped",
+        "reason": "item cap 2 reached",
+        "items": [
+            {"n": 1, "item": "sweep one", "status": "done", "commit": "c1abc23456",
+             "kind": "sweep"},
+            {"n": 2, "item": "sweep two", "status": "parked", "kind": "sweep",
+             "reason": "checkpoint refused: empty write set"},
+        ],
+        "sweep": {
+            "passes": [
+                {"pass": 1, "total": 12, "complete": True,
+                 "detectors": [{"name": "vulture", "note": ""}]},
+                {"pass": 2, "total": 3, "complete": False,
+                 "detectors": [{"name": "vulture", "note": ""},
+                               {"name": "ts-prune", "note": "timeout after 600s"}]},
+            ],
+            "ended": "item cap 2 reached",
+        },
+        "rounds": [{"item_no": 1, "round": 1, "status": "green", "verdict": "accept"}],
+    }
+    assert lg.format_status(ledger) == "\n".join([
+        "status: stopped",
+        "reason: item cap 2 reached",
+        "",
+        "items:",
+        "  1 done sweep c1abc23456",
+        "  2 parked sweep checkpoint refused: empty write set",
+        "",
+        "sweep:",
+        "  pass 1: 12 candidates",
+        "  pass 2: 3 candidates (incomplete: ts-prune)",
+        "  ended: item cap 2 reached",
+        "",
+        "rounds:",
+        "  item 1 round 1 accept",
+        "",
+    ])
+
+
+def test_the_sweep_section_renders_from_sweep_lines(lg):
+    """The dashboard prints these same lines and cannot import them: `lg` has no
+    extension, so `ui.py` cannot read this dict and its own copy is checked
+    against it instead. Every line here is one of these templates, or the page
+    and the terminal go on saying different things about the same pass."""
+    assert set(lg.SWEEP_LINES) == {"pass", "pass_incomplete", "ended", "none"}
+    ledger = {"status": "running", "sweep": {
+        "passes": [{"pass": 1, "total": 12, "complete": True,
+                    "detectors": [{"name": "vulture", "note": ""}]},
+                   {"pass": 2, "total": 3, "complete": False,
+                    "detectors": [{"name": "vulture", "note": "exit 1"},
+                                  {"name": "ts-prune", "note": "timeout after 600s"},
+                                  {"name": "ruff", "note": ""}]}],
+        "ended": "converged: nothing reported"}}
+    lines = lg.format_status(ledger).splitlines()
+    assert "  " + lg.SWEEP_LINES["pass"].format(n=1, k=12) in lines
+    assert "  " + lg.SWEEP_LINES["pass_incomplete"].format(
+        n=2, k=3, names="vulture, ts-prune") in lines, "only the detectors that failed"
+    assert "  " + lg.SWEEP_LINES["ended"].format(
+        reason="converged: nothing reported") in lines
+
+
+def test_no_sweep_key_prints_no_section(lg):
+    """A brief run has no `sweep` key and neither has any ledger from before this
+    phase. An empty section on either is a heading about nothing."""
+    assert "sweep" not in lg.format_status({"status": "merged", "items": [], "rounds": []})
+
+
+def test_no_passes_yet(lg):
+    """The gap between the ledger growing its sweep block and the first pass
+    coming back. A bare heading there reads as a sweep that found nothing."""
+    out = lg.format_status({"status": "running", "sweep": {"passes": [], "ended": None}})
+    assert "sweep:\n  " + lg.SWEEP_LINES["none"] in out
+
+
 # ---------- which workflow a slug names ----------
 
 def test_an_exact_id_wins_without_a_lookup(lg):

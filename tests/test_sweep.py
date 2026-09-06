@@ -275,7 +275,7 @@ def test_a_halt_in_a_sweep_stops_the_run_and_records_why():
     assert ledger["sweep"]["ended"] == ledger["reason"]
     assert [e["status"] for e in ledger["items"]] == ["done", "parked"]
     stopped = next(c for c in fake.cards if c[0] == "run stopped")
-    assert stopped[3].startswith("item 2 of 2")
+    assert stopped[3].startswith("item 2\n\nwhy: supervisor said stop")
     assert [c[0] for c in fake.cards] == ["run stopped"], "a halt sends no merge card"
 
 
@@ -376,6 +376,59 @@ def test_every_sweep_outcome_writes_its_entry():
     assert "- item 2: Sweep item." in merge[3]
     assert "net lines +37 exceed the cap of 0" in merge[3]
 
+
+# ---------- where a sweep's cards speak from ----------
+
+ASK = {"verdict": "ask", "reasons": ["the brief does not say"],
+       "directive": {"action": "which port should the health check use?"},
+       "options": {"A": "8400", "B": "9000"}}
+
+
+def test_sweep_cards_carry_the_short_location():
+    """AC-26. A sweep builds its items as it goes, so there is no total to count
+    towards, and every card would otherwise say the run was on its last item.
+
+    One run, all three notes: the first item asks the owner something, the cap
+    refusal parks it and the two after it, and three in a row stops the sweep.
+    """
+    fake = ScriptedWorkflow(config=_sweep(), passes=[_pass(_det(count=5))],
+                            verdicts=[ASK, ACCEPT], checkpoints=[CAP_REFUSAL])
+    drive(fake)
+    assert [c[0] for c in fake.cards] == \
+        ["decision", "parked", "parked", "parked", "run stopped"]
+    assert fake.cards[0][3].startswith("item 1 \u00b7 round 1\n\nwhich port")
+    assert fake.cards[2][3].startswith("item 2 parked\n\nSweep item.")
+    assert fake.cards[-1][3].startswith("item 3\n\nwhy: sweep stalled")
+
+
+def test_the_sweep_merge_card_says_how_it_ended():
+    """AC-27. Converged, out of items and out of time all arrive as the same
+    merge-ready card, and without the line the owner cannot tell which one this
+    is. The ledger keeps the card's own string, so the page and `lg status` show
+    the ending with nothing rebuilding it."""
+    fake = ScriptedWorkflow(config=_sweep(yield_floor=2),
+                            passes=[_pass(_det(count=10)), _pass(_det(count=2)),
+                                    _pass(_det(count=1))])
+    drive(fake)
+    text, awaiting = next((c[3], a) for c, a in zip(fake.cards, fake.awaiting_when_sent)
+                          if c[0] == "merge-ready")
+    assert text.startswith("item 2\n\n")
+    assert text.endswith("\n\nsweep ended: converged: two passes at or under 2 (2, 1)")
+    assert awaiting["question"] == text
+
+
+def test_brief_cards_are_unchanged():
+    """AC-26. The short form is the sweep's alone. A brief run knows how many
+    items it has before the first one runs, and every card still counts them."""
+    fake = ScriptedWorkflow(items=["one", "two", "three"], verdicts=[ASK, ACCEPT],
+                            rounds=[GREEN_ROUND, GREEN_ROUND,
+                                    dict(GREEN_ROUND, status="escalated"), GREEN_ROUND])
+    drive(fake)
+    texts = {c[0]: c[3] for c in fake.cards}
+    assert texts["decision"].startswith("item 1 of 3 \u00b7 round 1")
+    assert texts["parked"].startswith("item 2 of 3 parked")
+    assert texts["merge-ready"].startswith("item 3 of 3\n\ndid the thing")
+    assert "sweep ended" not in texts["merge-ready"]
 
 # ---------- the pass is given time to finish ----------
 

@@ -109,6 +109,19 @@ def _round_verdict(entry: dict) -> str:
     return {"escalated": "escalated", "green": "audit running"}.get(entry.get("status"), "")
 
 
+# The sweep section's copy, in one dictionary because the dashboard prints the
+# same lines and cannot share them: `lg` has no extension, so `ui.py` cannot
+# import from it. A test reads these templates, strips the placeholders and
+# looks for the fixed text on the page, which is the only thing holding the
+# terminal and the browser to the same words.
+SWEEP_LINES = {
+    "pass": "pass {n}: {k} candidates",
+    "pass_incomplete": "pass {n}: {k} candidates (incomplete: {names})",
+    "ended": "ended: {reason}",
+    "none": "(no passes yet)",
+}
+
+
 def format_status(ledger: dict) -> str:
     """A run's ledger as something readable in a terminal.
 
@@ -150,10 +163,35 @@ def format_status(ledger: dict) -> str:
             detail = str(entry.get("commit") or "")[:10]
         elif entry.get("status") == "parked":
             detail = str(entry.get("reason") or "")
-        items.append(f"  {entry.get('n', '')} {entry.get('status', '')} {detail}".rstrip())
+        # A removal item and a detector's item are the engine's own work, and
+        # nothing else on the line says so. An entry from a run older than `kind`
+        # has no key: those runs had brief items and nothing else.
+        kind = entry.get("kind", "brief")
+        word = "" if kind == "brief" else f"{kind} "
+        items.append(f"  {entry.get('n', '')} {entry.get('status', '')} "
+                     f"{word}{detail}".rstrip())
     if len(items) == 1:
         items.append("  (none yet)")
     sections.append(items)
+
+    sweep = ledger.get("sweep") or {}
+    if sweep:
+        block = ["sweep:"]
+        passes = sweep.get("passes") or []
+        for p in passes:
+            # Only a detector that failed carries a note, and a failed one counts
+            # zero whatever it printed, which is what makes the pass incomplete.
+            # The names are the owner's answer to which tool to go and fix.
+            names = ", ".join(d.get("name", "") for d in p.get("detectors") or []
+                              if d.get("note"))
+            key = "pass" if p.get("complete") else "pass_incomplete"
+            block.append("  " + SWEEP_LINES[key].format(
+                n=p.get("pass", ""), k=p.get("total", ""), names=names))
+        if not passes:
+            block.append("  " + SWEEP_LINES["none"])
+        if sweep.get("ended"):
+            block.append("  " + SWEEP_LINES["ended"].format(reason=sweep["ended"]))
+        sections.append(block)
 
     rounds = ["rounds:"]
     for entry in ledger.get("rounds") or []:

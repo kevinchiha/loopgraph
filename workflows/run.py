@@ -483,7 +483,6 @@ class LoopGraphRun:
                      "kind": "sweep"}
             self._ledger["items"].append(entry)
             items_run += 1
-            total = len(self._ledger["items"])
             outcome = await self._run_item(run_dir, target_repo, item, items_run,
                                            carried, "sweep")
             carried = None
@@ -498,12 +497,12 @@ class LoopGraphRun:
                 # Not one of the five end conditions, but it is still why the
                 # sweep ended, and that is the one key `lg status` reads.
                 self._ledger["sweep"]["ended"] = outcome["reason"]
-                await self._stopped_note(run_dir, outcome["reason"], items_run, total)
+                await self._stopped_note(run_dir, outcome["reason"], items_run, None)
                 return self._ledger
             else:
                 entry.update(status="parked", reason=outcome["reason"])
                 parked_streak += 1
-                await self._park_note(run_dir, items_run, total, item, outcome["reason"])
+                await self._park_note(run_dir, items_run, None, item, outcome["reason"])
             # A parked item read the code too, so its candidates count. They are
             # text for the next item and nothing else: counting them would hand
             # the executor the number the run ends on.
@@ -530,8 +529,7 @@ class LoopGraphRun:
             # nowhere to speak from; `item 0 of 0` is a wrong answer to where the
             # run is.
             if items_run:
-                await self._stopped_note(run_dir, reason, items_run,
-                                         len(self._ledger["items"]))
+                await self._stopped_note(run_dir, reason, items_run, None)
             else:
                 await self._stopped_note(run_dir, reason, None, None)
             return self._ledger
@@ -680,8 +678,13 @@ class LoopGraphRun:
                 d = verdict["directive"]
                 question = d.get("action", "Supervisor needs an owner decision")
                 options = verdict.get("options") or {}
+                # A sweep counts nothing towards a total: it builds its items
+                # as it goes, and `item 7 of 7` would say the run was on its
+                # last one every time it asked. The auditor still gets the
+                # integer above, which is a list length and not a total.
+                total = None if "sweep" in self._ledger else len(self._ledger["items"])
                 reply = await self._ask_owner(run_dir, question, options, item_no,
-                                              len(self._ledger["items"]), round_no)
+                                              total, round_no)
                 entry["owner_question"] = question
                 entry["owner_reply"] = reply
                 # Write it where the AUDITOR can read it. The supervisor never sees
@@ -882,11 +885,17 @@ class LoopGraphRun:
                           parked: list[dict] | None = None) -> None:
         """Merge-ready: hold at a safe no-change state until the owner decides."""
         total = len(self._ledger["items"])
+        # A sweep has no total to count towards and stops on a condition rather
+        # than on a list running out, so its card says which condition: converged,
+        # out of items and out of time arrive as this same card otherwise.
+        is_sweep = "sweep" in self._ledger
         # The last item is where the run finished, so that is where this speaks
         # from. Location line plus merge summary, parked list included, is exactly
         # what the owner saw, and the page prints it back as it is.
-        summary = location_line(total, total) + "\n\n" + build_merge_summary(
-            result["summary"], total, parked or [])
+        where = location_line(total, None if is_sweep else total)
+        summary = where + "\n\n" + build_merge_summary(
+            result["summary"], total, parked or [],
+            ended=self._ledger["sweep"]["ended"] if is_sweep else None)
         letter = await self._await_decision(
             run_dir, "merge-ready", summary, cp["commit"],
             {"A": "merge into " + (result["base_branch"] or "base") + " (local, no push)",
