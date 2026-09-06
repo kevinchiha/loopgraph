@@ -877,7 +877,7 @@ def test_the_workflow_captures_a_baseline_before_the_first_round():
 
     from workflows.run import LoopGraphRun
     src = inspect.getsource(LoopGraphRun.run)
-    before_loop = src.split("for i, item in enumerate")[0]
+    before_loop = src.split("while True:")[0]
     assert "run_baseline" in before_loop, "no baseline is captured before the run starts"
     assert "self._base_commit = await workflow.execute_activity" in before_loop
 

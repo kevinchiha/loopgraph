@@ -334,13 +334,18 @@ def test_the_workflow_module_reads_no_clock_env_or_disk():
 
 def test_the_all_parked_note_names_the_last_item():
     """AC-20's `item 3 of 3` case: nothing was accepted, so the run speaks from
-    the item it finished on. A halt speaks from the item it stopped on."""
+    the item it finished on. A halt speaks from the item it stopped on.
+
+    The count is a variable now that the run can inject a convergence item of its
+    own, so the tail has to read it again: `total` left over from the last
+    iteration would name a list one item shorter than the one that ran."""
     src = _method("run")
     all_parked = _flat(src.split("if accepted is None:")[1])
+    assert 'total = len(self._ledger["items"])' in all_parked
     assert ('_stopped_note(run_dir, "every work item was parked", '
-            'len(items), len(items))') in all_parked
+            'total, total)') in all_parked
     halt = _flat(src.split('elif outcome["status"] == "halt":')[1].split("else:")[0])
-    assert '_stopped_note(run_dir, outcome["reason"], i, len(items))' in halt
+    assert '_stopped_note(run_dir, outcome["reason"], n, total)' in halt
 
 
 def test_a_long_question_is_cut_on_the_card_and_kept_whole_in_the_ledger(monkeypatch):

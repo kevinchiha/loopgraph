@@ -289,23 +289,68 @@ class LoopGraphRun:
         accepted: dict | None = None  # last accepted round result, for the final card
         checkpoint_result: dict | None = None
 
-        for i, item in enumerate(items, start=1):
-            entry = self._ledger["items"][i - 1]
+        conv = self._config["convergence"]
+        queue = list(items)          # the brief's items, taken from the front
+        n = 0                        # items executed, and the number the next one gets
+        items_since = 0              # accepted brief items since the last removal pass
+        net_since = 0                # net lines those items committed
+        touched: list[str] = []      # every path they wrote
+
+        while True:
+            # Before the next brief item AND after the last one, which is the same
+            # branch: a five-item brief that added 600 lines needs its removal pass
+            # after item 5, or the rule skips exactly the run it exists for.
+            if conv["enabled"] and (items_since >= conv["every_items"]
+                                    or net_since >= conv["net_lines"]):
+                kind = "convergence"
+                item = build_convergence_item(sorted(set(touched)))
+                entry = {"n": n + 1, "item": item, "status": "pending", "kind": kind}
+                # It takes the position it runs in, and the pending items after it
+                # move up. Appending it with the next free number would put
+                # `item 6 of 6` on a card mid-run, which reads as the run going
+                # backwards; the dashboard keys rows on `n` and re-patches their
+                # text, so renumbering pending rows loses nothing.
+                self._ledger["items"].insert(n, entry)
+                for later in self._ledger["items"][n + 1:]:
+                    later["n"] += 1
+            elif not queue:
+                break
+            else:
+                kind = "brief"
+                item = queue.pop(0)
+                entry = self._ledger["items"][n]
+            total = len(self._ledger["items"])
+            n += 1
             entry["status"] = "running"
-            outcome = await self._run_item(run_dir, target_repo, item, i, carried)
+            outcome = await self._run_item(run_dir, target_repo, item, n, carried, kind)
             carried = None
             if outcome["status"] == "accepted":
-                entry["status"] = "done"
-                entry["commit"] = outcome["checkpoint"].get("commit")
-                accepted, checkpoint_result = outcome["result"], outcome["checkpoint"]
+                cp = outcome["checkpoint"]
+                if cp is None:
+                    # A convergence item the auditor accepted with an empty write
+                    # set: there was nothing left to remove. It committed nothing,
+                    # so the merge card must go on naming the last real checkpoint.
+                    entry.update(status="done", commit=None, note="nothing to remove")
+                else:
+                    entry["status"] = "done"
+                    entry["commit"] = cp.get("commit")
+                    accepted, checkpoint_result = outcome["result"], cp
+                    if kind == "brief":
+                        items_since += 1
+                        net_since += cp.get("net", 0)
+                        touched.extend(cp["files"])
             elif outcome["status"] == "halt":
                 entry.update(status="parked", reason=outcome["reason"])
                 self._ledger.update(status="stopped", reason=outcome["reason"])
-                await self._stopped_note(run_dir, outcome["reason"], i, len(items))
+                await self._stopped_note(run_dir, outcome["reason"], n, total)
                 return self._ledger
             else:
                 entry.update(status="parked", reason=outcome["reason"])
-                await self._park_note(run_dir, i, len(items), item, outcome["reason"])
+                await self._park_note(run_dir, n, total, item, outcome["reason"])
+            if kind == "convergence":
+                # The pass happened, whatever came of it. Carrying the counters on
+                # would inject the next one immediately and every item after it.
+                items_since, net_since, touched = 0, 0, []
 
             # Anything the owner sent while that item ran is steering for the next
             # one. It is already in workflow state: the dispatcher signalled it.
@@ -313,15 +358,16 @@ class LoopGraphRun:
             if notes:
                 entry.setdefault("owner_notes", []).extend(notes)
                 carried = ("The owner sent this mid-run, after item "
-                           f"{i}: {' / '.join(notes)}")
+                           f"{n}: {' / '.join(notes)}")
 
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
         if accepted is None:
             self._ledger.update(status="stopped", reason="every work item was parked")
             # Nothing was accepted, so there is no item the run stopped "on": it
-            # ran out at the last one, and that is where the note speaks from.
-            await self._stopped_note(run_dir, "every work item was parked",
-                                     len(items), len(items))
+            # ran out at the last one, and that is where the note speaks from. The
+            # count is read again here because an injected item changed it.
+            total = len(self._ledger["items"])
+            await self._stopped_note(run_dir, "every work item was parked", total, total)
             return self._ledger
         self._ledger.update(status="merge-ready")
         await self._owner_card(run_dir, accepted, checkpoint_result, parked)

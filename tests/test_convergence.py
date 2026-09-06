@@ -11,7 +11,8 @@ from __future__ import annotations
 import pytest
 from temporalio.exceptions import ActivityError, ApplicationError
 
-from workflow_fake import GREEN_ROUND, ScriptedWorkflow, drive, drive_item
+from workflow_fake import (COMMITTED, DEFAULT_CONFIG, GREEN_ROUND, ScriptedWorkflow,
+                           drive, drive_item)
 from workflows.run import build_convergence_item
 
 BAD_YAML = "run.yaml: unknown key 'yeild_floor' under sweep"
@@ -166,3 +167,152 @@ def test_a_driven_run_ends_held():
     ledger = drive(fake)
     assert [c[0] for c in fake.cards] == ["merge-ready"]
     assert ledger["status"] == "held"
+
+
+# ---------- the engine spends an item removing what the last ones added ----------
+
+def _config(**knobs) -> dict:
+    """The defaults with the convergence knobs a test cares about changed."""
+    return {"convergence": {**DEFAULT_CONFIG["convergence"], **knobs}, "sweep": None}
+
+
+def _cp(files: list[str], net: int = 2, commit: str = "c1") -> dict:
+    """A committed checkpoint that wrote those files."""
+    return dict(COMMITTED, files=files, net=net, commit=commit)
+
+
+def _kinds(ledger: dict) -> list[str]:
+    """What kind of item each ledger entry is, in execution order."""
+    return [e["kind"] for e in ledger["items"]]
+
+
+EMPTY_REFUSAL = {"committed": False, "reason": "empty write set"}
+
+CAP_REFUSAL = {"committed": False, "reason": "net lines +37 exceed the cap of 0",
+               "added": 40, "deleted": 3, "net": 37}
+
+
+def test_five_accepted_items_run_six():
+    """AC-8 and AC-9. Five accepted items trip `every_items`, and the item the
+    engine writes for itself lists everything those five wrote, sorted, so the
+    executor is looking at the run's own growth and not at the repo."""
+    fake = ScriptedWorkflow(items=["one", "two", "three", "four", "five"],
+                            checkpoints=[_cp(["e.py"]), _cp(["d.py"]), _cp(["c.py"]),
+                                         _cp(["b.py"]), _cp(["a.py"])])
+    ledger = drive(fake)
+    assert _kinds(ledger) == ["brief"] * 5 + ["convergence"]
+    assert [e["n"] for e in ledger["items"]] == [1, 2, 3, 4, 5, 6]
+    assert ledger["items"][5]["item"] == build_convergence_item(
+        ["a.py", "b.py", "c.py", "d.py", "e.py"])
+
+
+def test_net_lines_trigger_between_items():
+    """AC-8. On a short brief the counter that fires is the size of what it added:
+    300 then 150 crosses 400 with a brief item still to come, and the removal pass
+    goes in before it."""
+    fake = ScriptedWorkflow(config=_config(every_items=99, net_lines=400),
+                            items=["one", "two", "three"],
+                            checkpoints=[_cp(["a.py"], net=300), _cp(["b.py"], net=150)])
+    ledger = drive(fake)
+    assert _kinds(ledger) == ["brief", "brief", "convergence", "brief"]
+    # The brief item after it moved up, so `n` is still execution order.
+    assert [e["n"] for e in ledger["items"]] == [1, 2, 3, 4]
+    assert ledger["items"][3]["item"] == "three"
+
+
+def test_a_parked_brief_item_moves_no_counter():
+    """AC-8. A parked item committed nothing, so it added none of the lines the
+    removal pass exists to take back out."""
+    fake = ScriptedWorkflow(config=_config(every_items=2),
+                            items=["one", "two", "three", "four"],
+                            checkpoints=[_cp(["a.py"]), EMPTY_REFUSAL, _cp(["b.py"])])
+    ledger = drive(fake)
+    assert ledger["items"][1]["status"] == "parked"
+    assert _kinds(ledger) == ["brief", "brief", "brief", "convergence", "brief"]
+    assert ledger["items"][3]["item"] == build_convergence_item(["a.py", "b.py"])
+
+
+def test_counters_and_touched_reset_after_a_convergence_item():
+    """AC-8. Both counters and the write set start again after a removal pass, or
+    the next one fires an item early and is handed files that were already
+    cleaned."""
+    fake = ScriptedWorkflow(config=_config(every_items=2),
+                            items=["one", "two", "three", "four"],
+                            checkpoints=[_cp(["a.py"]), _cp(["b.py"]), _cp(["gone.py"]),
+                                         _cp(["c.py"]), _cp(["d.py"])])
+    ledger = drive(fake)
+    assert _kinds(ledger) == ["brief", "brief", "convergence",
+                              "brief", "brief", "convergence"]
+    assert [e["n"] for e in ledger["items"]] == [1, 2, 3, 4, 5, 6]
+    assert ledger["items"][5]["item"] == build_convergence_item(["c.py", "d.py"])
+
+
+def test_a_parked_convergence_item_resets_the_counters_too():
+    """AC-8. The removal pass happened, whatever came of it. Counting on from
+    where it left off would inject the next one straight away and every item after
+    it would be a convergence item."""
+    fake = ScriptedWorkflow(config=_config(every_items=2), items=["one", "two", "three"],
+                            checkpoints=[_cp(["a.py"]), _cp(["b.py"]), CAP_REFUSAL,
+                                         _cp(["c.py"])])
+    ledger = drive(fake)
+    assert _kinds(ledger) == ["brief", "brief", "convergence", "brief"]
+    assert ledger["items"][2]["status"] == "parked"
+    assert ledger["items"][2]["reason"] == \
+        "checkpoint refused: net lines +37 exceed the cap of 0"
+
+
+def test_enabled_false_injects_nothing():
+    """The escape hatch. A migration that legitimately adds 600 lines needs a way
+    out that is not editing the engine."""
+    ledger = drive(ScriptedWorkflow(config=_config(enabled=False),
+                                    items=["one", "two", "three", "four", "five", "six"]))
+    assert _kinds(ledger) == ["brief"] * 6
+
+
+def test_nothing_to_remove_leaves_the_card_on_the_last_real_commit():
+    """AC-10. The convergence item changed no file, so the commit the owner is
+    offered has to be the last one that exists. Writing its `None` over the card's
+    commit would offer a merge of nothing."""
+    fake = ScriptedWorkflow(config=_config(every_items=1), items=["one"],
+                            rounds=[GREEN_ROUND, dict(GREEN_ROUND, files=[])],
+                            checkpoints=[_cp(["a.py"], commit="c1")])
+    ledger = drive(fake)
+    conv = ledger["items"][1]
+    assert conv["kind"] == "convergence"
+    assert (conv["status"], conv["commit"]) == ("done", None)
+    assert conv["note"] == "nothing to remove"
+    assert [c[0] for c in fake.cards] == ["merge-ready"]
+    assert fake.cards[0][4] == "c1", "the merge card must name the last real commit"
+
+
+def test_the_location_line_counts_the_injected_item():
+    """AC-9. The injected item is in `items`, so every card after it says four.
+    A note still saying "of 3" would be counting a list nobody has."""
+    fake = ScriptedWorkflow(config=_config(every_items=2), items=["one", "two", "three"],
+                            checkpoints=[_cp(["a.py"]), _cp(["b.py"]), _cp(["c.py"]),
+                                         EMPTY_REFUSAL])
+    ledger = drive(fake)
+    assert _kinds(ledger) == ["brief", "brief", "convergence", "brief"]
+    parked = next(c for c in fake.cards if c[0] == "parked")
+    assert parked[3].startswith("item 4 of 4 parked")
+
+
+def test_a_convergence_item_can_be_the_last_item():
+    """The trigger is the counters, not the position: a five-item brief that added
+    enough gets its removal pass after item 5, or the rule would skip exactly the
+    run it exists for."""
+    fake = ScriptedWorkflow(items=["one", "two", "three", "four", "five"])
+    ledger = drive(fake)
+    assert _kinds(ledger)[-1] == "convergence"
+    assert _names(fake).count("execute_round") == 6, "the sixth item is the last one"
+    assert [c[0] for c in fake.cards] == ["merge-ready"]
+
+
+def test_an_all_parked_run_speaks_from_its_last_item():
+    """AC-33, driven. Nothing was accepted, so the run ran out at the last item
+    rather than stopping on one, and that is where the note speaks from."""
+    fake = ScriptedWorkflow(items=["one", "two", "three"], checkpoints=[EMPTY_REFUSAL])
+    ledger = drive(fake)
+    assert ledger["reason"] == "every work item was parked"
+    stopped = next(c for c in fake.cards if c[0] == "run stopped")
+    assert stopped[3].startswith("item 3 of 3")
