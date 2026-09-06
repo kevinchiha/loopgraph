@@ -28,6 +28,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
+from temporalio.service import RPCError, RPCStatusCode
 
 import version
 from envfile import parse_env, read_env
@@ -566,3 +567,340 @@ def test_lg_version_json_on_a_hand_made_tag_that_does_not_parse(
     assert said["installed"] == "v0.2.0-rc1"
     assert said["latest"] == "v0.2.0"
     assert said["behind"] is True
+
+
+# ---------------------------------------------------------------- lg update ---
+
+def fake_run(table=None):
+    """A stand-in for lg._run: git runs for real, nothing else runs at all.
+
+    Every call lands on `.calls` as (argv, cwd, timeout, stream), which is how a
+    test proves what the update did and, more to the point, what it did not. An
+    argv listed in `.table` is answered with the CompletedProcess sitting there;
+    a git argv nobody listed reaches the real runner, because git's own exit
+    codes are what these tests are about; anything else comes back exit 0 with no
+    output. That last default is the safety rail: no test can reach docker, uv or
+    pip by accident, and a `compose ps` naming no service reads as a stack that
+    is not running, which is the truth on a machine mid-test.
+    """
+    def run(argv, cwd, timeout=None, stream=False):
+        run.calls.append((list(argv), cwd, timeout, stream))
+        answer = run.table.get(tuple(argv))
+        if answer is not None:
+            return answer
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    run.table = dict(table or {})
+    run.calls = []
+    return run
+
+
+class ListingClient:
+    """Temporal as lg update reads it: one listing of what is still running.
+
+    The shape tests/test_lg_status.py's FakeClient has — list_workflows hands
+    back an async generator — narrowed to the single call this command makes.
+    `error` is raised from inside that generator rather than from the call, which
+    is where a real RPCError surfaces: the listing sends no request to the server
+    until something iterates it.
+    """
+
+    def __init__(self, workflows=(), error=None):
+        self.workflows, self.error = list(workflows), error
+        self.queries: list[str] = []
+
+    def list_workflows(self, query):
+        self.queries.append(query)
+
+        async def gen():
+            if self.error is not None:
+                raise self.error
+            for workflow in self.workflows:
+                yield workflow
+        return gen()
+
+
+def _temporal(lg, monkeypatch, client) -> None:
+    """Point lg at a Temporal that is not there. Nothing here opens a connection."""
+    async def connect():
+        return client
+    monkeypatch.setattr(lg, "_client", connect)
+
+
+def _update(lg, root, monkeypatch, capsys, runner=None) -> tuple[int, str, str]:
+    """`lg update` against a checkout under tmp_path, as (code, stdout, stderr)."""
+    monkeypatch.setattr(lg, "ROOT", str(root))
+    monkeypatch.setattr(lg, "_run", runner if runner is not None else fake_run())
+    code = asyncio.run(lg.cmd_update(types.SimpleNamespace()))
+    said = capsys.readouterr()
+    return code, said.out, said.err
+
+
+def _release_on_origin(clone_repo, tag: str, files: dict[str, str]) -> None:
+    """A release origin has that this checkout is one commit behind.
+
+    The commit and its tag are made here, pushed, and then taken back off the
+    clone: what a user's checkout looks like the morning after a release lands.
+    """
+    was = clone_repo.git("rev-parse", "HEAD")
+    clone_repo.commit(f"release {tag}", files)
+    clone_repo.tag(tag)
+    clone_repo.push()
+    clone_repo.git("reset", "--hard", was)
+    clone_repo.git("tag", "-d", tag)
+
+
+RELEASE_NOTES = """\
+# Changelog
+
+## 0.2.0 - 2026-09-07
+
+- the newest thing
+
+## 0.1.0 - 2026-09-01
+
+- the first thing
+"""
+
+
+def test_run_turns_a_hung_command_into_a_failed_result(tmp_path):
+    """subprocess raises here, and a traceback is not an answer: 124, the code a
+    shell reports a timeout as, with the reason where the caller reads stderr."""
+    done = _lg()._run(["sleep", "5"], str(tmp_path), timeout=0.05)
+    assert (done.returncode, done.stdout, done.stderr) == (124, "", "timed out after 0.05s")
+
+
+def test_run_turns_a_missing_binary_into_a_failed_result(tmp_path):
+    """A machine with no uv, no pip or no docker on the path."""
+    done = _lg()._run(["lg-no-such-program"], str(tmp_path))
+    assert done.returncode == 127
+    assert "lg-no-such-program" in done.stderr
+
+
+def test_update_refuses_uncommitted_changes_and_touches_nothing(
+        clone_repo, monkeypatch, capsys):
+    was = clone_repo.git("rev-parse", "HEAD")
+    (clone_repo.root / "README.md").write_text("# edited\n", encoding="utf-8")
+    code, out, err = _update(_lg(), clone_repo.root, monkeypatch, capsys)
+    assert code == 1
+    assert out == ""
+    assert err == (f"refuse: uncommitted changes in {clone_repo.root}. "
+                   "Commit or stash them, then run lg update again.\n")
+    assert clone_repo.git("rev-parse", "HEAD") == was
+
+
+def test_a_dirty_tree_refuses_before_it_asks_origin_anything(
+        clone_repo, monkeypatch, capsys):
+    """The order matters: a refusal the user can fix in a second must not cost
+    them 60 seconds waiting on a network they may not have."""
+    (clone_repo.root / "README.md").write_text("# edited\n", encoding="utf-8")
+    runner = fake_run()
+    code, _, _ = _update(_lg(), clone_repo.root, monkeypatch, capsys, runner)
+    assert code == 1
+    assert not [argv for argv, _, _, _ in runner.calls if argv[:2] == ["git", "fetch"]]
+
+
+def test_update_refuses_off_main_and_on_a_detached_head(clone_repo, monkeypatch, capsys):
+    lg = _lg()
+    clone_repo.git("checkout", "-b", "wip")
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out) == (1, "")
+    assert err == "refuse: on branch wip, not main. lg update only moves main.\n"
+
+    clone_repo.git("checkout", "--detach", "HEAD")
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out) == (1, "")
+    assert err == "refuse: not on a branch (detached HEAD). lg update only moves main.\n"
+
+
+def test_an_off_main_branch_refuses_before_it_asks_origin_anything(
+        clone_repo, monkeypatch, capsys):
+    clone_repo.git("checkout", "-b", "wip")
+    runner = fake_run()
+    code, _, _ = _update(_lg(), clone_repo.root, monkeypatch, capsys, runner)
+    assert code == 1
+    assert not [argv for argv, _, _, _ in runner.calls if argv[:2] == ["git", "fetch"]]
+
+
+def test_update_refuses_when_origin_is_unreachable(clone_repo, tmp_path, monkeypatch, capsys):
+    """Offline, or an origin that moved: git's own first line says which."""
+    clone_repo.git("remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    code, out, err = _update(_lg(), clone_repo.root, monkeypatch, capsys)
+    assert (code, out) == (1, "")
+    assert err.startswith("refuse: could not reach origin: ")
+    assert len(err.splitlines()) == 1
+
+
+def test_update_refuses_when_the_fetch_hangs(clone_repo, monkeypatch, capsys):
+    """A host that swallows packets keeps git waiting until TCP gives up, so the
+    fetch carries a deadline and the timeout reads as the reason it refused."""
+    hung = subprocess.CompletedProcess(["git", "fetch", "--tags", "--quiet", "origin"],
+                                       124, "", "timed out after 60s")
+    runner = fake_run({("git", "fetch", "--tags", "--quiet", "origin"): hung})
+    code, out, err = _update(_lg(), clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, out) == (1, "")
+    assert err == "refuse: could not reach origin: timed out after 60s\n"
+    deadlines = [t for argv, _, t, _ in runner.calls if argv[:2] == ["git", "fetch"]]
+    assert deadlines == [_lg().FETCH_TIMEOUT]
+
+
+def test_update_refuses_when_origin_has_no_releases(clone_repo, monkeypatch, capsys):
+    code, out, err = _update(_lg(), clone_repo.root, monkeypatch, capsys)
+    assert (code, out) == (1, "")
+    assert err == "refuse: origin has no releases yet.\n"
+
+
+def test_already_on_the_newest_tag_never_reaches_temporal(clone_repo, monkeypatch, capsys):
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+
+    async def refuse_to_connect():
+        raise AssertionError("Temporal was asked about a checkout that is already there")
+    monkeypatch.setattr(lg, "_client", refuse_to_connect)
+
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out, err) == (0, "already on v0.1.0\n", "")
+
+
+def test_already_past_the_newest_tag_reports_how_far(clone_repo, monkeypatch, capsys):
+    """A maintainer's checkout, mid-phase. It is not offered a move backwards."""
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    clone_repo.commit("after the release", {"one.txt": "1\n"})
+    clone_repo.commit("and another", {"two.txt": "2\n"})
+
+    async def refuse_to_connect():
+        raise AssertionError("Temporal was asked about a checkout that is already past")
+    monkeypatch.setattr(lg, "_client", refuse_to_connect)
+
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out, err) == (0, "already past v0.1.0 (HEAD is 2 commits ahead)\n", "")
+
+
+def test_update_refuses_when_temporal_cannot_be_reached_or_hangs(
+        clone_repo, monkeypatch, capsys):
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    cannot_reach = (f"refuse: cannot reach Temporal at {lg.ADDRESS}. "
+                    "Start the stack so lg update can check for open runs.\n")
+    was = clone_repo.git("rev-parse", "HEAD")
+
+    async def connection_refused():
+        raise OSError("[Errno 111] Connection refused")
+    monkeypatch.setattr(lg, "_client", connection_refused)
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out, err) == (1, "", cannot_reach)
+
+    async def never_answers():
+        await asyncio.Event().wait()
+    monkeypatch.setattr(lg, "_client", never_answers)
+    monkeypatch.setattr(lg, "TEMPORAL_TIMEOUT", 0.05)
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out, err) == (1, "", cannot_reach)
+    assert clone_repo.git("rev-parse", "HEAD") == was
+
+
+def test_update_refuses_when_the_workflow_listing_fails(clone_repo, monkeypatch, capsys):
+    """A server on the wrong namespace, or with a visibility store that is down.
+    The connect succeeds and the listing dies, so the check has to cover both."""
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    broken = RPCError("namespace not found", RPCStatusCode.NOT_FOUND, b"")
+    _temporal(lg, monkeypatch, ListingClient(error=broken))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out) == (1, "")
+    assert err == (f"refuse: cannot reach Temporal at {lg.ADDRESS}. "
+                   "Start the stack so lg update can check for open runs.\n")
+
+
+def test_update_refuses_with_one_line_per_open_run(clone_repo, monkeypatch, capsys):
+    """Restarting the stack under a waiting run loses the answer it is waiting
+    for, so the user is told which runs to finish and how to read each one."""
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    was = clone_repo.git("rev-parse", "HEAD")
+    client = ListingClient([types.SimpleNamespace(id="run-toy-ab12cd"),
+                            types.SimpleNamespace(id="gate-ef34gh")])
+    _temporal(lg, monkeypatch, client)
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out) == (1, "")
+    assert err.splitlines() == [
+        "refuse: 2 open run(s). Answer or finish them first:",
+        "  run-toy-ab12cd    lg status run-toy-ab12cd",
+        "  gate-ef34gh    lg status gate-ef34gh",
+    ]
+    # Every type, not only LoopGraphRun: a GateCheckRun replays too.
+    assert client.queries == ['ExecutionStatus = "Running"']
+    assert clone_repo.git("rev-parse", "HEAD") == was
+
+
+def test_update_fast_forwards_and_prints_the_changelog_slice(
+        clone_repo, monkeypatch, capsys):
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    _temporal(lg, monkeypatch, ListingClient())
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, err) == (0, "")
+    assert out.splitlines() == ["updated v0.1.0 → v0.2.0",
+                                "## 0.2.0 - 2026-09-07",
+                                "",
+                                "- the newest thing"]
+    assert clone_repo.git("rev-parse", "HEAD") == clone_repo.git("rev-parse", "v0.2.0^{commit}")
+
+
+def test_update_says_when_the_tag_has_no_changelog_entry(clone_repo, monkeypatch, capsys):
+    """A release made before the repo had a CHANGELOG.md at all, or one that
+    forgot to write its section. The update happened, and still says so."""
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"README.md": "# clone, released\n"})
+    _temporal(lg, monkeypatch, ListingClient())
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, err) == (0, "")
+    assert out.splitlines() == ["updated v0.1.0 → v0.2.0",
+                                "(no changelog entry for v0.2.0)"]
+
+
+def test_update_refuses_a_diverged_main_and_moves_nothing(clone_repo, monkeypatch, capsys):
+    """Local commits on main that origin does not have. --ff-only is what makes
+    this a refusal instead of a merge commit nobody asked for."""
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    clone_repo.commit("my own work", {"mine.txt": "mine\n"})
+    was = clone_repo.git("rev-parse", "HEAD")
+    _temporal(lg, monkeypatch, ListingClient())
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys)
+    assert (code, out) == (1, "")
+    assert err == "refuse: main and v0.2.0 have diverged; git status will show why.\n"
+    assert clone_repo.git("rev-parse", "HEAD") == was
+
+
+def test_update_never_runs_a_git_command_that_could_lose_work(
+        clone_repo, monkeypatch, capsys):
+    """AC-14, read off the recording: a user's own commits are never moved."""
+    lg = _lg()
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    _temporal(lg, monkeypatch, ListingClient())
+    runner = fake_run()
+    code, _, _ = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert code == 0
+    git = [argv for argv, _, _, _ in runner.calls if argv[0] == "git"]
+    assert git
+    assert not [argv for argv in git if argv[1] in ("checkout", "reset", "stash", "pull")]
+    assert all("--ff-only" in argv for argv in git if argv[1] == "merge")

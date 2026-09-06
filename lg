@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -29,6 +30,13 @@ TASK_QUEUE = "loopgraph"
 # Long enough for a slow network, short enough that a person waiting on
 # `lg version` gets an answer rather than a hung terminal.
 REMOTE_TIMEOUT = 10
+# The connect and the listing of open runs together. Short, because a stack that
+# is down is the ordinary reason this takes any time at all.
+TEMPORAL_TIMEOUT = 10
+# The fetch in `lg update`. Generous, because it is one round trip to GitHub on
+# whatever network the user has, and it is the only thing standing between them
+# and knowing whether there is a release.
+FETCH_TIMEOUT = 60.0
 
 
 def _dotenv() -> dict[str, str]:
@@ -427,6 +435,139 @@ async def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run(argv: list[str], cwd: str, timeout: float | None = None,
+         stream: bool = False) -> subprocess.CompletedProcess[str]:
+    """One external command, which always comes back as a result.
+
+    Every command `lg update` runs goes through this one door, so a test can
+    replace it and watch a whole update without a binary running. Nothing here
+    raises: subprocess raises both for a command that hangs and for a program
+    that is not installed, and a traceback at the moment the update has already
+    moved the checkout is the one output this command must never produce. Both
+    arrive as a failed result instead, on the codes a shell uses for them — 124
+    for a timeout, 127 for a missing binary — so they reach the same one-line
+    message paths as any other failure.
+
+    `stream=True` hands the terminal to the command, so a build shows progress
+    and a `sudo docker` can ask for its password. There is nothing to capture
+    then, and the result says as much with empty text.
+    """
+    try:
+        if stream:
+            done = subprocess.run(argv, cwd=cwd, timeout=timeout)
+            return subprocess.CompletedProcess(argv, done.returncode, "", "")
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout:g}s")
+    except FileNotFoundError as e:
+        return subprocess.CompletedProcess(argv, 127, "", str(e))
+
+
+async def _open_runs() -> list:
+    """Every workflow Temporal still calls running, of any type.
+
+    Connect and listing in one coroutine so a single deadline covers both: the
+    listing sends no request until it is iterated, so a connect that succeeded
+    proves nothing about the server behind it.
+    """
+    client = await _client()
+    return [wf async for wf in client.list_workflows('ExecutionStatus = "Running"')]
+
+
+def _changelog(root: str) -> str:
+    """The checkout's CHANGELOG.md, empty when the release did not ship one."""
+    path = os.path.join(root, "CHANGELOG.md")
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+async def cmd_update(args: argparse.Namespace) -> int:
+    """Move a clean main to the newest release origin has.
+
+    Every refusal below happens before anything on disk moves, and each one names
+    what the user has to do about it. They run cheapest first: a dirty tree is
+    answered without waiting on the network, and the network is answered without
+    waiting on Temporal.
+
+    ROOT is read here rather than at import, the way cmd_version reads it, so a
+    test can point the whole command at a repository under tmp_path.
+    """
+    root = ROOT
+
+    def git(*argv: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        return _run(["git", *argv], root, timeout=timeout)
+
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        print(f"refuse: uncommitted changes in {root}. "
+              "Commit or stash them, then run lg update again.", file=sys.stderr)
+        return 1
+
+    branch = git("branch", "--show-current").stdout.strip()
+    if not branch:
+        print("refuse: not on a branch (detached HEAD). lg update only moves main.",
+              file=sys.stderr)
+        return 1
+    if branch != "main":
+        print(f"refuse: on branch {branch}, not main. lg update only moves main.",
+              file=sys.stderr)
+        return 1
+
+    fetched = git("fetch", "--tags", "--quiet", "origin", timeout=FETCH_TIMEOUT)
+    if fetched.returncode != 0:
+        said = next((ln.strip() for ln in fetched.stderr.splitlines() if ln.strip()), "")
+        print(f"refuse: could not reach origin: {said}", file=sys.stderr)
+        return 1
+
+    tag = version.newest(git("tag", "--list", "v*").stdout.split())
+    if tag is None:
+        print("refuse: origin has no releases yet.", file=sys.stderr)
+        return 1
+
+    old_commit = git("rev-parse", "HEAD").stdout.strip()
+    # release.sh tags annotated, so the tag object has a hash of its own and
+    # `<tag>^{commit}` is the only thing HEAD can be compared with.
+    if old_commit and old_commit == git("rev-parse", f"{tag}^{{commit}}").stdout.strip():
+        print(f"already on {tag}")
+        return 0
+    if git("merge-base", "--is-ancestor", tag, "HEAD").returncode == 0:
+        # Counted from the tag being moved to, not from the tag this checkout is
+        # described by: on a maintainer's tree those are two different releases.
+        ahead = git("rev-list", "--count", f"{tag}..HEAD").stdout.strip()
+        print(f"already past {tag} (HEAD is {ahead} commits ahead)")
+        return 0
+
+    try:
+        open_runs = await asyncio.wait_for(_open_runs(), TEMPORAL_TIMEOUT)
+    except Exception:
+        # Every way this can fail reads the same to the user and has the same
+        # fix, and none of them may end as a traceback in front of an update that
+        # has not started: without an answer here the command cannot know whether
+        # restarting the stack would drop a run mid-question.
+        print(f"refuse: cannot reach Temporal at {ADDRESS}. "
+              "Start the stack so lg update can check for open runs.", file=sys.stderr)
+        return 1
+    if open_runs:
+        print(f"refuse: {len(open_runs)} open run(s). Answer or finish them first:",
+              file=sys.stderr)
+        for workflow in open_runs:
+            print(f"  {workflow.id}    lg status {workflow.id}", file=sys.stderr)
+        return 1
+
+    here = version.installed(root)
+    old, old_tag = installed_line(here), here["tag"]
+    if git("merge", "--ff-only", tag).returncode != 0:
+        print(f"refuse: main and {tag} have diverged; git status will show why.",
+              file=sys.stderr)
+        return 1
+
+    print(f"updated {old} → {tag}")
+    notes = version.changelog_between(_changelog(root), old_tag, tag)
+    print(notes or f"(no changelog entry for {tag})")
+    return 0
+
+
 async def cmd_ui(args: argparse.Namespace) -> int:
     import ui
     ui.serve(args.port)
@@ -477,6 +618,9 @@ def main() -> int:
     v.add_argument("--json", action="store_true",
                    help="print one JSON object instead of the lines")
     v.set_defaults(fn=cmd_version)
+    up = sub.add_parser("update",
+                        help="move a clean main to the newest release and restart the stack")
+    up.set_defaults(fn=cmd_update)
     u = sub.add_parser("ui", help="web dashboard → http://localhost:8400")
     u.add_argument("--port", type=int, default=8400)
     u.set_defaults(fn=cmd_ui)
