@@ -148,6 +148,32 @@ agent is there for.
 
 </details>
 
+## Updating
+
+```bash
+lg version    # what you have, and whether a newer release exists
+lg update     # move to it
+```
+
+`lg update` moves your checkout's `main` to the newest release, refreshes the host
+environment when the dependencies changed, and restarts the worker and dispatcher.
+It refuses, and changes nothing, in three cases you can hit:
+
+- You edited files in the engine checkout: commit or stash them first.
+- A run is open: answer or finish it. Changing the code under a paused run can
+  break it, so there is no flag to push past this.
+- Temporal is down: start the stack (`<docker> compose up -d`) so it can check for
+  open runs.
+
+The dashboard header shows the installed release and says when a newer one exists.
+
+To go back to an earlier release, in the engine checkout: `git checkout vX.Y.Z`,
+then `<docker> compose up -d --build worker dispatcher` (a rollback always
+rebuilds; it is rare, and guessing whether the dependencies changed is not worth
+it). `lg update` refuses while you are on a tag, so run `git checkout main` first
+when you want to move forward again. The same warning applies: do it with no run
+open.
+
 ## Using it
 
 The installer links a skill into `~/.claude/skills/`, so your agent already knows

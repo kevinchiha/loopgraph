@@ -18,9 +18,14 @@ those values.
 
 ```bash
 lg where                    # engine root, projects dir, docker command
+lg version                  # what you have, and whether a newer release exists
 cd <engine_root> && <docker> compose ps
 ```
 
+- **If `lg version` prints an `update:` line**, tell the user in one sentence
+  what they have and what is available, and that `lg update` gets it. Then carry
+  on with the run. Do not run `lg update` unless the user asks: it restarts the
+  stack, and it refuses while any run is open.
 - The worker **and the dispatcher** must both be `Up`. If not: `<docker> compose
   up -d`, wait ~10s and look again. Nothing in the stack restarts itself, so a
   container that died stays dead. A missing dispatcher is the quiet failure:

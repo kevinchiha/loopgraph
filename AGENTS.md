@@ -28,6 +28,10 @@ produces bug reports nobody can reproduce.
 - `ui.py` — read-only dashboard on port 8400. Change its `PAGE` string and you
   must run the browser checklist in `tests/test_ui.py` by hand: the suite reads
   that JavaScript as text and cannot see the page.
+- `version.py` — release tags, changelog slicing and the update rules. `lg` and
+  `ui.py` both import it; it is at the root because `lg` cannot be imported.
+- `release.sh` — the maintainer's release command. Nothing else writes a tag.
+- `CHANGELOG.md` — one section per release, newest first, `## Unreleased` on top.
 - `runs/` — run directories. Gitignored except the shipped examples.
 
 ## Rules that bite if you ignore them
@@ -62,6 +66,17 @@ do. Everything machine-specific comes from `.env`, which `install.sh` writes.
 
 **Nothing under `runs/` gets committed** except the named examples in
 `.gitignore`. Real runs hold the user's work, sometimes a client's.
+
+## Releasing
+
+Write the user-visible note under `## Unreleased` in `CHANGELOG.md` in the same
+commit as the change. `./release.sh X.Y.Z` does the rest: it renames that heading
+to the version and date, sets the version in `pyproject.toml`, commits, makes the
+annotated tag `vX.Y.Z` and pushes both. It refuses off `main`, with uncommitted
+changes, when `main` is not at `origin/main`, when the tag exists, when the
+changelog has nothing to say, and when the tests fail.
+
+No agent runs `release.sh`. It pushes.
 
 ## Checks
 

@@ -1307,3 +1307,86 @@ def test_the_poll_times_out_naming_the_service_that_never_came_up(
     assert len(_ran(runner, "logs", "--since", "worker")) == 1
     assert _ran(runner, "logs", "--tail") == [tail]
     assert out.splitlines()[-1] == "dispatcher  | Traceback (most recent call last)"
+
+
+# --------------------------------- what the docs and the installer teach ---
+
+ROOT = Path(__file__).resolve().parent.parent
+README = (ROOT / "README.md").read_text()
+AGENTS = (ROOT / "AGENTS.md").read_text()
+SKILL = (ROOT / "skills/loopgraph/SKILL.md").read_text()
+INSTALL = (ROOT / "install.sh").read_text()
+
+
+def _section(text: str, heading: str) -> str:
+    """One `##` section of a markdown file, heading line included.
+
+    Whole lines only: `## Unreleased` and `lg update` both appear inside prose
+    in these files, and a substring search would find those instead.
+    """
+    lines = text.splitlines()
+    start = lines.index(heading)
+    rest = lines[start + 1:]
+    end = next((i for i, ln in enumerate(rest) if ln.startswith("## ")), len(rest))
+    return "\n".join(lines[start:start + 1 + end])
+
+
+@pytest.fixture
+def skill_step_0() -> str:
+    return _section(SKILL, "## 0. Preconditions (check, don't assume)")
+
+
+def test_the_skill_runs_lg_version_beside_lg_where(skill_step_0):
+    """The skill is what an agent in another project reads before it starts a
+    run, so `lg version` has to sit in the same block it already runs, not in a
+    paragraph underneath it. And the agent is told not to act on the answer:
+    `lg update` restarts the stack, which is the user's call and never a step
+    on the way to a run."""
+    blocks = [b for b in skill_step_0.split("```") if "lg where" in b]
+    assert len(blocks) == 1, "step 0 should have one block with lg where in it"
+    assert "lg version" in blocks[0]
+    assert "Do not run" in skill_step_0
+    assert "lg update" in skill_step_0
+
+
+def test_the_readme_has_an_updating_section_between_install_and_using_it():
+    """Order, because a reader who has just installed reads down. And the
+    rollback has to name the rebuild: a rollback that only restarts leaves the
+    container on the newer image, which is the failure nobody would connect to
+    the checkout they moved."""
+    headings = [ln for ln in README.splitlines() if ln.startswith("## ")]
+    assert headings.index("## Install") + 1 == headings.index("## Updating")
+    assert headings.index("## Updating") + 1 == headings.index("## Using it")
+
+    section = _section(README, "## Updating")
+    for said in ("lg version", "lg update", "git checkout v",
+                 "up -d --build worker dispatcher", "git checkout main"):
+        assert said in section, f"the Updating section never says {said}"
+    assert "compose restart" not in section
+
+
+def test_agents_md_lists_the_three_new_files_and_has_a_releasing_section():
+    """An agent changing the engine finds files through this list, and a file
+    nobody lists is a file somebody re-invents. The releasing rule is the one
+    that matters most: release.sh pushes, and an agent must not run it."""
+    layout = _section(AGENTS, "## Layout")
+    for name in ("`version.py`", "`release.sh`", "`CHANGELOG.md`"):
+        assert f"- {name} —" in layout, f"Layout never lists {name}"
+
+    releasing = _section(AGENTS, "## Releasing")
+    assert "./release.sh X.Y.Z" in releasing
+    assert "## Unreleased" in releasing
+    assert "No agent runs `release.sh`." in releasing
+
+
+def test_the_installers_closing_text_names_lg_version_under_lg_where():
+    """The last thing install.sh prints is the only instruction some users ever
+    read, and it is a heredoc, so the line is pinned whole: a comment shifted
+    out of its column is a ragged block in front of a first-time user."""
+    line = ("  lg version                                      "
+            "# what you have, and whether a newer release exists")
+    lines = INSTALL.splitlines()
+    assert line in lines, "install.sh's Try it block never names lg version"
+    before = lines[lines.index(line) - 1]
+    assert before.startswith("  lg where")
+    assert before.index("#") == line.index("#")

@@ -342,6 +342,7 @@ say "Done"
 bold "Try it:"
 cat <<EOF
   lg where                                        # paths and ports on this machine
+  lg version                                      # what you have, and whether a newer release exists
   lg start runs/example-hello /projects/loopgraph-example
 EOF
 echo "  Cards land in $BOT_NAME on Telegram. From a terminal: lg approve <workflow-id> A"
