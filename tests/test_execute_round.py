@@ -1,6 +1,10 @@
+import inspect
+
 import pytest
 
-from activities.execute_round import assemble_prompt, parse_final_json, parse_porcelain
+from activities.discover import discover
+from activities.execute_round import (assemble_prompt, execute_round, parse_final_json,
+                                      parse_porcelain, run_paths)
 
 
 def test_assemble_prompt_has_all_parts():
@@ -42,3 +46,15 @@ def test_parse_porcelain_rename():
 
 def test_parse_porcelain_keeps_paths_with_spaces_and_arrows_intact():
     assert parse_porcelain("?? my file.py\0?? a -> b.py\0") == ["a -> b.py", "my file.py"]
+
+
+def test_execute_round_and_discover_derive_the_same_paths(tmp_path):
+    """Both activities work in the same worktree on the same branch. Deriving
+    those two strings twice is a rename away from a sweep whose detectors read
+    one worktree while its executor writes another."""
+    run_dir = tmp_path / "runs" / "sweep-me"
+    assert run_paths(str(run_dir), "ab12cd") == (
+        str(run_dir / "worktrees" / "ab12cd"), "lg-sweep-me-ab12cd")
+    assert run_paths(str(run_dir), "") == (str(run_dir / "worktrees" / "run"), "lg-sweep-me")
+    for fn in (execute_round, discover):
+        assert "run_paths(" in inspect.getsource(fn), f"{fn.__name__} derives its own paths"

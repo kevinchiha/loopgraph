@@ -99,6 +99,19 @@ def parse_porcelain(porcelain: str) -> list[str]:
     return sorted(files)
 
 
+def run_paths(run_dir: str, run_token: str) -> tuple[str, str]:
+    """The worktree and the branch a run works in.
+
+    Every activity that touches the run's checkout derives these two strings, and
+    deriving them twice is a rename away from a sweep whose detectors read one
+    worktree while its executor writes another.
+    """
+    run = Path(run_dir)
+    worktree = str(run / "worktrees" / (run_token or "run"))
+    branch = f"lg-{run.name}-{run_token}" if run_token else f"lg-{run.name}"
+    return worktree, branch
+
+
 # ---------- container-side effects ----------
 
 async def _git(*args: str, cwd: str | None = None) -> str:
@@ -223,9 +236,7 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
     prompt = assemble_prompt(brief, constraints, work_item or brief, directive,
                              read_answers(run_dir))
 
-    token = run_token or "run"
-    worktree = str(run / "worktrees" / token)
-    branch = f"lg-{run.name}" if not run_token else f"lg-{run.name}-{run_token}"
+    worktree, branch = run_paths(run_dir, run_token)
     base_branch = (await _git("branch", "--show-current", cwd=target_repo)).strip()
     await ensure_worktree(target_repo, worktree, branch)
     await reset_to_checkpoint(worktree, base_commit)
