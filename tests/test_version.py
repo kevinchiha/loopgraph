@@ -11,8 +11,10 @@ Then the two that do run git, `installed` and `remote_newest`. Those are tested
 against a real repository with a real origin, both under tmp_path, because what
 they have to get right is git's own output and exit codes.
 
-The last section is `lg version` itself, the command that puts those two
-together and turns them into the lines a person reads.
+The last sections are the commands themselves — `lg version`, which turns those
+two into the lines a person reads, and `lg update`, from its refusals through the
+venv refresh to the stack restart — and then what the README, the skill and the
+installer tell people about them.
 """
 
 from __future__ import annotations

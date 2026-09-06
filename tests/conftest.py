@@ -1,10 +1,12 @@
 """A git repository with a remote, built under tmp_path, for the release tests.
 
-`lg version`, `lg update`, the dashboard's version hint and the release guard all
-read git, and the only honest way to test them is against a repository that
-really has commits, tags and an origin. So `clone_repo` builds one: a clone on
-`main` with a single commit, and a bare repository beside it standing in for
-GitHub. Nothing here reaches the network — the "remote" is a directory.
+Two files use it: tests/test_version.py, for `lg version`, `lg update` and the
+git-reading rules under them, and tests/test_release_script.py, for what
+`./release.sh` refuses and writes. All of that reads git, and the only honest way
+to test it is against a repository that really has commits, tags and an origin.
+So `clone_repo` builds one: a clone on `main` with a single commit, and a bare
+repository beside it standing in for GitHub. Nothing here reaches the network —
+the "remote" is a directory.
 
 The identity, the config files, the language and the search ceiling come from
 environment variables set for the whole test, not from `-c` flags on these

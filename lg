@@ -518,11 +518,12 @@ def _dep_name(spec: str) -> str:
 def _host_deps(pyproject: str) -> list[str]:
     """What the host venv installs of a release's dependencies.
 
-    claude-agent-sdk is left out: the executor runs inside the worker container,
-    which installs its own copy, and pulling the sdk onto the host would drag in
-    a node runtime nobody on this side uses. A pyproject.toml nothing could read
-    leaves the list empty rather than raising — the refresh is already running
-    after a merge that succeeded.
+    This list is the pip fallback's, and it installs what install.sh's pip path
+    installs: every declared dependency except claude-agent-sdk, for the reason
+    install.sh gives beside its own list. The uv path tried first syncs the whole
+    file and never asks. A pyproject.toml nothing could read leaves the list
+    empty rather than raising — the refresh is already running after a merge that
+    succeeded.
     """
     try:
         project = tomllib.loads(pyproject).get("project", {})
@@ -652,11 +653,10 @@ async def cmd_update(args: argparse.Namespace) -> int:
 
     fetched = git("fetch", "--tags", "--quiet", "origin", timeout=FETCH_TIMEOUT)
     if fetched.returncode != 0:
-        said = next((ln.strip() for ln in fetched.stderr.splitlines() if ln.strip()), "")
         # A git that failed silently still has to say something, the way
         # version.remote_newest falls back for the same case: a refusal whose
         # reason is the empty string tells the user nothing at all.
-        reason = said or f"git fetch exited {fetched.returncode}"
+        reason = _said(fetched.stderr) or f"git fetch exited {fetched.returncode}"
         print(f"refuse: could not reach origin: {reason}", file=sys.stderr)
         return 1
 

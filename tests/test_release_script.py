@@ -202,18 +202,25 @@ def test_releases_renames_bumps_commits_tags_and_pushes(clone_repo):
 def test_the_intro_survives_a_release_byte_for_byte(clone_repo):
     """The shipped file names `## Unreleased` twice in its intro, above the real
     heading. An unanchored sed or str.replace would rewrite those two mentions on
-    the maintainer's very first release."""
-    shipped = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    _plant(clone_repo, changelog=shipped)
-    before, _ = _split_at_unreleased(shipped)
-    assert before.count("`## Unreleased`") == 2, "the fixture is not the shipped file"
+    the maintainer's very first release.
+
+    What gets planted is that intro with a fresh `## Unreleased` and one note
+    under it, not the shipped file whole. The intro is the part this test is
+    about, and the shipped file's version sections grow with every release: a
+    test that asserted what sits below the heading would go red the day the next
+    one lands, and release.sh runs the suite before it writes.
+    """
+    before, _ = _split_at_unreleased((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
+    planted = before + "## Unreleased\n\n- a note.\n"
+    assert planted.count("`## Unreleased`") == 2, "the intro is not the shipped one"
+    _plant(clone_repo, changelog=planted)
 
     done = _release(clone_repo, "0.2.0")
     assert done.returncode == 0, done.stderr
 
     after, rest = _split_at_unreleased(_read(clone_repo, "CHANGELOG.md"))
     assert after == before
-    assert re.match(r"## Unreleased\n\n## 0\.2\.0 - \d{4}-\d{2}-\d{2}\n", rest)
+    assert re.fullmatch(r"## Unreleased\n\n## 0\.2\.0 - \d{4}-\d{2}-\d{2}\n\n- a note\.\n", rest)
 
 
 def _split_at_unreleased(text: str) -> tuple[str, str]:
