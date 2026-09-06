@@ -70,6 +70,32 @@ def parse_final_json(text: str) -> dict:
     return json.loads(matches[-1])
 
 
+CANDIDATE_CAP = 200  # chars per candidate
+
+
+def clean_candidates(raw) -> list[str]:
+    """The things an executor found by hand, one line each, no repeats.
+
+    A sweep pastes these raw into the next item's text, which lands in the
+    executor prompt and in the auditor's scope block, above the engine's own
+    sections. A newline in one could open a "# Gate results" of its own, which is
+    the bug flatten_claim fixed for claims; audit.py imports from this module and
+    never the other way round, so the collapse is repeated here rather than
+    imported. Cleaning happens before anything stores a candidate, so nothing
+    downstream ever holds a raw one.
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for c in raw:
+        if not isinstance(c, str):
+            continue
+        line = " ".join(c.split())[:CANDIDATE_CAP]
+        if line and line not in out:
+            out.append(line)
+    return out
+
+
 def parse_porcelain(porcelain: str) -> list[str]:
     """`git status --porcelain -z --untracked-files=all` → the paths that changed.
 
@@ -273,6 +299,10 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
         # its own and must not have one: the supervisor reads these and decides
         # which, if any, become a card.
         "blocked": final["result"].get("blocked", []) or [],
+        # Extra work the executor spotted while doing this item. The sweep hands
+        # them to the next item; the fallback payload run_executor builds when the
+        # JSON block is missing has no such key, and .get covers it.
+        "candidates": clean_candidates(final["result"].get("candidates")),
         "files": files,
         "diff_stat": diff_stat.strip(),
         "gate_results": final["gate_results"],

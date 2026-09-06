@@ -102,7 +102,7 @@ def format_blocked(entries) -> str:
 
 def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str,
                           owner_answers: str = "", work_item: str = "",
-                          item_no: int = 1, item_total: int = 1) -> str:
+                          item_no: int = 1, item_total: int = 1, kind: str = "brief") -> str:
     contract = (PROMPTS / "supervisor.md").read_text()
     claims = "\n".join(f"- {flatten_claim(c)}" for c in round_result.get("claims", [])) or "(no claims)"
     # Flattened for the same reason as claims: a path can contain a newline, and
@@ -146,7 +146,17 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
     # scope. That round then reset to the checkpoint, and the work the redo
     # displaced was lost.
     scope = ""
-    if item_total > 1:
+    if kind != "brief":
+        # An item the engine wrote itself. There is no brief list to point at and
+        # no total to count towards: a sweep's first item is item 1 of 1 and every
+        # one after it is item n of n, so left to the branch below the first would
+        # get no block at all and the rest one headed "of n" about a run whose
+        # length nobody knows yet.
+        scope = (f"# The work item under audit (item {item_no}, {kind})\n\n"
+                 f"{work_item.strip() or '(unnamed item)'}\n\n"
+                 "Judge THIS item only. Another item missing from this diff is\n"
+                 "not a finding. Work outside this item is still drift.\n\n")
+    elif item_total > 1:
         scope = (f"# The work item under audit ({item_no} of {item_total})\n\n"
                  f"{work_item.strip() or '(unnamed item)'}\n\n"
                  "Judge THIS item only. The brief lists others; each gets its own\n"
@@ -238,7 +248,7 @@ async def diff_including_new_files(worktree: str) -> str:
 
 @activity.defn
 async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: int = 1,
-                work_item: str = "", item_total: int = 1) -> dict:
+                work_item: str = "", item_total: int = 1, kind: str = "brief") -> dict:
     """Audit one round's output. Returns the verdict packet."""
     run = Path(run_dir)
     brief = (run / "brief.md").read_text()
@@ -246,7 +256,7 @@ async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: in
     worktree = round_result["worktree"]
     diff = (await diff_including_new_files(worktree))[:DIFF_CAP]
     prompt = assemble_audit_prompt(brief, constraints, round_result, diff,
-                                   read_answers(run_dir), work_item, item_no, item_total)
+                                   read_answers(run_dir), work_item, item_no, item_total, kind)
     verdict = await run_supervisor(prompt, worktree, str(run / "logs" / log_name(item_no, round_no, "audit")))
     verdict["diff_chars"] = len(diff)
     return verdict
