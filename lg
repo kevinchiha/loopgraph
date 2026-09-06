@@ -20,11 +20,15 @@ from datetime import datetime
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
+import version
 from envfile import read_env
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
 TASK_QUEUE = "loopgraph"
+# Long enough for a slow network, short enough that a person waiting on
+# `lg version` gets an answer rather than a hung terminal.
+REMOTE_TIMEOUT = 10
 
 
 def _dotenv() -> dict[str, str]:
@@ -368,6 +372,61 @@ async def cmd_where(args: argparse.Namespace) -> int:
     return 0
 
 
+def installed_line(info: dict) -> str:
+    """What version.installed found, in the words a person reads.
+
+    One copy of the wording because two commands print it: `lg version` beside
+    `installed:`, and `lg update` as the release it moved you off.
+    """
+    if info["commit"] is None:
+        return "untagged (not a git checkout)"
+    if info["tag"] is None:
+        return f"untagged ({info['commit']})"
+    if info["ahead"]:
+        return f"{info['tag']} +{info['ahead']} commits ({info['commit']})"
+    return info["tag"]
+
+
+async def cmd_version(args: argparse.Namespace) -> int:
+    """What you have installed, and whether origin has a newer release.
+
+    ROOT is read here rather than at import, the way _dotenv reads it, so a test
+    can point the whole command at a repository under tmp_path.
+
+    An unreachable origin is news, not a failure: the question "what am I
+    running" has an answer offline, so the reason is printed beside `latest:`
+    and the exit code stays 0. Only RemoteError is caught — anything else is a
+    bug in the engine and should arrive as a traceback, not as a shrug.
+    """
+    here = version.installed(ROOT)
+    latest, error = None, None
+    try:
+        latest = version.remote_newest(ROOT, REMOTE_TIMEOUT)
+    except version.RemoteError as e:
+        error = str(e)
+    behind = version.is_behind(here["tag"], latest)
+
+    if args.json:
+        print(json.dumps({"installed": here["tag"], "commit": here["commit"],
+                          "ahead": here["ahead"], "latest": latest,
+                          "behind": behind, "error": error}, indent=2))
+        return 0
+
+    print(f"installed: {installed_line(here)}")
+    if error is not None:
+        print(f"latest: unknown (could not reach origin: {error})")
+    elif latest is None:
+        print("latest: none (origin has no releases yet)")
+    else:
+        # Hung off `behind` rather than on the two tags being equal, so a
+        # checkout sitting past the newest release — a maintainer's, mid-phase —
+        # is told it is up to date instead of being offered a move backwards.
+        print(f"latest: {latest}" if behind else f"latest: {latest} (up to date)")
+    if behind:
+        print("update: run lg update")
+    return 0
+
+
 async def cmd_ui(args: argparse.Namespace) -> int:
     import ui
     ui.serve(args.port)
@@ -413,6 +472,11 @@ def main() -> int:
     ap.set_defaults(fn=cmd_approve)
     w = sub.add_parser("where", help="paths, ports and Telegram status on this machine")
     w.set_defaults(fn=cmd_where)
+    v = sub.add_parser("version",
+                       help="what you have installed, and whether origin has a newer release")
+    v.add_argument("--json", action="store_true",
+                   help="print one JSON object instead of the lines")
+    v.set_defaults(fn=cmd_version)
     u = sub.add_parser("ui", help="web dashboard → http://localhost:8400")
     u.add_argument("--port", type=int, default=8400)
     u.set_defaults(fn=cmd_ui)

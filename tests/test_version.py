@@ -7,16 +7,25 @@ rules here rather than inside the commands is that a rule the user can hit —
 exact file shapes the repo really produces, and there is only ever one copy of
 it.
 
-The last section is the two that do run git, `installed` and `remote_newest`.
-Those are tested against a real repository with a real origin, both under
-tmp_path, because what they have to get right is git's own output and exit codes.
+Then the two that do run git, `installed` and `remote_newest`. Those are tested
+against a real repository with a real origin, both under tmp_path, because what
+they have to get right is git's own output and exit codes.
+
+The last section is `lg version` itself, the command that puts those two
+together and turns them into the lines a person reads.
 """
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import inspect
+import json
 import re
 import subprocess
+import types
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
 
 import pytest
 
@@ -394,3 +403,166 @@ def test_remote_newest_names_the_exit_code_when_git_said_nothing(clone_repo, mon
     monkeypatch.setattr(version.subprocess, "run", quiet_failure)
     with pytest.raises(RemoteError, match="git ls-remote exited 128"):
         remote_newest(clone_repo.root, 10)
+
+
+# --------------------------------------------------------------- lg version ---
+
+def _lg():
+    """`lg` has no .py extension, so it needs loading by path.
+
+    Under its own module name, not the one tests/test_release.py uses: two
+    loaders sharing a name would hand one module object to both files.
+    """
+    path = Path(__file__).resolve().parent.parent / "lg"
+    loader = SourceFileLoader("lg_cli_version", str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("lg_cli_version", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def _version(root, monkeypatch, capsys, as_json=False) -> tuple[int, str, str]:
+    """`lg version` against a checkout under tmp_path, as (code, stdout, stderr)."""
+    lg = _lg()
+    monkeypatch.setattr(lg, "ROOT", str(root))
+    code = asyncio.run(lg.cmd_version(types.SimpleNamespace(json=as_json)))
+    said = capsys.readouterr()
+    return code, said.out, said.err
+
+
+def _release_on_origin_only(clone_repo, tag: str) -> None:
+    """A release origin has and this checkout does not: a clone nobody fetched."""
+    clone_repo.tag(tag)
+    clone_repo.push()
+    clone_repo.git("tag", "-d", tag)
+
+
+@pytest.mark.parametrize("info,line", [
+    ({"tag": "v0.4.0", "commit": "abc1234", "ahead": 0}, "v0.4.0"),
+    ({"tag": "v0.4.0", "commit": "abc1234", "ahead": 3}, "v0.4.0 +3 commits (abc1234)"),
+    # `+1 commits` reads wrong and is meant to: the spec fixes the word, and this
+    # same text is what `lg update` prints as the release it moved you off.
+    ({"tag": "v0.4.0", "commit": "abc1234", "ahead": 1}, "v0.4.0 +1 commits (abc1234)"),
+    ({"tag": None, "commit": "abc1234", "ahead": 0}, "untagged (abc1234)"),
+    ({"tag": None, "commit": None, "ahead": 0}, "untagged (not a git checkout)"),
+])
+def test_installed_line_names_every_shape_a_checkout_can_be_in(info, line):
+    assert _lg().installed_line(info) == line
+
+
+def test_lg_version_on_a_tagged_clone_that_matches_origin(clone_repo, monkeypatch, capsys):
+    """The everyday case: two lines, and nothing telling the user to update."""
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    code, out, err = _version(clone_repo.root, monkeypatch, capsys)
+    assert code == 0
+    assert out.splitlines() == ["installed: v0.1.0", "latest: v0.1.0 (up to date)"]
+    # `lg version | head -1` has to stay stable, so nothing goes to stderr.
+    assert err == ""
+
+
+def test_lg_version_says_run_lg_update_when_origin_is_ahead(clone_repo, monkeypatch, capsys):
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin_only(clone_repo, "v0.2.0")
+    code, out, _ = _version(clone_repo.root, monkeypatch, capsys)
+    assert code == 0
+    assert out.splitlines() == ["installed: v0.1.0", "latest: v0.2.0", "update: run lg update"]
+
+
+def test_lg_version_on_an_untagged_clone_with_an_origin_release(clone_repo, monkeypatch, capsys):
+    """Every checkout cloned before the first release, once one exists."""
+    _release_on_origin_only(clone_repo, "v0.1.0")
+    code, out, _ = _version(clone_repo.root, monkeypatch, capsys)
+    lines = out.splitlines()
+    assert code == 0
+    assert re.fullmatch(r"installed: untagged \([0-9a-f]{7}\)", lines[0])
+    assert lines[1:] == ["latest: v0.1.0", "update: run lg update"]
+
+
+def test_lg_version_when_origin_has_no_tags(clone_repo, monkeypatch, capsys):
+    """A remote that has never released is silence, not news: no update line."""
+    code, out, _ = _version(clone_repo.root, monkeypatch, capsys)
+    lines = out.splitlines()
+    assert code == 0
+    assert lines[1:] == ["latest: none (origin has no releases yet)"]
+
+
+def test_lg_version_when_origin_is_unreachable_exits_0_and_says_why(
+        clone_repo, tmp_path, monkeypatch, capsys):
+    """Offline, or an origin that moved. Asking what you have installed still has
+    to answer, and a script wrapping the command must not start failing."""
+    clone_repo.git("remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    code, out, err = _version(clone_repo.root, monkeypatch, capsys)
+    lines = out.splitlines()
+    assert code == 0
+    assert lines[0].startswith("installed: ")
+    assert lines[1].startswith("latest: unknown (could not reach origin: ")
+    assert len(lines) == 2
+    assert err == ""
+
+
+def test_lg_version_outside_a_git_checkout_exits_0(tmp_path, monkeypatch, capsys):
+    """A tree unpacked from an archive rather than cloned.
+
+    The ceiling is what keeps git inside tmp_path: without it, a TMPDIR under a
+    checkout would have git answer about that repository and ask its real origin.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    unpacked = tmp_path / "unpacked"
+    unpacked.mkdir()
+    code, out, _ = _version(unpacked, monkeypatch, capsys)
+    lines = out.splitlines()
+    assert code == 0
+    assert lines[0] == "installed: untagged (not a git checkout)"
+    assert lines[1].startswith("latest: unknown (")
+
+
+def test_lg_version_json_carries_the_six_keys(clone_repo, monkeypatch, capsys):
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    code, out, _ = _version(clone_repo.root, monkeypatch, capsys, as_json=True)
+    said = json.loads(out)
+    assert code == 0
+    assert set(said) == {"installed", "commit", "ahead", "latest", "behind", "error"}
+    assert said["installed"] == "v0.1.0"
+    assert said["latest"] == "v0.1.0"
+    assert said["ahead"] == 0
+    assert re.fullmatch(r"[0-9a-f]{7}", said["commit"])
+    assert said["behind"] is False
+    assert said["error"] is None
+
+    _release_on_origin_only(clone_repo, "v0.2.0")
+    code, out, _ = _version(clone_repo.root, monkeypatch, capsys, as_json=True)
+    said = json.loads(out)
+    assert code == 0
+    assert (said["installed"], said["latest"], said["behind"]) == ("v0.1.0", "v0.2.0", True)
+    assert said["error"] is None
+
+
+def test_lg_version_json_carries_the_reason_when_origin_is_unreachable(
+        clone_repo, tmp_path, monkeypatch, capsys):
+    """Whatever reads this has to tell "no release yet" from "no answer"."""
+    clone_repo.tag("v0.1.0")
+    clone_repo.git("remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    with pytest.raises(RemoteError) as raised:
+        remote_newest(clone_repo.root, 10)
+    code, out, _ = _version(clone_repo.root, monkeypatch, capsys, as_json=True)
+    said = json.loads(out)
+    assert code == 0
+    assert said["error"] == str(raised.value)
+    assert said["latest"] is None
+    assert said["behind"] is False
+
+
+def test_lg_version_json_on_a_hand_made_tag_that_does_not_parse(
+        clone_repo, monkeypatch, capsys):
+    """`--match 'v*'` names a hand-made v0.2.0-rc1 too. It is reported as it is
+    and counted as no release, so the user is offered the real one."""
+    _release_on_origin_only(clone_repo, "v0.2.0")
+    clone_repo.tag("v0.2.0-rc1")
+    code, out, _ = _version(clone_repo.root, monkeypatch, capsys, as_json=True)
+    said = json.loads(out)
+    assert code == 0
+    assert said["installed"] == "v0.2.0-rc1"
+    assert said["latest"] == "v0.2.0"
+    assert said["behind"] is True
