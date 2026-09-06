@@ -22,3 +22,8 @@ runs/*
 runs/*/worktrees/
 runs/*/logs/
 runs/*/target/
+
+# Phase working papers: specs, plans and gap reports. They are how a change got
+# built, not part of the engine, and a gap report runs to hundreds of kilobytes
+# of machine-generated citation. Kept on disk, out of the repo.
+docs/superpowers/
