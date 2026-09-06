@@ -256,6 +256,175 @@ def test_runs_endpoint_without_temporal(server):
     assert row["close_time"] is None, "no workflow, so no time rather than a wrong one"
 
 
+# ---------- the release the header reports ----------
+
+# The checker is the one thing on the dashboard that runs git on a timer, and
+# `remote_newest` is the one that reaches the network. Every test below hands it
+# fakes on ui.version, which is why ui.py calls those two as module attributes.
+
+NO_VERSION = {"installed": None, "latest": None, "behind": False}
+THIS_CHECKOUT = {"tag": "v0.1.0", "commit": "abc1234", "ahead": 0}
+
+
+class Counting:
+    """A stand-in for one of version.py's two git readers that counts its calls.
+
+    `hold_at` holds the checker's thread inside the nth call until `release` is
+    set. That is what makes a count read from the test's own thread a count of
+    what has finished rather than a race with the next tick.
+    """
+
+    def __init__(self, answer, hold_at=None):
+        self.answer, self.hold_at, self.calls = answer, hold_at, 0
+        self.reached, self.release = threading.Event(), threading.Event()
+
+    def __call__(self, *args):
+        self.calls += 1
+        if self.calls == self.hold_at:
+            self.reached.set()
+            self.release.wait(5)
+        return self.answer
+
+
+def patch_version(monkeypatch, local, remote):
+    """Both git readers, replaced on the module ui.py reads them off."""
+    monkeypatch.setattr(ui.version, "installed", local)
+    monkeypatch.setattr(ui.version, "remote_newest", remote)
+
+
+class FakeChecker:
+    """The one member the handler reads, over a canned answer.
+
+    A page request runs no git: it reads what the checker's own thread put in
+    memory, so a reader hitting refresh cannot put `git ls-remote` on the wire.
+    """
+
+    def __init__(self, snap):
+        self.snap = snap
+
+    def snapshot(self):
+        return dict(self.snap)
+
+
+def test_api_runs_reports_a_null_version_with_no_checker(server):
+    """Every fixture in this file builds its server without a checker, which is
+    what keeps the suite off the network. The field is still on the wire: the
+    page reads it on every poll, and a missing key would land the whole poll in
+    the catch branch and put `server error` in the header."""
+    assert getjson(server + "/api/runs")["version"] == NO_VERSION
+
+
+def test_api_runs_carries_the_checkers_snapshot(tmp_path):
+    snap = {"installed": "v0.1.0", "latest": "v0.2.0", "behind": True}
+    srv = ui.make_server(0, tmp_path, temporal_addr=None, checker=FakeChecker(snap))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        d = getjson(f"http://127.0.0.1:{srv.server_address[1]}/api/runs")
+    finally:
+        srv.shutdown()
+    assert d["version"] == snap
+    assert d["temporal"] is False, "the version field is the only thing that moved"
+
+
+def test_the_checker_re_reads_the_tag_without_asking_the_remote(monkeypatch, tmp_path):
+    """A refresh with no remote read is the cheap one the thread does every
+    minute, and it must stay cheap: `git ls-remote` is a network round trip.
+
+    Counted rather than made to raise, because refresh() swallows exceptions —
+    a remote fake that blew up would leave exactly the same snapshot behind.
+    """
+    local, remote = Counting(THIS_CHECKOUT), Counting("v0.2.0")
+    patch_version(monkeypatch, local, remote)
+
+    checker = ui.VersionChecker(tmp_path)
+    assert checker.snapshot() == NO_VERSION, "a checker knows nothing until it reads"
+    checker.refresh(False)
+
+    assert remote.calls == 0, "a refresh with no remote read went to the network anyway"
+    assert local.calls == 1, "the tag was read some number of times other than once"
+    assert checker.snapshot() == {"installed": "v0.1.0", "latest": None, "behind": False}
+    assert checker.snapshot() is not checker.snapshot(), \
+        "a caller holding the dict would see the next refresh half-written"
+
+
+def test_the_checker_keeps_the_latest_it_has_when_the_remote_fails(monkeypatch, tmp_path):
+    """The header is written from this every 4 seconds, so a remote that answered
+    once and then went away must not empty it: a laptop off the network would
+    watch the update hint blink out and come back all afternoon.
+    """
+    def gone(root, timeout):
+        raise ui.version.RemoteError("could not read from remote repository")
+
+    patch_version(monkeypatch, lambda root: THIS_CHECKOUT, lambda root, timeout: "v0.2.0")
+    checker = ui.VersionChecker(tmp_path)
+    checker.refresh(True)
+    assert checker.snapshot() == {"installed": "v0.1.0", "latest": "v0.2.0", "behind": True}
+
+    monkeypatch.setattr(ui.version, "remote_newest", gone)
+    checker.refresh(True)
+    assert checker.snapshot() == {"installed": "v0.1.0", "latest": "v0.2.0", "behind": True}
+
+
+def test_start_publishes_the_tag_before_the_thread_has_read_the_remote(monkeypatch, tmp_path):
+    """`serve` starts the checker and then serves, so the first read has to be on
+    the caller's thread. `git describe` is a millisecond; the remote read is a
+    connection to GitHub, and a header that waited on it would be blank for as
+    long as that took, on a page whose only job is to be looked at."""
+    remote = Counting("v0.2.0", hold_at=1)
+    patch_version(monkeypatch, lambda root: THIS_CHECKOUT, remote)
+
+    checker = ui.VersionChecker(tmp_path)
+    checker.start()
+    try:
+        assert remote.reached.wait(5), "the thread never got as far as the remote"
+        assert checker.snapshot() == {"installed": "v0.1.0", "latest": None, "behind": False}
+    finally:
+        remote.release.set()
+        checker.stop()
+
+
+def test_the_loop_reads_the_tag_every_tick_and_the_remote_every_few(monkeypatch, tmp_path):
+    """The two reads cost different things, so they run at different rates: the
+    local one every period, the remote one every remote_every-th wake. Held still
+    inside the third remote read, the counts are exact — one local read in
+    start(), one per tick since, and the remote at the thread's own first read
+    and then at ticks 3 and 6."""
+    local, remote = Counting(THIS_CHECKOUT), Counting("v0.2.0", hold_at=3)
+    patch_version(monkeypatch, local, remote)
+
+    checker = ui.VersionChecker(tmp_path, period=0.01, remote_every=3)
+    checker.start()
+    try:
+        assert remote.reached.wait(5), "the loop never reached its sixth tick"
+        assert (local.calls, remote.calls) == (7, 3)
+    finally:
+        remote.release.set()
+        checker.stop()
+
+
+def test_the_header_carries_the_release_beside_the_name():
+    """AC-15 on the page. Its own span, because the poll rewrites #hdr from what
+    Temporal said and the release has nothing to do with that."""
+    header = re.search(r"<header>(.*?)</header>", ui.page_html(), re.S)
+    assert header, "the page has no header"
+    inner = header.group(1)
+    assert '<span id="ver"></span>' in inner, \
+        "the span is not empty, so the page ships text no poll has checked"
+    assert inner.index("loopgraph") < inner.index('id="ver"') < inner.index('id="hdr"'), \
+        "the release does not sit between the name and the Temporal line"
+
+
+def test_the_poll_writes_the_update_hint_through_setText():
+    """AC-16. The words are what a reader acts on — `lg update` is the command —
+    and they go through the guarded setter like every other text on this page, so
+    a poll that changes nothing takes nobody's selection with it."""
+    src = function_source(ui.page_html(), "runs")
+    assert "' available · lg update'" in src, "the header never names the command"
+    assert "untagged" in src, "a checkout with no tag leaves a gap beside the name"
+    assert re.search(r"setText\(ver,", src), "the release is written some other way"
+    assert ".textContent =" not in src, "a poll writes text without checking it changed"
+
+
 # ---------- the ledger, per workflow id ----------
 
 LEDGER = {"status": "merge-ready", "rounds": [{"verdict": "PASS"}]}
@@ -609,6 +778,21 @@ def test_the_injected_pattern_survives_javascript():
 #     That box is `display:inline-block`, the same shape as the rule that beat
 #     `hidden` in item 3, and the command is the highest-stakes text on the page:
 #     it is the only thing here that changes what a run does.
+#
+# 10. Read the header. This item needs no run at all, so it is the cheap one.
+#     See: the release this checkout is on beside the name — `v0.2.0`, or
+#     `untagged` on a clone that has no tag yet — as soon as the first
+#     `/api/runs` lands, and never a blank gap that fills in a second or two
+#     later. A gap is the page waiting on the remote read, which is the whole
+#     reason the local one happens before the checker's thread starts. Beside it,
+#     `engine dashboard` reads exactly as it did before, in the same dim 12px.
+#     Then look at it on a checkout that is behind origin: clone this repository
+#     into a temporary directory, check an older tag out in the clone, and run
+#     `.venv/bin/python ui.py 8410` from there.
+#     See: `v0.1.0 · v0.2.0 available · lg update`, in that same dim style, with
+#     `engine dashboard` still untouched next to it. `lg update` is the command
+#     the reader is meant to type, so it is the one word here that has to survive
+#     being read at a glance.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
@@ -2070,10 +2254,22 @@ def test_diff_rejects_bad_ids(server, bad):
 
 def test_the_dashboard_has_no_write_methods():
     """AC-38, read off the source: one handler method, and every git invocation
-    naming its subcommand right next to the program, so this can see them all."""
+    naming its subcommand right next to the program, so this can see them all.
+
+    Both files, because the dashboard process runs git in two of them now: the
+    diff pane here, and the version checker's reads through version.py. A guard
+    that read only this file would leave the checker's git unwatched, and the
+    checker is the half with a remote in it.
+    """
     src = Path(ui.__file__).read_text()
     assert re.findall(r"def (do_\w+)\(", src) == ["do_GET"]
-    subcommands = re.findall(r'"git",\s*"([a-z][a-z-]*)"', src)
-    assert set(subcommands) == {"rev-parse", "diff"}
-    assert src.count('"git"') == len(subcommands), \
-        "a git invocation whose subcommand is not a literal beside it"
+    for path, expected in [(Path(ui.__file__), {"rev-parse", "diff"}),
+                           (Path(ui.version.__file__),
+                            {"describe", "rev-parse", "rev-list", "ls-remote"})]:
+        text = path.read_text()
+        subcommands = re.findall(r'"git",\s*"([a-z][a-z-]*)"', text)
+        assert set(subcommands) == expected, f"{path.name} runs a git command nobody expected"
+        assert text.count('"git"') == len(subcommands), \
+            f"{path.name} has a git invocation whose subcommand is not a literal beside it"
+        assert not {"push", "commit", "checkout", "merge", "reset"} & set(subcommands), \
+            f"{path.name} writes with git from a process that only reads"

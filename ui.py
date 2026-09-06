@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import version
 from activities.stream import LOG_GLOB, LOG_RE
 from envfile import read_env
 
@@ -165,7 +166,7 @@ PAGE = """<!doctype html>
   @media (max-width:900px) { .panels { flex-direction:column; align-items:stretch; }
                              #runs { width:240px; } }
 </style></head><body>
-<header><b>loopgraph</b><span id="hdr">engine dashboard</span></header>
+<header><b>loopgraph</b><span id="ver"></span><span id="hdr">engine dashboard</span></header>
 <main><div id="runs"></div><div id="board"><div class="empty">select a run</div></div></main>
 <script>
 // Two kinds of function on this page, and the names are the contract.
@@ -747,7 +748,7 @@ async function patchDiff(pane) {
   cut.hidden = !d.truncated;
 }
 async function runs() {
-  const hdr = document.getElementById('hdr');
+  const hdr = document.getElementById('hdr'), ver = document.getElementById('ver');
   try {
     const d = await (await fetch('/api/runs')).json();
     patchRuns(d.runs || []);
@@ -759,6 +760,11 @@ async function runs() {
     const first = document.getElementById('runs').firstElementChild;
     if (!sel && first) first.click();
     setText(hdr, d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only');
+    // Read off the reply the rows came from, so the release and the runs on
+    // screen are never one poll apart. A checkout with no tag still gets a word:
+    // an empty span beside the name reads as the page having failed to load.
+    const v = d.version || {}, here = v.installed || 'untagged';
+    setText(ver, v.behind ? here + ' · ' + v.latest + ' available · lg update' : here);
   } catch(e) { setText(hdr, 'server error'); }
 }
 async function poll() {
@@ -1260,6 +1266,83 @@ class TemporalFeed:
             return []
 
 
+# What the page is told when nothing is checking, and what a checker says before
+# its first read lands. One shape either way, so the header has one path through.
+NO_VERSION = {"installed": None, "latest": None, "behind": False}
+
+
+class VersionChecker:
+    """What release this checkout is on and whether origin has a newer one.
+
+    On its own thread, because a request must never wait on git. The remote read
+    is a connection to GitHub: hung on a poll it would stall the page every time
+    the network did, and every reader watching would hold a connection open
+    against the same remote. So the reads happen here and a request only reads
+    the answer they left in memory.
+
+    The two reads run at different rates for the same reason. The local one is a
+    `git describe` against a checkout the owner may be committing to, so it runs
+    every period; the remote one costs a round trip and answers a question whose
+    answer changes every few weeks, so it runs rarely.
+    """
+
+    def __init__(self, root: Path, remote_timeout: float = 10.0,
+                 period: float = 60.0, remote_every: int = 60) -> None:
+        self._root = root
+        self._remote_timeout = remote_timeout
+        self._period, self._remote_every = period, remote_every
+        self._state = dict(NO_VERSION)
+        self._stop = threading.Event()
+
+    def snapshot(self) -> dict:
+        """The last answer read, copied so a caller cannot edit what the thread owns."""
+        return dict(self._state)
+
+    def refresh(self, remote: bool) -> None:
+        """One wake's worth of reading."""
+        self._read(local=True, remote=remote)
+
+    def _read(self, local: bool, remote: bool) -> None:
+        # Nothing in here raises. It runs on a thread with nobody to tell, and a
+        # remote that cannot be reached is the ordinary state of a laptop rather
+        # than a failure: the header keeps the answer it has until a later read
+        # replaces it, instead of blinking the update hint out and back.
+        state = dict(self._state)
+        if local:
+            try:
+                state["installed"] = version.installed(self._root)["tag"]
+            except Exception:
+                pass
+        if remote:
+            try:
+                state["latest"] = version.remote_newest(self._root, self._remote_timeout)
+            except Exception:
+                pass
+        state["behind"] = version.is_behind(state["installed"], state["latest"])
+        # One reference swapped, never the fields one at a time, so a request that
+        # lands mid-read gets the old answer whole rather than a new tag beside a
+        # remote that has not been asked yet.
+        self._state = state
+
+    def start(self) -> None:
+        # The local read happens here, on the caller's thread, so the first page
+        # anyone loads already names the release. It is a `git describe`, which
+        # costs a millisecond; the remote read is what the thread is for.
+        self.refresh(False)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        # The remote alone to begin with: the tag was read a moment ago in start().
+        self._read(local=False, remote=True)
+        tick = 0
+        while not self._stop.wait(self._period):
+            tick += 1
+            self.refresh(remote=tick % self._remote_every == 0)
+
+
 # ---------- server ----------
 
 def page_html() -> str:
@@ -1274,11 +1357,15 @@ def page_html() -> str:
 
 
 def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhost:7233",
-                feed=None) -> ThreadingHTTPServer:
+                feed=None, checker=None) -> ThreadingHTTPServer:
     """The dashboard's server. `feed` stands in for the Temporal connection.
 
     The handler reads only `connected`, `runs()` and `ledger()` off it, so a test
     can pass a fake and assert the endpoints over HTTP with no engine running.
+
+    `checker` is a VersionChecker, and there is no default one: a server built
+    without it says nothing about releases and runs no git of its own, which is
+    what keeps the suite off the network.
     """
     if feed is None and temporal_addr:
         feed = TemporalFeed(temporal_addr)
@@ -1333,7 +1420,8 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                         # and no times: the page shows none rather than a wrong one.
                         wf.append({"id": d, "dir": d, "state": "unknown", "detail": "logs only",
                                    "start_time": None, "close_time": None})
-                self._json({"runs": wf, "temporal": bool(feed and feed.connected)})
+                self._json({"runs": wf, "temporal": bool(feed and feed.connected),
+                            "version": checker.snapshot() if checker else NO_VERSION})
             elif u.path == "/api/run":
                 wf_id = parse_qs(u.query).get("id", [""])[0]
                 if bad_param(wf_id):
@@ -1359,7 +1447,11 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
 
 
 def serve(port: int = 8400, temporal_addr: str | None = "localhost:7233") -> None:
-    srv = make_server(port, ROOT / "runs", temporal_addr)
+    # start() reads the tag here and leaves the remote to its own thread, so the
+    # dashboard is listening as fast as it was before there was a checker.
+    checker = VersionChecker(ROOT)
+    checker.start()
+    srv = make_server(port, ROOT / "runs", temporal_addr, checker=checker)
     print(f"loopgraph ui → http://localhost:{port}", flush=True)
     srv.serve_forever()
 
