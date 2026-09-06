@@ -175,8 +175,10 @@ def test_trim_pass_keeps_ten_lines_and_a_tail_only_where_there_is_a_note():
     assert (trimmed["pass"], trimmed["complete"], trimmed["total"]) == (4, False, 93)
     kept, failed = trimmed["detectors"]
     assert kept["lines"] == SIXTY[:10]
-    assert set(kept) == {"name", "exit_code", "count", "note", "lines"}
-    assert set(failed) == {"name", "exit_code", "count", "note", "lines", "stderr_tail"}
+    assert set(kept) == {"name", "cmd", "exit_code", "count", "note", "lines"}
+    assert set(failed) == {"name", "cmd", "exit_code", "count", "note", "lines",
+                           "stderr_tail"}
+    assert failed["cmd"] == "ts-prune .", "which command failed is the owner's next move"
     assert failed["stderr_tail"] == "boom\n"
 
 

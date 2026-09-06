@@ -239,12 +239,15 @@ def trim_pass(found: dict, pass_no: int) -> dict:
     executor still gets all 60: this returns a copy and leaves `found` alone,
     which is what the item text is built from. The stderr tail is kept only where
     the note says there is something to read, which is the same test `lg status`
-    and the dashboard use to decide whether to name the detector at all.
+    and the dashboard use to decide whether to name the detector at all. `cmd`
+    stays whatever the note says: it is one short string, and an owner reading a
+    failed pass wants to see which command it was.
     """
     detectors = []
     for d in found["detectors"]:
-        kept = {"name": d["name"], "exit_code": d["exit_code"], "count": d["count"],
-                "note": d["note"], "lines": d["lines"][:LEDGER_LINES]}
+        kept = {"name": d["name"], "cmd": d["cmd"], "exit_code": d["exit_code"],
+                "count": d["count"], "note": d["note"],
+                "lines": d["lines"][:LEDGER_LINES]}
         if d["note"]:
             kept["stderr_tail"] = d["stderr_tail"]
         detectors.append(kept)
