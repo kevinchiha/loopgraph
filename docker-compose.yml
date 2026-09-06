@@ -62,7 +62,11 @@ services:
       - ${LOOPGRAPH_PROJECTS_DIR:?not set - run ./install.sh}:/projects
       # Shared npm cache so gates that run `npm ci` in a fresh worktree are not slow.
       - ${LOOPGRAPH_NPM_CACHE:?not set - run ./install.sh}:/home/worker/.npm
-    restart: unless-stopped
+    # No restart policy, here or on the dispatcher, on purpose. Postgres and
+    # temporal do not come back after a reboot, so a worker that did came up
+    # against a database that was not there and crash-looped for hours while the
+    # engine looked like it was running. Bring the stack up deliberately with
+    # `docker compose up -d`.
 
   dispatcher:
     # The only thing that reads Telegram. Telegram allows one getUpdates per bot,
@@ -85,7 +89,6 @@ services:
     volumes:
       - ./:/app
     command: ["python", "dispatcher.py"]
-    restart: unless-stopped
 
 volumes:
   temporal-pg:
