@@ -13,6 +13,65 @@ brief + gates  →  executor round  →  gates (code, no model)  →  audit (fre
                                                               decision → you
 ```
 
+<p align="center">
+  <img src="screenshots/telegram-card.jpg" width="330" alt="A loopgraph merge card in Telegram, with A, B and C buttons">
+</p>
+
+<p align="center">
+  <em>The end of a run. It found me on my phone, said what it had checked and how,<br>
+  and waited. A is the only thing between that branch and main.</em>
+</p>
+
+## What actually happens
+
+If you have never run anything like this, here is one job from start to finish.
+
+1. **You write down the job.** A short file saying what you want, how anyone would
+   know it worked, and which files are allowed to change. Your coding agent writes
+   this for you and shows it to you before anything starts.
+
+2. **An agent goes and does it.** In a container, on its own branch of your repo.
+   Your working copy is not touched and neither is your main branch.
+
+3. **Your own test suite decides whether it worked.** Not the agent's opinion of
+   its work. The literal `pytest` or `npm run build` you already run, which either
+   exits 0 or does not.
+
+4. **If something failed, it is told what and tries again.** Three attempts. After
+   that it stops rather than grinding, and the job moves on.
+
+5. **A second agent checks the claim.** It gets your brief and the diff. It does
+   not get the first agent's reasoning, notes or chat log, so "all tests pass" is
+   something it has to go and verify rather than a fact it inherits.
+
+6. **Your phone asks you.** The work is committed on a branch. Nothing is merged,
+   nothing is pushed. You tap A, B or C.
+
+## Words you will see
+
+**Run** — one job. A directory under `runs/` holding your instructions plus
+everything the engine wrote while working.
+
+**Brief** — the file where you say what you want, how you will know it worked, and
+which files may change.
+
+**Gate** — a shell command that has to exit 0. Your tests, your build, your linter.
+No model gets a vote here.
+
+**Write set** — the list of files the agent may touch. Change anything else and the
+round fails.
+
+**Executor** — the agent that writes the code.
+
+**Auditor** — the second agent, called `supervisor` in the logs. It sees the brief
+and the diff and nothing else, so it cannot be talked into agreeing with itself.
+
+**Round** — one attempt: write, run the gates, get checked. Three per item, then it
+escalates.
+
+**Parked** — an item that would not go green in three rounds. The run leaves it,
+tells you, and carries on with the rest.
+
 ## Why
 
 The usual routine is: open a coding agent, describe a feature, watch it type,
@@ -26,13 +85,15 @@ must exit 0, and the auditor is a separate agent with a fresh context that only
 sees the brief and the diff. It never sees the reasoning that produced the code,
 which is the whole point. An executor that says "all tests pass" gets checked.
 
-**Long runs die.** So the orchestration is [Temporal](https://temporal.io): the
-run's state is durable, and a reboot in the middle resumes rather than restarts.
-Waiting two days for you to answer a decision costs nothing.
+**Long runs die.** So the run is driven by [Temporal](https://temporal.io), a job
+runner that writes down every step it takes. Reboot the machine halfway through and
+the run picks up where it was instead of starting over. Waiting two days for you to
+answer a decision costs nothing.
 
-Inside one round, [LangGraph](https://github.com/langchain-ai/langgraph) runs the
-small loop: produce, gate, correct, repeat, capped at three attempts. After that
-it escalates to the auditor instead of grinding.
+Inside one round, [LangGraph](https://github.com/langchain-ai/langgraph), a library
+for wiring steps into a loop, runs the small one: produce, gate, correct, repeat,
+capped at three attempts. After that it escalates to the auditor instead of
+grinding.
 
 ## What you need
 
@@ -158,10 +219,12 @@ The skill writes these for you, but read this section anyway. It is what you are
 checking when the agent shows you a brief before starting a run, and a brief you
 did not read is a run you cannot judge.
 
-A run is a directory under `runs/`. Three files:
+A run is a directory under `runs/`. Its name is the run's slug, and that is how
+you refer to it everywhere else. Three files go in it:
 
-**`brief.md`** — the feature, the checkable done-when, and the write set: the exact
-paths the executor may touch. One screen. A vague brief produces vague work.
+**`brief.md`** — what you want, how anyone could check it is done, and the write
+set: the exact paths the executor may touch. One screen. A vague brief produces
+vague work.
 
 List the work under a `## Work items` heading and the run does them one at a time:
 
@@ -216,13 +279,33 @@ build byproducts. Never fix it by loosening the scope gate.
 
 ```bash
 lg status runs/<slug>             # what the run is doing
-lg status <workflow-id> ledger    # the raw ledger, as before
+lg status <workflow-id> ledger    # every step it took, raw
 lg tail runs/<slug>               # live executor and audit streams
 lg ui                             # dashboard on http://localhost:8400
 ```
 
-Temporal's own UI is on http://localhost:8233 and shows the workflow history,
-which is the place to look when something is stuck rather than slow.
+`lg ui` is the one to start with. Every run you have ever done is down the left
+side, and picking one shows what it decided and why. The reasons are the auditor's
+own words, written before it knew whether you would agree.
+
+![The loopgraph dashboard: a list of past runs on the left, and one run's audit verdict and reasons on the right](screenshots/dashboard.jpg)
+
+Open a round and you get both agents side by side. The executor on the left is
+writing the code. The auditor on the right is opening the same files to check what
+it was told about them.
+
+![The executor and supervisor logs open next to each other, one editing cli.py and the other reading it back](screenshots/agents.jpg)
+
+Temporal's own UI is on http://localhost:8233. That is where you look when a run is
+stuck rather than slow. Every run you have started is a row:
+
+![The Temporal web UI listing sixteen loopgraph workflows and their statuses](screenshots/temporal-workflows.jpg)
+
+Open one and you get every step it took and how long each took. Read this one from
+the bottom up: it set up, ran a round, audited it, ran a second round, audited that,
+sent the card, and the pink block near the end is me answering.
+
+![A Temporal timeline showing run_baseline, load_work_items, two execute_round and audit pairs, then send_card and decide](screenshots/temporal-timeline.jpg)
 
 ## When it talks to you
 
@@ -248,7 +331,8 @@ lg approve <workflow-id> A     # A merge, B keep the branch, C delete the branch
 ```
 
 A merge is local and is never pushed. C deletes the run's branch and its worktree,
-so the work is gone; B is the one to pick if you want to look at it later.
+the throwaway checkout of your repo the run worked in, so the work is gone. B is
+the one to pick if you want to look at it later.
 
 The same question is already on your phone with buttons, and a tap does the same
 thing. `lg approve` is for when you are at the machine anyway; it is not a
@@ -280,7 +364,7 @@ Nothing above needs an agent. The skill is a shortcut, not a dependency.
 lg where                                                # paths and ports here
 lg start runs/example-hello /projects/loopgraph-example
 lg status runs/<slug>                                   # what the run is doing
-lg status <workflow-id> ledger                          # the raw ledger, as before
+lg status <workflow-id> ledger                          # every step it took, raw
 lg approve <workflow-id> A
 ```
 
@@ -303,7 +387,8 @@ never use it: it is the shortest description of how to drive this thing properly
   database, a dev server, whatever else you have running. Temporal is bound to
   loopback so nothing on your network can reach it, but the executor is not "on
   your network", it is on your machine. Read a brief before you start it, and do
-  not run this on a box where loopback is a trust boundary.
+  not run this on a box where "it only listens locally" is what keeps something
+  safe.
 - Three rounds, then it escalates. It does not grind forever, and it does not
   quietly give up either.
 - Linux and Docker only.
@@ -312,13 +397,21 @@ never use it: it is the shortest description of how to drive this thing properly
 
 ## How it fits together
 
-[SPEC.md](SPEC.md) is the original design doctrine and still the best explanation
-of why the pieces are arranged this way. `docs/architecture.html` is an explorable
-diagram of the same thing.
+![Every piece of loopgraph and how they connect: you and the Telegram bot on the left, the dispatcher and Temporal in the middle, and the worker container running LoopGraphRun, execute_round, gates, audit and checkpoint on the right](screenshots/architecture.png)
 
-Both predate the dispatcher. They show a run reading Telegram for itself, which is
-how it worked until one poller replaced per-run polling; the shape everywhere else
-is unchanged. `dispatcher.py` and this README are the current word on that part.
+The yellow dashed box is the worker container, where a round actually happens.
+`Gates` sits inside it and is the one box no model can influence: exit codes only.
+
+The two red dashed marks are the parts worth knowing about. Temporal is bound to
+`127.0.0.1`, so nothing on your network can reach it. And the auditor is handed
+`Read`, `Glob` and `Grep` and nothing else, so it cannot quietly fix the thing it
+is supposed to be judging.
+
+[SPEC.md](SPEC.md) is the original design doctrine and still the best explanation
+of why the pieces are arranged this way. It predates the dispatcher, so it shows a
+run reading Telegram for itself, which is how it worked until one poller replaced
+per-run polling. The shape everywhere else is unchanged. `dispatcher.py` and this
+README are the current word on that part.
 
 ## License
 

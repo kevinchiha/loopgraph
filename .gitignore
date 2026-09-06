@@ -23,7 +23,8 @@ runs/*/worktrees/
 runs/*/logs/
 runs/*/target/
 
-# Phase working papers: specs, plans and gap reports. They are how a change got
-# built, not part of the engine, and a gap report runs to hundreds of kilobytes
-# of machine-generated citation. Kept on disk, out of the repo.
-docs/superpowers/
+# docs/ is a scratch pad: phase specs, plans, gap reports, and the generated
+# architecture diagram. They are how a change got built, not part of the engine,
+# and they run to megabytes of machine-generated text nobody reads. Kept on disk,
+# out of the repo. README screenshots live in screenshots/ so they still ship.
+docs/
