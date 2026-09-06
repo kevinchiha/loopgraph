@@ -28,7 +28,7 @@ from activities.gate import _drain, _kill_group
 
 STDOUT_CAP = 1_048_576   # bytes of detector stdout kept, from the front
 STDERR_TAIL = 2000       # characters of detector stderr kept, from the end
-LINES_SHOWN = 60         # candidates quoted back in the item and the ledger
+LINES_SHOWN = 60         # candidates quoted back in the item; the ledger keeps fewer (trim_pass)
 
 
 def count_candidates(data: bytes) -> tuple[int, list[str]]:

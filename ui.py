@@ -466,8 +466,9 @@ function patchSweep(ledger) {
       rows.insertBefore(row, after ? after.nextSibling : rows.firstChild);
     }
     // A non-empty note means there is something to read about that detector: it
-    // died, or its output was cut at 1 MiB. The names are the owner's answer to
-    // which tool to go and look at. Both lines are lg status's, word for word,
+    // died, or its output was cut at 1 MiB. Names print only on an incomplete
+    // pass, and a pass is incomplete only when a detector died, so what the owner
+    // sees here is the tool to go and look at. Both lines are lg status's, word for word,
     // and each is written whole rather than pasted together from a stem and a
     // clause, so the two files cannot word one of them differently.
     const names = (p.detectors || []).filter(d => d.note).map(d => d.name).join(', ');
