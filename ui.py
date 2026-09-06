@@ -465,11 +465,11 @@ function patchSweep(ledger) {
       // reader has selected stays selected.
       rows.insertBefore(row, after ? after.nextSibling : rows.firstChild);
     }
-    // Only a detector that failed carries a note, and a failed one counts zero
-    // whatever it printed, which is what makes the pass incomplete. The names are
-    // the owner's answer to which tool to go and fix. Both lines are lg status's,
-    // word for word, and each is written whole rather than pasted together from a
-    // stem and a clause, so the two files cannot word one of them differently.
+    // A non-empty note means there is something to read about that detector: it
+    // died, or its output was cut at 1 MiB. The names are the owner's answer to
+    // which tool to go and look at. Both lines are lg status's, word for word,
+    // and each is written whole rather than pasted together from a stem and a
+    // clause, so the two files cannot word one of them differently.
     const names = (p.detectors || []).filter(d => d.note).map(d => d.name).join(', ');
     setText(row, p.complete ? `pass ${p.pass}: ${p.total} candidates`
                             : `pass ${p.pass}: ${p.total} candidates (incomplete: ${names})`);

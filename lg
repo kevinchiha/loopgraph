@@ -179,9 +179,9 @@ def format_status(ledger: dict) -> str:
         block = ["sweep:"]
         passes = sweep.get("passes") or []
         for p in passes:
-            # Only a detector that failed carries a note, and a failed one counts
-            # zero whatever it printed, which is what makes the pass incomplete.
-            # The names are the owner's answer to which tool to go and fix.
+            # A non-empty note means there is something to read about that
+            # detector: it died, or its output was cut at 1 MiB. The names are
+            # the owner's answer to which tool to go and look at.
             names = ", ".join(d.get("name", "") for d in p.get("detectors") or []
                               if d.get("note"))
             key = "pass" if p.get("complete") else "pass_incomplete"

@@ -22,7 +22,7 @@ from activities.config import parse_run_config
 from activities.execute_round import clean_candidates
 from workflow_fake import (ACCEPT, COMMITTED, DEFAULT_CONFIG, GREEN_ROUND, START,
                            ScriptedWorkflow, drive)
-from workflows.run import build_sweep_item, sweep_end_reason
+from workflows.run import build_sweep_item, sweep_end_reason, trim_pass
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -157,6 +157,41 @@ def test_a_brief_run_has_no_sweep_key():
     """AC-23. `lg status` and the dashboard show the sweep section only when the
     ledger has one, so a brief run must not grow an empty one."""
     assert "sweep" not in drive(ScriptedWorkflow())
+
+
+# ---------- what the ledger carries, and what only the item text gets ----------
+
+SIXTY = [f"cli.py:{i}: unused function 'f{i}'" for i in range(1, 61)]
+
+
+def test_trim_pass_keeps_ten_lines_and_a_tail_only_where_there_is_a_note():
+    """AC-23. The ledger is the `ledger` query's whole reply on every dashboard
+    poll and the workflow's own return value, and Temporal caps a payload at
+    2 MB. A green detector's stderr tail is up to 2000 characters nobody will
+    open; the note is what says there is something there to read."""
+    loud = dict(_det(count=93), lines=SIXTY, stderr_tail="deprecated\n")
+    broken = dict(_det(name="ts-prune", note="exit 1"), stderr_tail="boom\n")
+    trimmed = trim_pass(_pass(loud, broken), 4)
+    assert (trimmed["pass"], trimmed["complete"], trimmed["total"]) == (4, False, 93)
+    kept, failed = trimmed["detectors"]
+    assert kept["lines"] == SIXTY[:10]
+    assert set(kept) == {"name", "exit_code", "count", "note", "lines"}
+    assert set(failed) == {"name", "exit_code", "count", "note", "lines", "stderr_tail"}
+    assert failed["stderr_tail"] == "boom\n"
+
+
+def test_the_ledger_keeps_a_trimmed_pass_and_the_item_the_whole_sample():
+    """AC-23. The trim is the ledger's alone. The executor is handed every line
+    the detector printed, because the sample is the work; the ledger is carried
+    on every status query and has to stay small."""
+    loud = dict(_det(count=93), lines=SIXTY, stderr_tail="x" * 2000)
+    fake = ScriptedWorkflow(config=_sweep(max_items=1), passes=[_pass(loud)])
+    ledger = drive(fake)
+    kept = ledger["sweep"]["passes"][0]["detectors"][0]
+    assert kept["lines"] == SIXTY[:10]
+    assert "stderr_tail" not in kept, "the detector was green"
+    assert [line for line in ledger["items"][0]["item"].splitlines()
+            if line in SIXTY] == SIXTY
 
 
 # ---------- what ends a sweep ----------

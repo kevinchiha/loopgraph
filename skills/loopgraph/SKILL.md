@@ -35,8 +35,8 @@ cd <engine_root> && <docker> compose ps
 after installing.) The run dir already exists. Skip to step 2 with
 `runs/example-hello` and `/projects/loopgraph-example`. Do not write a new brief.
 
-`<engine_root>/runs/<YYYY-MM-DD>-<short-slug>/` with exactly these three, plus
-`run.yaml` for a sweep:
+`<engine_root>/runs/<YYYY-MM-DD>-<short-slug>/` with exactly these three files, plus
+`run.yaml` for a sweep or to change the convergence defaults:
 
 - `brief.md` — the feature, the checkable done-when, and the write set (the exact
   paths the executor may touch). One screen, no more. If the request is vague,

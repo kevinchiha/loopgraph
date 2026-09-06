@@ -71,7 +71,7 @@ tells you, and carries on with the rest.
 
 **Sweep** — a run with no work items of its own. It asks the detectors what is
 dead, removes some of it, asks again, and stops when two passes in a row come back
-under the floor, or when the deadline or the item cap lands first.
+at or under the floor, or when the deadline or the item cap lands first.
 
 **Detector** — a shell command in `run.yaml` that prints one candidate per line and
 exits 0. `vulture`, `ts-prune`, a grep you wrote. What it prints is the only count

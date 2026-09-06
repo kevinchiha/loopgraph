@@ -149,6 +149,9 @@ def test_an_empty_brief_or_sweep_item_still_parks_at_checkpoint(kind):
     # Every outcome carries its round result: a sweep harvests the executor's
     # candidates off a parked item as well as an accepted one.
     assert outcome["result"]["files"] == []
+    # And nothing else: a parked outcome that grew a `checkpoint` key would be
+    # read by `run` as an item that committed something.
+    assert set(outcome) == {"status", "reason", "result"}
     assert "checkpoint" in _names(fake)
 
 
@@ -263,6 +266,45 @@ def test_a_parked_convergence_item_resets_the_counters_too():
     assert ledger["items"][2]["status"] == "parked"
     assert ledger["items"][2]["reason"] == \
         "checkpoint refused: net lines +37 exceed the cap of 0"
+
+
+class _NoteDuringItem(ScriptedWorkflow):
+    """A run with the owner sending one note while a chosen item is executing.
+
+    That is how a reply really arrives: the dispatcher signals `decide` at
+    whatever moment the owner types, and the run picks it up between items. The
+    scripts here give every item one round, so counting `execute_round` calls
+    counts items.
+    """
+
+    def __init__(self, during_item: int, note: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._during_item, self._note = during_item, note
+        self._items_seen = 0
+
+    async def execute_activity(self, fn, args=None, **kwargs):
+        result = await super().execute_activity(fn, args=args, **kwargs)
+        if fn.__name__ == "execute_round":
+            self._items_seen += 1
+            if self._items_seen == self._during_item:
+                self.run.decide(self._note)
+        return result
+
+
+def test_a_note_that_lands_before_an_injection_reaches_the_next_brief_item():
+    """AC-8. The park card tells the owner to reply with anything the next item
+    should know, and the convergence item is not the item they were answering:
+    it is the engine's own. Clearing the note after it spent the reply there and
+    the brief item it was written for never heard a word of it."""
+    note = "the API key is in .env.local"
+    fake = _NoteDuringItem(2, note, config=_config(every_items=2),
+                           items=["one", "two", "three"])
+    ledger = drive(fake)
+    assert _kinds(ledger) == ["brief", "brief", "convergence", "brief"]
+    directives = [args[4] for name, args, _kwargs in fake.scheduled
+                  if name == "execute_round"]
+    assert note in (directives[2] or ""), "the convergence item hears it too"
+    assert directives[3] == f"The owner sent this mid-run, after item 2: {note}"
 
 
 def test_enabled_false_injects_nothing():

@@ -166,7 +166,9 @@ def build_merge_summary(summary: str, total: int, parked: list[dict],
         text = (f"{summary}\n\nParked, NOT in this branch:\n{lines}\n\n"
                 f"Merging takes the {kept} item(s) that passed. The parked ones need "
                 f"another run.")
-    return f"{text}\n\nsweep ended: {ended}" if ended else text
+    # `is not None`, not truthiness: an ending reason that came out empty is a
+    # bug the owner should see on the card, not one that vanishes off it.
+    return f"{text}\n\nsweep ended: {ended}" if ended is not None else text
 
 
 def build_convergence_item(files: list[str]) -> str:
@@ -219,8 +221,35 @@ def build_sweep_item(detector: dict, pass_no: int, extras: list[str]) -> str:
     ])
 
 
-EXTRAS_CAP = 20   # candidates an earlier item found, carried to the next one
-STALL_LIMIT = 3   # sweep items parked in a row before the run gives up
+EXTRAS_CAP = 20    # candidates an earlier item found, carried to the next one
+STALL_LIMIT = 3    # sweep items parked in a row before the run gives up
+LEDGER_LINES = 10  # candidate lines per detector the ledger keeps
+
+
+def trim_pass(found: dict, pass_no: int) -> dict:
+    """A `discover` result cut down to what the ledger can afford to carry.
+
+    The ledger is not a log: it is the `ledger` query's whole reply on every
+    dashboard poll, and the workflow's return value, and Temporal caps a payload
+    at 2 MB. Storing the result whole was measured at 1,569 KB for a 40-item
+    sweep over three detectors and 1,941 KB over four, because every pass kept
+    60 candidate lines and a 2000-character stderr tail per detector.
+
+    Ten lines is enough for the owner to see what a pass was looking at, and the
+    executor still gets all 60: this returns a copy and leaves `found` alone,
+    which is what the item text is built from. The stderr tail is kept only where
+    the note says there is something to read, which is the same test `lg status`
+    and the dashboard use to decide whether to name the detector at all.
+    """
+    detectors = []
+    for d in found["detectors"]:
+        kept = {"name": d["name"], "exit_code": d["exit_code"], "count": d["count"],
+                "note": d["note"], "lines": d["lines"][:LEDGER_LINES]}
+        if d["note"]:
+            kept["stderr_tail"] = d["stderr_tail"]
+        detectors.append(kept)
+    return {"pass": pass_no, "complete": found["complete"], "total": found["total"],
+            "detectors": detectors}
 
 
 def sweep_end_reason(passes: list[dict], sweep: dict, elapsed: float, items_run: int,
@@ -373,7 +402,13 @@ class LoopGraphRun:
             n += 1
             entry["status"] = "running"
             outcome = await self._run_item(run_dir, target_repo, item, n, carried, kind)
-            carried = None
+            if kind == "brief":
+                # Cleared only after a brief item. The park card tells the owner
+                # to reply with anything the next item should know; clearing after
+                # every item spent that reply on the convergence item the engine
+                # injects — its own item, about the run's own growth — and the
+                # brief item the note was written for never saw it.
+                carried = None
             if outcome["status"] == "accepted":
                 cp = outcome["checkpoint"]
                 if cp is None:
@@ -407,8 +442,12 @@ class LoopGraphRun:
             notes = self._drain_decisions()
             if notes:
                 entry.setdefault("owner_notes", []).extend(notes)
-                carried = ("The owner sent this mid-run, after item "
-                           f"{n}: {' / '.join(notes)}")
+                fresh = ("The owner sent this mid-run, after item "
+                         f"{n}: {' / '.join(notes)}")
+                # Joined, not overwritten: a note kept across a convergence item
+                # and a note sent during it are both steering for the same next
+                # brief item, and dropping either loses an owner's answer.
+                carried = f"{carried} / {fresh}" if carried else fresh
 
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
         if accepted is None:
@@ -462,7 +501,9 @@ class LoopGraphRun:
                 heartbeat_timeout=timedelta(minutes=3),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )
-            self._ledger["sweep"]["passes"].append({**found, "pass": pass_no})
+            # `found` stays a local: the item text below quotes all 60 of a
+            # detector's lines, and the ledger keeps ten of them.
+            self._ledger["sweep"]["passes"].append(trim_pass(found, pass_no))
             elapsed = (workflow.now() - start).total_seconds()
             reason = sweep_end_reason(self._ledger["sweep"]["passes"], sweep, elapsed,
                                       items_run, parked_streak)
