@@ -1,8 +1,9 @@
 """Checkpoint activity: commit only independently verified, gate-green write sets.
 
 Order is mechanical: re-run the narrow gate → stage ONLY the declared set →
-`git diff --cached --check` → commit. Never pushes. Never stages anything the
-round didn't declare. A refusal is a result, not an exception.
+`git diff --cached --check` → count the staged lines → commit, unless the
+caller's `max_net` says the item grew too much. Never pushes. Never stages
+anything the round didn't declare. A refusal is a result, not an exception.
 
 The logic is a plain async function (tested with real tmp git repos, no
 Temporal); the @activity.defn wrapper is thin.
@@ -10,12 +11,37 @@ Temporal); the @activity.defn wrapper is thin.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from temporalio import activity
 
 from activities.execute_round import _git, parse_porcelain
 from activities.gate import _run_one, load_gates
+
+
+_NUMSTAT_RE = re.compile(r"^(\d+|-)\t(\d+|-)\t")
+
+
+def parse_numstat(text: str) -> tuple[int, int]:
+    """`git diff --numstat` output → (added, deleted), summed over its records.
+
+    Only lines shaped like a record count. `_git` merges git's stderr into the
+    text it returns, so a rename-limit warning ("warning: exhaustive rename
+    detection was skipped due to too many files.") lands between the records,
+    and an int() over that line would kill the run at the moment of commit, with
+    the ledger unwritten. A binary file prints "-" in both columns; it has no
+    lines to count, so it counts as none.
+    """
+    added = deleted = 0
+    for line in text.splitlines():
+        m = _NUMSTAT_RE.match(line)
+        if not m:
+            continue
+        a, d = m.group(1), m.group(2)
+        added += 0 if a == "-" else int(a)
+        deleted += 0 if d == "-" else int(d)
+    return added, deleted
 
 
 def build_commit_message(round_no: int, summary: str, files: list[str], item_no: int = 1) -> str:
@@ -50,14 +76,21 @@ async def _already_committed(worktree: str, message: str) -> str | None:
     return (await _git("rev-parse", "HEAD", cwd=worktree)).strip()
 
 
-async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict], message: str) -> dict:
+async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict], message: str,
+                               max_net: int | None = None) -> dict:
     if not files:
         return {"committed": False, "reason": "empty write set"}
 
     done = await _already_committed(worktree, message)
     if done:
+        # Nothing is staged on a retry, so the counts come from the commit itself.
+        # Reporting zero here would leave the run's net-lines counter short by
+        # one item, and the convergence rule turns on that number.
+        added, deleted = parse_numstat(
+            await _git("show", "--numstat", "--format=", "HEAD", cwd=worktree))
         return {"committed": True, "commit": done, "files": files, "leftovers": [],
-                "dropped_ignored": [], "note": "already committed by an earlier attempt"}
+                "dropped_ignored": [], "added": added, "deleted": deleted, "net": added - deleted,
+                "note": "already committed by an earlier attempt"}
 
     hb = activity.heartbeat if activity.in_activity() else None
     gate_results = [await _run_one(g, worktree, heartbeat=hb) for g in gates]
@@ -90,19 +123,31 @@ async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict
         return {"committed": False, "reason": "git diff --cached --check failed",
                 "detail": check["output_tail"]}
 
+    # The staged diff against HEAD is exactly this item's change, and it is already
+    # here at the moment of commit. Counted after --check has passed, so a
+    # whitespace refusal keeps its own reason and never reads as a cap refusal.
+    added, deleted = parse_numstat(await _git("diff", "--numstat", "--cached", cwd=worktree))
+    net = added - deleted
+    if max_net is not None and net > max_net:
+        await _git("reset", "-q", cwd=worktree)  # same reason the whitespace path unstages
+        return {"committed": False, "reason": f"net lines +{net} exceed the cap of {max_net}",
+                "added": added, "deleted": deleted, "net": net}
+
     await _git("-c", "user.email=engine@loopgraph.local", "-c", "user.name=loopgraph",
                "commit", "-qm", message, cwd=worktree)
     commit = (await _git("rev-parse", "HEAD", cwd=worktree)).strip()
     return {"committed": True, "commit": commit, "files": files, "leftovers": leftovers,
-            "dropped_ignored": sorted(ignored)}
+            "dropped_ignored": sorted(ignored), "added": added, "deleted": deleted, "net": net}
 
 
 @activity.defn
 async def checkpoint(run_dir: str, worktree: str, files: list[str], round_no: int,
-                     summary: str, item_no: int = 1) -> dict:
+                     summary: str, item_no: int = 1, max_net: int | None = None) -> dict:
     activity.heartbeat("checkpoint start")
     gates = load_gates(str(Path(run_dir) / "gates.yaml"))
-    return await checkpoint_write_set(worktree, files, gates, build_commit_message(round_no, summary, files, item_no))
+    return await checkpoint_write_set(worktree, files, gates,
+                                      build_commit_message(round_no, summary, files, item_no),
+                                      max_net=max_net)
 
 
 async def merge_branch(target_repo: str, base_branch: str, branch: str) -> dict:
