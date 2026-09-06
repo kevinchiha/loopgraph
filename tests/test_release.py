@@ -1,5 +1,5 @@
-"""Guards for the public release: nothing personal ships, and a run can be
-answered without Telegram."""
+"""Guards for the public release: nothing personal ships, a run can be answered
+without Telegram, and a tagged release agrees with the files that describe it."""
 
 from __future__ import annotations
 
@@ -7,9 +7,12 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
+
+import version
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -173,3 +176,33 @@ def test_lg_where_says_what_to_do_before_install(tmp_path, capsys, monkeypatch):
     out = json.loads(capsys.readouterr().out)
     assert "install.sh" in out["projects_dir"]
     assert out["telegram"]["configured"] is False
+
+
+# ---------- releases ----------
+
+def _reachable_tag() -> str:
+    """The release this checkout is on, or a skip when it is on none.
+
+    A clone taken before the first release, and a branch that predates the newest
+    tag, both belong on green: there is no release for the guards below to hold
+    the files against. `installed` names the nearest tag reachable from HEAD, so a
+    branch behind the newest one is judged against its own release and not the
+    latest.
+    """
+    tag = version.installed(ROOT)["tag"]
+    if tag is None:
+        pytest.skip("no release tag reachable from HEAD")
+    return tag
+
+
+def test_changelog_has_a_section_for_the_reachable_tag():
+    released = _reachable_tag()[1:]
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert version.changelog_has(text, released), f"CHANGELOG.md has no section for {released}"
+
+
+def test_pyproject_version_matches_the_reachable_tag():
+    released = _reachable_tag()[1:]
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = pyproject["project"]["version"]
+    assert declared == released, f"pyproject.toml says {declared}, the tag says {released}"
