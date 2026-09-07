@@ -2447,13 +2447,36 @@ def test_the_strip_does_nothing_before_a_run_is_chosen():
     runs_fn = function_source(html, "runs")
     click = re.search(r"\.click\(\);", runs_fn)
     assert click, "runs() no longer selects a run at all"
-    assert "patchStrip()" in runs_fn[click.end():], \
-        "the poll patches the strip above the line that selects the first run, so the first " \
-        "load leaves it empty"
+    # The statement straight after the click, and not merely somewhere below it.
+    # `patchStrip()` anywhere later in the text is satisfied by
+    # `const firstLoad = !sel; … if (firstLoad) patchStrip();`, which patches the
+    # strip on the poll that selects the run and on no poll ever again: measured
+    # in a browser, the strip read `42m 03s` beside a rail reading `42m 19s` after
+    # 14 seconds, and a run that closes keeps `RUNNING` on the strip for the life
+    # of the tab. That is the contradiction the mirroring test above says it
+    # prevents, put back by a guard that reads as harmless.
+    #
+    # Comments are stripped out of the source this reads, so the next line with
+    # anything on it is the next statement.
+    after = next((ln.strip() for ln in runs_fn[click.end():].splitlines() if ln.strip()), "")
+    assert after.startswith("patchStrip();"), \
+        ("the poll does not patch the strip on the statement after the one that selects a run: "
+         f"`{after}`")
 
     build = function_source(html, "buildRunRow")
     assert "patchStrip()" in build, "a click never patches the strip"
-    assert build.index("patchStrip()") > build.index("buildBoard("), \
+    # Inside the click handler, and not merely somewhere in the builder above a
+    # `buildBoard(` that only ever appears inside it. Moved out into buildRunRow's
+    # own body the call runs once, when the ROW is made — before there is a board
+    # to write into, and never again when the reader clicks — so a click leaves
+    # the strip naming the run they just left for up to 4 seconds. That is
+    # behaviour 5's second call site gone, with the comparison below still true.
+    handler = [c for c in closures(build) if "buildBoard(" in c]
+    assert len(handler) == 1, \
+        f"expected one closure in buildRunRow that builds a board, found {len(handler)}"
+    assert "patchStrip()" in handler[0], \
+        "the strip is patched somewhere other than the click handler, so a click never fills it"
+    assert handler[0].index("patchStrip()") > handler[0].index("buildBoard("), \
         "the click patches the strip before buildBoard has made one"
 
 
