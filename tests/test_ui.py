@@ -2464,6 +2464,11 @@ def test_the_board_builds_a_strip_before_the_state():
     ever built. Move the button in front of `.dur` and the duration is written into
     the button and then overwritten by its own label, so the strip reads
     `2026-09-05-alpha merge-ready archive` with the duration nowhere.
+
+    What it does not read is how any one tag is written. `<button hidden
+    class="archbtn">` is the same button in the same place, and a pin that reds on
+    two attributes swapping is a trap for the next person rather than a guard on
+    anything.
     """
     build = function_source(ui.page_html(), "buildBoard")
     order = [m.group(1) for m in re.finditer(r'id="(\w+)"', build)]
@@ -2473,18 +2478,35 @@ def test_the_board_builds_a_strip_before_the_state():
     assert strip, "the strip is not a div of its own in the board's markup"
     assert "hidden" in strip.group(1), \
         "the strip is on screen before a run is chosen, naming nothing"
-    assert [m.group(1) for m in re.finditer(r'<span class="(\w+)"></span>', strip.group(2))] \
-        == ["dir", "pill", "dur", "archerr"], \
-        ("the strip's spans are not the name, the pill, the duration and the archive control's "
-         "error line, in that order")
-    # The button as well, which is no span and which the list above cannot see. Tag
-    # and class together and the lot compared whole: this is the position
-    # patchStrip's `const [name, word, dur] = strip.children;` is written against,
-    # and a child inserted anywhere among the first three silently rebinds them.
-    assert re.findall(r'<(\w+) class="([\w-]+)"[^>]*>', strip.group(2)) \
+    # Every child in order, tag and class, and the class taken from wherever in the
+    # tag it was written. One list rather than a list of spans and a second rule for
+    # the button: the button is no span, so a span list cannot see the one child
+    # whose position matters most, and two overlapping pins is two things to relax
+    # the next time somebody adds a child.
+    #
+    # Nothing here reads attribute ORDER. `<button hidden class="archbtn">` is the
+    # same button, and moving two attributes past each other is an ordinary edit
+    # that must not turn red — what patchStrip depends on is which children there
+    # are and what order THEY are in.
+    def classed(attrs):
+        found = re.search(r'class="([\w-]+)"', attrs)
+        return found.group(1) if found else ""
+
+    children = [(tag, classed(attrs))
+                for tag, attrs in re.findall(r"<(\w+)([^>]*)>", strip.group(2))]
+    assert children \
         == [("span", "dir"), ("span", "pill"), ("span", "dur"),
             ("button", "archbtn"), ("span", "archerr")], \
-        "the strip's children are not its three words and then the archive control, in that order"
+        ("the strip's children are not its three words and then the archive control, in that "
+         f"order: {children}")
+    # And every one of them empty, which the old `></span>` spelling checked by
+    # accident and this would not: patchStrip writes every word on the strip, so a
+    # word written here as well is one the reader sees until the first patch lands
+    # and never again. The `' + '` between the two source lines the markup is built
+    # from is a seam in the JavaScript and not a word on the page, so it goes first.
+    left = re.sub(r"<[^>]*>", "", re.sub(r"'\s*\+\s*'", "", strip.group(2), flags=re.S)).strip()
+    assert not left, \
+        f"the strip's markup carries a word of its own, which patchStrip overwrites: `{left}`"
 
 
 def test_the_strip_mirrors_the_selected_row():
@@ -4874,10 +4896,20 @@ def test_a_refusal_reaches_the_error_span(archiving):
     # pattern that stops at it is happy with `d.error || ''`: the middle of this
     # closure's three failure paths then writes an empty line, and the reader gets
     # a click that does nothing, which is the whole thing this test says it is
-    # about. A literal with something in it, whatever the wording.
-    assert re.fullmatch(r"""[`'"][^`'"]*\w[^`'"]*[`'"]""", shown.group(3).strip()), \
-        (f"the fallback for a refusal with no `{shown.group(2)}` in it is not a line with words "
-         f"in it: `{shown.group(3).strip()}`")
+    # about.
+    #
+    # The floor is that SOME fixed words reach the span, and the wording, the quote
+    # style and the shape are all free: a template literal, a concatenation like
+    # `'could not archive (' + r.status + ')'`, one string or three. So every
+    # literal in the expression is read out and each one's interpolations dropped —
+    # `${r.status}` alone is a status code with nothing around it, which is not a
+    # sentence — and one of them has to have a word left in it.
+    floor = shown.group(3).strip()
+    words = [re.sub(r"\$\{[^}]*\}", "", lit[1:-1])
+             for lit in re.findall(r"`[^`]*`|'[^']*'|\"[^\"]*\"", floor)]
+    assert any(re.search(r"\w", w) for w in words), \
+        (f"the fallback for a refusal with no `{shown.group(2)}` in it puts no words of its own "
+         f"on screen: `{floor}`")
     assert re.search(rf"\b{shown.group(1)} = \w+\.querySelector\('\.archerr'\);?", script_of(html)), \
         f"`{shown.group(1)}` is not the strip's error line"
     # The catch's own block, counted out rather than searched for past the word
@@ -4886,8 +4918,23 @@ def test_a_refusal_reaches_the_error_span(archiving):
     # saying nothing at all on the one failure that leaves no status to read.
     caught = [h for _, h in try_blocks(handler) if "fetch('/api/archive'" in _]
     assert len(caught) == 1, "the archive request sits inside no try of its own"
-    assert re.search(rf"setText\({shown.group(1)}, '[^']+'\);", caught[0]), \
+    said = re.search(rf"setText\({shown.group(1)}, ([^;]+)\);", caught[0])
+    assert said and re.search(r"""[`'"][^`'"]*\w""", said.group(1)), \
         "a request that never reached the server leaves the reader with nothing on screen"
+    # And that message is the end of that path. Fall out of the catch and the next
+    # line reads `.ok` off a reply that was never assigned, so every real rejection
+    # — the dashboard stopped, the connection dropped — throws a TypeError one
+    # statement after the words written for it, and the span the reader is looking
+    # at stays empty. Every other check in this test reads the closure as text and
+    # sees a page that says the right thing.
+    #
+    # Two shapes stop it and both are fine: the catch returns, or the line after
+    # the try refuses to go on without a reply. What is not fine is neither.
+    stops = " ".join(caught[0].split()).endswith("return; }")
+    after = handler[handler.index(caught[0]) + len(caught[0]):]
+    assert stops or re.match(rf"\s*if \(!{reply.group(1)}\)", after), \
+        ("the catch falls through to the branch that reads the reply, so a fetch that never "
+         f"answered throws instead of saying so: `{' '.join(caught[0].split())}`")
     assert f"setText({shown.group(1)}, '');" in handler, \
         "a refusal's words stay on the strip after the next click succeeds"
 
