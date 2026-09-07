@@ -2451,6 +2451,19 @@ def test_the_board_builds_a_strip_before_the_state():
     first, because it is the one line that stays while everything under it scrolls
     away — a strip sitting below the status it is meant to be pinned above is not
     that.
+
+    Every child, in order, and this is the only thing in the file that reads that
+    markup: patchStrip binds its slots positionally out of `strip.children` and
+    everything else about the strip is read off patchStrip's SOURCE, which is happy
+    with a destructure of children that are not there. Three mutations were watched
+    in a browser through a `[:3]` version of this. Drop the `archerr` span and the
+    first refusal throws a TypeError into a click handler and the strip says
+    nothing at all — the silent failure the archive control exists not to be. Drop
+    the button and buildBoard throws, then patchStrip throws into runs()'s one
+    catch: the header sticks on `server error`, the count freezes and no board is
+    ever built. Move the button in front of `.dur` and the duration is written into
+    the button and then overwritten by its own label, so the strip reads
+    `2026-09-05-alpha merge-ready archive` with the duration nowhere.
     """
     build = function_source(ui.page_html(), "buildBoard")
     order = [m.group(1) for m in re.finditer(r'id="(\w+)"', build)]
@@ -2460,12 +2473,18 @@ def test_the_board_builds_a_strip_before_the_state():
     assert strip, "the strip is not a div of its own in the board's markup"
     assert "hidden" in strip.group(1), \
         "the strip is on screen before a run is chosen, naming nothing"
-    # The first three, and not the whole list: the archive control's own error line
-    # is a span too and follows them. What it says and where it is written from is
-    # test_the_strip_carries_the_archive_control's.
-    assert [m.group(1) for m in re.finditer(r'<span class="(\w+)"></span>', strip.group(2))][:3] \
-        == ["dir", "pill", "dur"], \
-        "the strip's slots are not the name, the pill and the duration, in that order"
+    assert [m.group(1) for m in re.finditer(r'<span class="(\w+)"></span>', strip.group(2))] \
+        == ["dir", "pill", "dur", "archerr"], \
+        ("the strip's spans are not the name, the pill, the duration and the archive control's "
+         "error line, in that order")
+    # The button as well, which is no span and which the list above cannot see. Tag
+    # and class together and the lot compared whole: this is the position
+    # patchStrip's `const [name, word, dur] = strip.children;` is written against,
+    # and a child inserted anywhere among the first three silently rebinds them.
+    assert re.findall(r'<(\w+) class="([\w-]+)"[^>]*>', strip.group(2)) \
+        == [("span", "dir"), ("span", "pill"), ("span", "dur"),
+            ("button", "archbtn"), ("span", "archerr")], \
+        "the strip's children are not its three words and then the archive control, in that order"
 
 
 def test_the_strip_mirrors_the_selected_row():
@@ -4848,8 +4867,17 @@ def test_a_refusal_reaches_the_error_span(archiving):
 
     body = re.search(r"const (\w+) = await \w+\.json\(\)", handler)
     assert body, "the refusal's body is never read"
-    shown = re.search(rf"setText\((\w+), {body.group(1)}\.(\w+) \|\| ", handler)
+    shown = re.search(rf"setText\((\w+), {body.group(1)}\.(\w+) \|\| ([^;]+)\);", handler)
     assert shown, "the body's own words are not written into anything, or not through setText"
+    # What is written when the body carries no words of its own — a proxy in the
+    # way, a 500 that never reached the handler. Read past the `||`, because a
+    # pattern that stops at it is happy with `d.error || ''`: the middle of this
+    # closure's three failure paths then writes an empty line, and the reader gets
+    # a click that does nothing, which is the whole thing this test says it is
+    # about. A literal with something in it, whatever the wording.
+    assert re.fullmatch(r"""[`'"][^`'"]*\w[^`'"]*[`'"]""", shown.group(3).strip()), \
+        (f"the fallback for a refusal with no `{shown.group(2)}` in it is not a line with words "
+         f"in it: `{shown.group(3).strip()}`")
     assert re.search(rf"\b{shown.group(1)} = \w+\.querySelector\('\.archerr'\);?", script_of(html)), \
         f"`{shown.group(1)}` is not the strip's error line"
     # The catch's own block, counted out rather than searched for past the word
