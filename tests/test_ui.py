@@ -2336,11 +2336,29 @@ def test_reason_rows_are_keyed_and_diffed_not_rebuilt():
 
     Keyed on the index because the supervisor writes the list fresh each round, so
     a re-ordered list is a text change and never a move.
+
+    Building the map is not the same as reading it, and reading it is where this
+    goes wrong. `dataset` hands its values back as strings whatever they were
+    assigned, so `rows.get(i)` with a number misses every row it has, and
+    patchReasons builds the whole list again on every poll — a new node under the
+    reader's selection every 2 seconds, with the map still made, the key still
+    stamped, insertBefore and remove still there and every word this test used to
+    look for still in the source. `let row = null;` is the same failure written
+    shorter. So the lookup is read out by name: the map it reads, the coercion,
+    and the variable the branch below tests have to be the one line.
     """
     html = ui.page_html()
     src = function_source(html, "patchReasons")
-    assert re.search(r"new Map\(\[\.\.\.\w+\.children\]", src), \
-        "the rows already on screen are not read out before the list is walked"
+    made = re.search(r"const (\w+) = new Map\(\[\.\.\.\w+\.children\]", src)
+    assert made, "the rows already on screen are not read out before the list is walked"
+    held = made.group(1)
+    found = re.search(rf"let (\w+) = {held}\.get\(String\(", src)
+    assert found, \
+        f"nothing reads {held} back with a string key, so every row is a miss and is built again"
+    assert re.search(rf"if \({found.group(1)}\)", src), \
+        "the row the lookup found is not what decides whether one is built"
+    assert re.search(rf"{held}\.delete\(String\(", src), \
+        f"a row that was found is not dropped from {held}, so the sweep at the end removes it"
     assert "dataset.i" in src, "a row is matched to its reason by position alone"
     assert "insertBefore" in src, "a new reason cannot arrive without moving the rows around it"
     assert ".remove()" in src, "a reason the round no longer carries stays on screen for ever"
