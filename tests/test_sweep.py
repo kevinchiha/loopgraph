@@ -739,11 +739,15 @@ WORK_ITEMS_RULE = ("A sweep brief must not carry a `## Work items` heading; "
     ("skills/loopgraph/SKILL.md", "one candidate per line"),
     ("skills/loopgraph/SKILL.md", "enabled: false"),
     ("skills/loopgraph/SKILL.md", WORK_ITEMS_RULE),
+    ("skills/loopgraph/SKILL.md", "groups:"),
+    ("skills/loopgraph/SKILL.md", "(other)"),
+    ("skills/loopgraph/SKILL.md", "one pointer carries across"),
     ("AGENTS.md", "comes from `discover`"),
     ("AGENTS.md", "net zero"),
     ("README.md", "**Sweep**"),
     ("README.md", "**Detector**"),
     ("README.md", "**Convergence item**"),
+    ("README.md", "path group"),
 ])
 def test_the_docs_teach_sweeps(doc, phrase):
     """AC-32. The skill is what an agent in another project reads before it
@@ -781,3 +785,4 @@ def test_the_skill_example_parses_as_a_sweep(tmp_path):
     assert [d["name"] for d in sweep["detectors"]] == ["vulture", "ts-prune"]
     assert sweep["deadline_seconds"] == 345600, "4d"
     assert (sweep["yield_floor"], sweep["max_items"]) == (3, 40)
+    assert sweep["groups"] == ["src/", "tests/"]

@@ -220,6 +220,7 @@ sweep:
   yield_floor: 3    # end after two passes at or under this
   deadline: 4d      # 30m, 4h or 4d; leave it out for no deadline
   max_items: 40
+  groups: [src/, tests/]   # optional; path prefixes each item works in turn
   detectors:
     - name: vulture
       cmd: "vulture src/ --min-confidence 80"
@@ -238,6 +239,20 @@ counted, so a warning on stderr is harmless; a non-zero exit or a timeout makes
 the pass incomplete and counts nothing from that detector, and the ledger keeps
 the tail of what it wrote to stderr so you can see why. A misspelt key anywhere
 in the file stops the run before it starts, with the key named in the reason.
+
+`groups` is optional. Each entry is a path prefix compared verbatim against the
+path at the start of every candidate line, so it should end in `/`: `app/`
+matches `app/core.py` and nothing outside that directory, while `app` also
+matches `apple.py`. A candidate no prefix matches goes to a group called
+`(other)`. Leave the key out and candidates are grouped by their top-level
+directory, with files at the repo root in `(root)`.
+
+Each sweep item takes one group of the chosen detector's candidates, and the next
+item takes the next group by name, wrapping round; one pointer carries across
+every detector, so a detector whose list always starts in the same corner cannot
+keep the run there. Rotation changes nothing about the count the run converges
+on: every detector still runs over the whole tree each pass, and every candidate
+is still counted, whichever group it sits in.
 
 Prove every detector the way you prove gates, inside the container on a tree that
 holds tracked files only: in the same `/tmp/gatetest` tree as step 1, run each
