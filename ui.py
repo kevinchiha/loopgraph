@@ -88,7 +88,34 @@ PAGE = """<!doctype html>
      already wear, so the colour means the same thing everywhere on the page. */
   .blue { background:rgba(88,166,255,.15); color:#58a6ff; }
   .gray { background:rgba(125,133,144,.15); color:#8b949e; }
-  #board { flex:1; overflow-y:auto; padding:16px 20px; min-width:0; }
+  /* No padding at the top, and the strip below carries it instead. Measured in a
+     browser: a sticky offset is taken from the scroll container's PADDING box, so
+     16px here held the strip 16px down from the board's own top edge and left a
+     band that width above it with the round cards sliding past in full view. The
+     suite cannot see it — nothing in this file lays out a page — and neither can
+     a scripted browser reading text back. */
+  #board { flex:1; overflow-y:auto; padding:0 20px 16px; min-width:0; }
+  /* The selected run's name, pinned over the board it names. Three screens into a
+     long run the only thing saying which run this is was the highlight in the
+     rail, off to the left and behind the reader's eye.
+     Sticky is relative to the nearest thing that scrolls, which is #board, and an
+     element cannot stick past its own containing block — so the strip is the
+     first child of the board's sections and holds for the length of them.
+     Opaque and edged because sticky leaves the element in the flow rather than
+     lifting it out: the round cards pass underneath, and a see-through strip is
+     two lines of text in one place. The padding is the board's own, moved in here
+     for the reason above, and the negative side margins put the strip's edges back
+     out to the board's — a border stopping 20px short of each side reads as a
+     card, not as the top of the board.
+     The [hidden] rule above beats this display on !important, which is the whole
+     reason it carries one: the strip is hidden until a run is chosen. */
+  #strip { position:sticky; top:0; z-index:1; margin:0 -20px 14px; padding:16px 20px 11px;
+           background:var(--bg); border-bottom:1px solid var(--line);
+           display:flex; gap:10px; align-items:baseline; }
+  #strip .dir { font:600 13px/1.3 ui-monospace,Menlo,monospace; word-break:break-all; }
+  /* Tabular figures for the rail's own reason: a duration counting up must not
+     shuffle the line sideways under a reader trying to read it. */
+  #strip .dur { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
   .empty { color:var(--dim); text-align:center; padding:40px 0; font-size:13px; }
   /* The state board: what the run is doing, what it is asking, what it is
      working through. The logs come after all three. */
@@ -390,7 +417,11 @@ function buildRunRow(entry) {
   div.onclick = () => {
     sel = {id: entry.id, dir: entry.dir};
     location.hash = encodeURIComponent(entry.id);
-    patchSelected(); buildBoard(sel.id); poll();
+    // patchStrip after buildBoard, which is the only thing that ever makes a
+    // #strip for it to write into, and here at all so the strip names the run the
+    // moment the reader clicks rather than on whichever of the next four seconds
+    // the run list happens to land.
+    patchSelected(); buildBoard(sel.id); patchStrip(); poll();
   };
   return div;
 }
@@ -408,6 +439,14 @@ function patchRunRow(row, entry) {
   // reads it to tell a round being worked on right now from one that was simply
   // never recorded, which nothing else on the board can tell apart.
   row.dataset.live = entry.start_time && !entry.close_time ? '1' : '';
+  // Whether Temporal has times for this run at all, which is a different question
+  // and one data-live cannot be made to answer: that stamp is '' for a workflow
+  // that has finished and '' for a directory of log files with nothing behind it,
+  // and the board owes those two different things — a pill and a duration for the
+  // first, the name alone for the second. So a second stamp rather than a wider
+  // reading of the first, whose shape is pinned by
+  // test_only_a_run_that_is_still_open_claims_a_round_is_in_progress in any case.
+  row.dataset.times = entry.start_time ? '1' : '';
   // Both times null is a run known only from its log files: it shows no time at
   // all rather than a wrong one. The two live in separate elements because only
   // one of them moves — the duration of a running run counts up on every poll,
@@ -477,8 +516,14 @@ function buildBoard(id) {
   // the run's state, and until the first reply lands there is no state to say it
   // from. #rounds is the exception because a run directory with logs and no
   // workflow is a real thing the page has always shown.
+  //
+  // #strip is first because it is the line that stays while everything under it
+  // scrolls away, and the stylesheet can only pin it to the top of what it is
+  // inside. Empty, like a run row: every word in it is written by patchStrip off
+  // the rail, so nothing a run directory is called reaches the page as markup.
   sections.innerHTML =
-      '<div id="state" hidden><span class="pill"></span><span class="reason"></span></div>'
+      '<div id="strip" hidden><span class="dir"></span><span class="pill"></span><span class="dur"></span></div>'
+    + '<div id="state" hidden><span class="pill"></span><span class="reason"></span></div>'
     + '<div id="why" hidden></div>'
     + '<section id="awaiting" hidden><h2></h2><div class="q"></div><div class="opts"></div>'
     + '<div class="answer"><span class="lbl">answer with:</span><code class="cmd"></code></div>'
@@ -494,6 +539,53 @@ function buildBoard(id) {
   // and the worktree from the run token, so every round of a run diffs to the
   // same thing and a copy under each card would be the same patch drawn twice.
   sections.lastElementChild.append(buildDiffPane(id));
+}
+// The selected run's name over the board, with the pill and the duration beside
+// it — copied off the rail row the run list keeps fresh, never worked out again
+// here. The rail stays the one source for those three words, so the strip cannot
+// come to disagree with the row it is mirroring, which is the contradiction
+// checklist item 4 looks for with the two halves an inch apart.
+//
+// The guard is the first thing in it and it is not an edge case. `sel` is null
+// until something is clicked and #strip does not exist until buildBoard has made
+// it, and both are true on every page load and stay true for ever on a dashboard
+// with no runs. runs() is one try around the fetch, patchRuns, the guarded first
+// click and the header writes, with a single catch that writes `server error`: a
+// TypeError thrown from here goes into that catch, the one line that ever selects
+// a run never runs, and the page reads `server error` over a board that was never
+// built, again every 4 seconds, on a server that answered every request. The
+// click handler is the same shape from the other end — a listener that throws
+// leaves the board unbuilt and says so nowhere but the console.
+//
+// No answer command up here, on purpose. user-select:all is what makes that
+// command copyable in one gesture, and two copies of it on screen is an invitation
+// to paste the wrong one into a shell.
+function patchStrip() {
+  const strip = document.getElementById('strip');
+  if (!sel || !strip) return;
+  const row = [...document.getElementById('runs').children].find(r => r.dataset.id === sel.id);
+  // The run has left the reply. The strip keeps what it has, the way the board
+  // keeps its cards: the last true thing it said beats a name wiped mid-poll.
+  if (!row) return;
+  strip.hidden = false;
+  const [name, word, dur] = strip.children;
+  const [rowName, meta, when] = row.children;
+  const [rowPill] = meta.children;
+  setText(name, rowName.textContent);
+  // A run known only from its log files: no workflow behind it, so no state to
+  // make a pill out of and no times to make a duration from. The page has neither
+  // and must not invent them. Off the row already in hand rather than through
+  // runHasTimes, which is the same stamp read by patchState, which has no row.
+  const times = row.dataset.times === '1';
+  word.hidden = !times;
+  dur.hidden = !times;
+  // The colour and the word together. A pill given the row's class and not the
+  // row's text is a coloured badge reading whatever the run before it left there.
+  word.className = rowPill.className;
+  setText(word, rowPill.textContent);
+  // The row writes ` · 4m 12s`, where the dot holds the duration off the time
+  // beside it. Nothing sits to the strip's left for it to hold off.
+  setText(dur, when.lastElementChild.textContent.replace(/^ · /, ''));
 }
 function buildOptionRow(letter) {
   const row = document.createElement('div');
@@ -551,11 +643,26 @@ function patchState(d, live) {
     setText(reason, ledger.reason || '');
     return;
   }
-  // The page's two lines for "there is no state", and it has no third. `temporal`
-  // says whether the feed is connected, never whether it knows this id, so an id
-  // Temporal has never heard of is the second line and not the first.
-  setText(why, d && d.temporal ? 'no workflow for this run'
-                               : 'temporal unreachable — logs only');
+  // The page's three lines for "there is no state". `temporal` says whether the
+  // feed is connected, never whether it knows this id, so a feed that never
+  // answered is the first of them and nothing else is.
+  //
+  // The third exists because the strip above now names the run. `no workflow for
+  // this run` was printed both for a directory of log files with nothing behind
+  // it and for a workflow Temporal knows perfectly well whose ledger query
+  // happened to fail this poll — nondeterminism on 7 of the 15 histories on this
+  // machine. With the strip carrying that second run's pill and duration, the
+  // line under it denied the run named an inch above: the board contradicting
+  // itself, for as long as the query kept failing.
+  //
+  // Told apart by the run's own times off the rail, the way the round cards are
+  // told apart by its liveness. Nothing else can: there is no ledger to read,
+  // which is the whole case, and `temporal` says the feed answered rather than
+  // what it said.
+  const feed = d && d.temporal;
+  setText(why, !feed ? 'temporal unreachable — logs only'
+             : runHasTimes(sel.id) ? 'ledger did not answer this poll; the run is still there'
+             : 'no workflow for this run');
 }
 // What the run is asking. It goes the moment the workflow pops `awaiting`, which
 // it does as soon as the owner answers, so the next poll is the whole of AC-6.
@@ -949,6 +1056,15 @@ function runIsLive(id) {
   const row = [...document.getElementById('runs').children].find(r => r.dataset.id === id);
   return !!row && row.dataset.live === '1';
 }
+// Whether Temporal has times for the run behind `id` — a workflow the feed
+// answered for, as against a directory of log files with nothing behind it at
+// all. Off the row's own stamp, the way runIsLive reads data-live and for the
+// same reason: `sel` holds the reply its row was first built from and never moves
+// again, and the rail is what the run list keeps up to date.
+function runHasTimes(id) {
+  const row = [...document.getElementById('runs').children].find(r => r.dataset.id === id);
+  return !!row && row.dataset.times === '1';
+}
 function patchRounds(dir, rounds, names, live) {
   // `dir` is passed in, never read off `sel`: these names were fetched for one
   // run and the panes built from them have to be stamped with that same run,
@@ -1181,6 +1297,11 @@ async function runs() {
     const target = shown.find(r => r.dataset.id === want)
                 || shown.find(r => r.dataset.archived !== '1');
     if (!sel && target) target.click();
+    // After the click, which is the only line on the page that ever sets `sel`:
+    // above it the first load would find no selection and leave the strip empty
+    // for another four seconds. patchStrip returns on its own when there is still
+    // nothing selected, which on a rail with no rows is every poll there will be.
+    patchStrip();
     setText(hdr, d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only');
     // Read off the reply the rows came from, so the release and the runs on
     // screen are never one poll apart. A checkout with no tag still gets a word:

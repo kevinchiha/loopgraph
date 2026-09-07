@@ -1910,6 +1910,7 @@ def test_the_board_copy_is_pinned():
     html = ui.page_html()
     for line in ("temporal unreachable — logs only",
                  "no workflow for this run",
+                 "ledger did not answer this poll; the run is still there",
                  "awaiting: ",
                  "no card was sent; the lg approve command is the only way to answer",
                  "no items yet"):
@@ -2307,6 +2308,256 @@ def test_the_recorded_question_keeps_its_own_line_breaks():
     rule = re.search(r"#awaiting \.q \{([^}]*)\}", html)
     assert rule, "the question has no style of its own"
     assert "pre-wrap" in rule.group(1), "the question's line breaks are collapsed away"
+
+
+# ---------- the strip over the board ----------
+
+
+def strip_wiring(html):
+    """The locals patchStrip works through: the strip and its three slots, and the
+    rail row and the pieces of it they are copied from.
+
+    Read out of the source rather than named here, so the tests below can ask what
+    each slot is written FROM rather than only that something was written. A strip
+    that took the row's pill class and not the row's pill word is a coloured badge
+    reading whatever the run before it left there, and a check that counted the
+    writes would pass it.
+    """
+    src = function_source(html, "patchStrip")
+    strip = re.search(r"const (\w+) = document\.getElementById\('strip'\);", src)
+    assert strip, "patchStrip never looks the strip up, so it cannot be guarded on one either"
+    row = re.search(
+        r"const (\w+) = \[\.\.\.document\.getElementById\('runs'\)\.children\]"
+        r"\.find\((\w+) => \2\.dataset\.id === sel\.id\);", src)
+    assert row, \
+        "the strip is filled from something other than the selected run's own row in the rail"
+    slots = re.search(rf"const \[(\w+), (\w+), (\w+)\] = {strip.group(1)}\.children;", src)
+    assert slots, "the strip's name, pill and duration are not read out as its own three children"
+    parts = re.search(rf"const \[(\w+), (\w+), (\w+)\] = {row.group(1)}\.children;", src)
+    assert parts, "the row's three lines are not read out as its children"
+    pill = re.search(rf"const \[(\w+)\] = {parts.group(2)}\.children;", src)
+    assert pill, "the row's pill is not read out of the row's own meta line"
+    return {"src": src, "strip": strip.group(1), "row": row.group(1),
+            "name": slots.group(1), "word": slots.group(2), "dur": slots.group(3),
+            "row_name": parts.group(1), "when": parts.group(3), "row_pill": pill.group(1)}
+
+
+def test_the_board_builds_a_strip_before_the_state():
+    """AC-15. The strip is built with the board, hidden, and ahead of everything
+    else on it.
+
+    Built rather than patched into being, for the reason every other section is:
+    nothing on the poll path has to decide whether a part of the page exists yet.
+    Hidden, because until a run is chosen there is no run for it to name. And
+    first, because it is the one line that stays while everything under it scrolls
+    away — a strip sitting below the status it is meant to be pinned above is not
+    that.
+    """
+    build = function_source(ui.page_html(), "buildBoard")
+    order = [m.group(1) for m in re.finditer(r'id="(\w+)"', build)]
+    assert order[:2] == ["strip", "state"], \
+        f"the board's sections open {order[:2]}, not the strip and then the state"
+    strip = re.search(r'<div id="strip"([^>]*)>(.*?)</div>', build, re.S)
+    assert strip, "the strip is not a div of its own in the board's markup"
+    assert "hidden" in strip.group(1), \
+        "the strip is on screen before a run is chosen, naming nothing"
+    assert [m.group(1) for m in re.finditer(r'<span class="(\w+)"></span>', strip.group(2))] \
+        == ["dir", "pill", "dur"], \
+        "the strip's slots are not the name, the pill and the duration, in that order"
+
+
+def test_the_strip_mirrors_the_selected_row():
+    """AC-15. Every word on the strip is the rail row's own, copied off the row the
+    run list keeps fresh — so the rail stays the single source for those words and
+    the two can never come to say different things about one run. That is checklist
+    item 4's failure with the halves an inch apart instead of a screen.
+
+    The pill moves as a pair. A strip that took the row's class and not its text
+    would be a coloured badge reading whatever the run before it left in there.
+
+    A run that has left the reply has no row to copy, and the strip keeps what it
+    has rather than blanking: the board does the same with its cards, and the last
+    true thing said beats an empty line mid-poll.
+    """
+    html = ui.page_html()
+    w = strip_wiring(html)
+    src = w["src"]
+    assert f"{w['strip']}.hidden = false;" in src, \
+        "the strip is filled and never shown, so it stays hidden for the life of the page"
+    assert f"if (!{w['row']}) return;" in src, \
+        "a run that has left the reply blanks the strip instead of leaving what it had"
+    assert f"setText({w['name']}, {w['row_name']}.textContent);" in src, \
+        "the strip's name is written from something other than the row's own"
+    assert f"{w['word']}.className = {w['row_pill']}.className;" in src, \
+        "the strip's pill does not take the colour the rail has already worked out"
+    assert f"setText({w['word']}, {w['row_pill']}.textContent);" in src, \
+        "the strip's pill takes the row's colour without the row's word"
+    # The row writes ` · 4m 12s`, where the dot holds the duration off the time
+    # beside it. The strip has nothing to its left for it to hold off, so a
+    # duration copied whole opens every strip on the page with a separator
+    # separating nothing.
+    assert f"setText({w['dur']}, {w['when']}.lastElementChild.textContent.replace(/^ · /, ''));" \
+        in src, "the duration is not the row's own with the row's separator taken off it"
+    assert "patchStrip()" in function_source(html, "runs"), \
+        "nothing repatches the strip, so it holds the run's first reading for ever"
+    assert "patchStrip()" in function_source(html, "buildRunRow"), \
+        "a click leaves the strip on the run just left until the run list next lands"
+
+
+def test_the_strip_does_nothing_before_a_run_is_chosen():
+    """AC-15's last sentence, and the line the rest of the page rests on.
+
+    `runs()` is one try around the fetch, patchRuns, the guarded first click and
+    the header writes, with a single catch that writes `server error`. Read `sel.id`
+    before anything is selected and the TypeError goes straight into that catch:
+    the one line that ever selects a run is skipped, and the reader gets `server
+    error` over a board that was never built, again every 4 seconds, on a server
+    that answered every request. That is not a corner — it is every page load, and
+    it is permanent on a dashboard with no runs at all, where there is no first row
+    to click either.
+
+    #strip is the same shape from the other end. It does not exist until buildBoard
+    has made it, so the click handler patches the strip after that call and the
+    poll has to survive there being none; a listener that throws leaves the board
+    unbuilt with nothing on screen saying why.
+
+    Hence the two positions, both load-bearing: after the guarded click, which is
+    the only line on the page that ever sets `sel`, and after buildBoard, which is
+    the only thing that ever makes a strip. The second is also what fills the strip
+    the moment the reader clicks rather than up to four seconds later.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchStrip")
+    guard = re.search(r"if \(([^)]*)\) return;", src)
+    assert guard, "patchStrip has no early return, so it reads `sel` whatever state the page is in"
+    cond = guard.group(1)
+    assert re.search(r"!\s*sel\b", cond), \
+        "nothing stops patchStrip reading a selection that has not been made yet"
+    held = re.search(r"const (\w+) = document\.getElementById\('strip'\);", src)
+    assert held and re.search(rf"!\s*{held.group(1)}\b", cond), \
+        "nothing stops patchStrip writing into a board that was never built"
+    # `||` and not `&&`. ANDed, the function returns only when BOTH are missing,
+    # so the first load — nothing selected, no board — falls through to the throw
+    # the guard exists to stop.
+    assert "||" in cond and "&&" not in cond, \
+        f"either half alone has to return, and this returns on neither: `{cond.strip()}`"
+    assert not re.search(r"\bsel\s*\.", src[:guard.start()]), \
+        "patchStrip reads off `sel` above the line that checks there is one"
+
+    runs_fn = function_source(html, "runs")
+    click = re.search(r"\.click\(\);", runs_fn)
+    assert click, "runs() no longer selects a run at all"
+    assert "patchStrip()" in runs_fn[click.end():], \
+        "the poll patches the strip above the line that selects the first run, so the first " \
+        "load leaves it empty"
+
+    build = function_source(html, "buildRunRow")
+    assert "patchStrip()" in build, "a click never patches the strip"
+    assert build.index("patchStrip()") > build.index("buildBoard("), \
+        "the click patches the strip before buildBoard has made one"
+
+
+def test_a_logs_only_run_strips_to_its_name():
+    """AC-15. A run known only from its log files has no workflow behind it: no
+    state to make a pill out of and no times to make a duration from. The page has
+    neither and must not invent them, so the strip carries the name alone.
+
+    Off a stamp of its own, because `data-live` cannot answer this and cannot be
+    made to: it is '' for a workflow that finished, which owes the strip a pill and
+    a duration, and '' for a directory of log files, which owes it neither. The
+    regex test_only_a_run_that_is_still_open_claims_a_round_is_in_progress pins
+    forbids changing that stamp's shape in any case, which is why there are two.
+    """
+    html = ui.page_html()
+    row = function_source(html, "patchRunRow")
+    stamp = re.search(r"\.dataset\.times = (\w+)\.start_time \? '1' : '';", row)
+    assert stamp, "the row does not stamp whether Temporal has times for its run"
+    live = re.search(r"\.dataset\.live = (\w+)\.start_time", row)
+    assert live and live.group(1) == stamp.group(1), \
+        "the two stamps are read off different replies"
+    w = strip_wiring(html)
+    src = w["src"]
+    times = re.search(rf"const (\w+) = {w['row']}\.dataset\.times === '1';", src)
+    assert times, "the strip reads the stamp some way other than off the row it already holds"
+    assert "dataset.live" not in src and "runIsLive(" not in src, \
+        "the strip tells a logs-only run from a finished one by liveness, which is '' for both"
+    hidden = set(re.findall(rf"(\w+)\.hidden = !{times.group(1)};", src))
+    assert hidden == {w["word"], w["dur"]}, \
+        f"the pill and the duration are not the two the stamp hides: {sorted(hidden)}"
+
+
+def test_the_board_says_which_silence_it_means():
+    """AC-30. `no workflow for this run` was one line doing two jobs: a directory
+    of log files with no workflow behind it, and a workflow Temporal knows
+    perfectly well whose ledger query happened to fail this poll — which is
+    nondeterminism on 7 of the 15 histories on this machine, not a rare state.
+
+    With the strip above it the second reads as the board denying, in one line, the
+    run it named in the line above, pill and duration and all. That is checklist
+    item 4's failure — a page contradicting itself, where the reader cannot tell
+    which half to believe — and it would sit there for as long as the query kept
+    failing.
+
+    So three lines, keyed on the two facts that tell the three cases apart: whether
+    the feed answered at all, and whether the run has times on the wire. Which
+    sentence goes with which case is the whole of the change, so each is pinned to
+    its own branch and not merely to the page.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchState")
+    feed = re.search(r"const (\w+) = (\w+) && \2\.temporal;", src)
+    assert feed, "the board no longer holds whether the feed answered at all"
+    assert re.search(rf"!{feed.group(1)} \? 'temporal unreachable — logs only'", src), \
+        "a feed that never answered says something other than that it is unreachable"
+    assert re.search(r"runHasTimes\(sel\.id\) \? "
+                     r"'ledger did not answer this poll; the run is still there'", src), \
+        "a run Temporal has times for is told its workflow does not exist"
+    assert re.search(r": 'no workflow for this run'\);", src), \
+        "the run with no workflow behind it is no longer the case that falls through"
+    assert "runIsLive(" not in src, \
+        "the two silences are told apart by liveness, which is '' for a finished run too"
+
+
+def test_the_strip_is_sticky_in_css():
+    """AC-15's own word: the strip stays visible while the board scrolls. Nothing
+    in this file can compute a layout — the suite has never rendered the page — so
+    what is held here is the rule that does it, and the two things that make it
+    readable once it holds.
+
+    Opaque and edged, because sticky leaves the element in the flow rather than
+    taking it out of one: the round cards pass underneath, and a see-through strip
+    is two lines of text in the same place. And sticky is relative to the nearest
+    thing that scrolls, which is #board — take the overflow off that and the strip
+    has nothing to stick inside.
+
+    The last one was measured in a browser and is the reason #board's padding is
+    written the way it is. A sticky offset is taken from the scroll container's
+    PADDING box, so #board's 16px of padding-top held the strip 16px below the
+    board's own top edge and left a band exactly that deep above it, with the work
+    items and the round cards sliding through it in full view. Every check in this
+    file was green on it, and so is a scripted browser reading text back: the strip
+    said the right words in the right place and there was a second line of the
+    board's own content overlapping it. So the padding moved into the strip, which
+    is what puts the sticky edge on the board's own top.
+
+    Whether the whole of it holds is checklist work, in Task 12.
+    """
+    html = ui.page_html()
+    body = declarations(html, "#strip").replace(" ", "")
+    assert "position:sticky" in body, "the strip scrolls off the top with the rest of the board"
+    assert "top:0" in body, "the strip sticks at no edge, so it never stops moving"
+    assert "background:var(--bg)" in body, \
+        "the board's cards read through the strip as they pass under it"
+    assert re.search(r"border-bottom:[\d.]+pxsolid", body), \
+        "nothing marks where the strip ends and the board it is pinned over begins"
+    board = declarations(html, "#board")
+    assert "overflow-y:auto" in board.replace(" ", ""), \
+        "#board no longer scrolls, so there is nothing for the strip to stick inside"
+    pad = re.search(r"padding:\s*([^;]+);", board)
+    assert pad and pad.group(1).split()[0] == "0", \
+        "#board pads above the strip, so a band of that depth over it carries the cards scrolling by"
+    assert re.search(r"padding:[1-9][\d.]*px", body), \
+        "the strip took #board's padding away and gave none back, so the board's text starts flush"
 
 
 # ---------- the rounds ----------

@@ -44,6 +44,17 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   not there, or one that is not a valid URL at all, opens the top run as before.
 - Times in the rail read as `14m ago` and `3h ago` for the first day, and go back to
   the date after that. Hover one for the full timestamp, whichever way it is showing.
+- The run you are reading is named at the top of the board, with its status and how
+  long it has been going, and it stays there while you scroll. Three screens into a
+  long run the only thing telling you which run it was is the highlight in the rail,
+  off to the left where you are not looking. A run known only from its log files gets
+  its name and nothing else, because there is no status or duration to give it.
+- The board no longer says `no workflow for this run` about a run that plainly has
+  one. That line was covering two different things: a directory of log files with
+  nothing behind it, and a run Temporal knows perfectly well whose state just did not
+  come back this time. The second now says `ledger did not answer this poll; the run
+  is still there` and keeps its status, instead of denying the run named right above
+  it.
 
 ## 0.2.0 - 2026-09-07
 
