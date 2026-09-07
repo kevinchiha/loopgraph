@@ -13,6 +13,10 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 - A run that has finished never says `waiting`, and its question, its options and its
   `lg approve` command come off the board with it. A run whose engine died keeps its
   last card in the record, and the page was still asking you to answer it.
+- The browser tab says how many runs are waiting on you: `(2) loopgraph` with two of
+  them, `loopgraph` with none. Its icon is a dot that turns blue at the same moment,
+  so a dashboard left open in a background tab tells you a run needs you without you
+  going and looking.
 
 ## 0.2.0 - 2026-09-07
 

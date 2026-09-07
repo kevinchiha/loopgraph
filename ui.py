@@ -48,7 +48,13 @@ ROOT = Path(__file__).resolve().parent
 HEAD_MARK = b"[... head truncated ...]\n"
 
 PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>loopgraph</title><style>
+<html><head><meta charset="utf-8"><title>loopgraph</title>
+<!-- The tab's dot, drawn inline so there is no second request and no /favicon.ico
+     404 in the console. runs() recolours it, and this href is FAV_IDLE's string
+     character for character, so the page is not one shade on load and another
+     4 seconds later. `%23` is the `#`: a raw one ends the URI at the colour. -->
+<link id="fav" rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6.5' fill='%237d8590'/></svg>">
+<style>
   :root { --bg:#0b0e14; --pane:#11151d; --panel:#151a24; --line:#232a36; --fg:#d6dbe2;
           --dim:#7d8590; --accent:#58a6ff; --purple:#bc8cff; }
   * { box-sizing:border-box; margin:0; }
@@ -232,6 +238,17 @@ const ROLES = [['executor', 'executor'], ['audit', 'supervisor']];
 // asking the owner for something must not read like a run getting on with it.
 const pill = s => ({green:'green',running:'yellow',waiting:'blue',stopped:'red',failed:'red',
   'merge-ready':'green',merged:'green',held:'gray',discarded:'gray',unknown:'gray'}[s]||'gray');
+// The tab's dot in the two states it has: dim when nothing wants the reader, and
+// the waiting pill's blue when something does, so the tab and the rail say the
+// same thing in the same colour. FAV_IDLE is the href the <link> ships with,
+// character for character — a drifted copy would show one icon on load and
+// another 4 seconds later, for ever, with the suite green, so the equality is
+// pinned by test. `%23` is the `#`: a raw one ends the data URI at the colour.
+//
+// Up here with sel and pill, and above the first `function`, because regions() in
+// tests/test_ui.py charges everything after a declaration to that declaration.
+const FAV_IDLE = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6.5' fill='%237d8590'/></svg>";
+const FAV_WAIT = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6.5' fill='%2358a6ff'/></svg>";
 const esc = t => t.replaceAll('&','&amp;').replaceAll('<','&lt;');
 // Assigning textContent builds a NEW text node even when the string is the one
 // already there, and the reader's selection lives in the old one. Every text a
@@ -876,9 +893,30 @@ async function patchDiff(pane) {
 }
 async function runs() {
   const hdr = document.getElementById('hdr'), ver = document.getElementById('ver');
+  const fav = document.getElementById('fav');
   try {
     const d = await (await fetch('/api/runs')).json();
-    patchRuns(d.runs || []);
+    const rows = d.runs || [];
+    patchRuns(rows);
+    // How many runs want the reader, said where they can see it with the tab in
+    // the background. Counted off the reply and never off the rail, because the
+    // rail is what the reader has chosen to look at: an archived run they have
+    // hidden has no row to count, and one they are showing has a row that must
+    // not be counted. The reply answers both the same way.
+    //
+    // `archived` is the server's mark; a row it never marked is not archived, so
+    // `!r.archived` is the right reading whether the key is there or not.
+    const n = rows.filter(r => r.state === 'waiting' && !r.archived).length;
+    const title = n ? `(${n}) loopgraph` : 'loopgraph';
+    if (document.title !== title) document.title = title;
+    // getAttribute, not .href: the property is the URL the browser parsed and
+    // wrote out again, and nothing promises that round trip gives back the string
+    // we put in — this URI carries spaces and angle brackets, which a serialiser
+    // is free to percent-encode. The attribute is the string itself, so the guard
+    // compares what was written with what is about to be, and cannot quietly stop
+    // holding on some browser and leave the icon rewritten every 4 seconds.
+    const icon = n ? FAV_WAIT : FAV_IDLE;
+    if (fav.getAttribute('href') !== icon) fav.setAttribute('href', icon);
     // Nothing chosen yet: take the first row the way the reader would. Through
     // the row's own handler, so there is one path that sets `sel`, builds the
     // board and starts its poll — a second copy of it here would be a poll

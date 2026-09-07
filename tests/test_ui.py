@@ -1450,6 +1450,154 @@ def test_the_run_list_is_patched_and_never_rebuilt():
     assert "buildRunRow" not in runs_fn, "the poll builds rows itself"
 
 
+# ---------- the tab: title and favicon ----------
+
+
+def favicon_link(html):
+    """The page's `<link rel="icon">`, as (whole tag, href), from its `<head>`.
+
+    Not `<link[^>]*>`: the href is an inline SVG and carries `>` inside its own
+    quotes, so the obvious tag pattern stops in the middle of `<circle` and hands
+    back half an attribute. The href is quoted with `"` and contains none, so
+    reading to the closing quote is what finds the end of the tag.
+    """
+    head = re.search(r"<head>(.*?)</head>", html, re.S)
+    assert head, "the page has no head"
+    tag = re.search(r'<link\s+[^>]*?href="([^"]*)"\s*>', head.group(1), re.S)
+    assert tag, "the page ships no <link> with an href in its head"
+    return tag.group(0), tag.group(1)
+
+
+def fav_const(src, name):
+    got = re.search(rf'const {name} = "([^"]*)";', src)
+    assert got, f"{name} is not a top-level string const in the script"
+    return got.group(1)
+
+
+def test_the_page_ships_a_data_uri_favicon():
+    """AC-4. Two things at once, and the second is the quiet one.
+
+    The reader gets a tab icon before the first reply lands, four seconds in. And
+    a page with no `<link rel="icon">` at all makes the browser go and ask for
+    /favicon.ico by itself, which this server has never had — so the console
+    carries a 404 on every load, under which a real one is invisible. The icon is
+    a data URI rather than a file for the same reason: a file is a second request
+    and a second thing to serve.
+
+    The two consts sit above the first `function` declaration because regions()
+    charges everything after a declaration to that declaration, so a const written
+    lower down would be read as part of whichever function happened to precede it.
+    """
+    html = ui.page_html()
+    tag, href = favicon_link(html)
+    assert 'id="fav"' in tag, "the poll finds the icon by id, and this one has none"
+    assert 'rel="icon"' in tag, "a link that is not rel=icon leaves the browser asking for /favicon.ico"
+    assert href.startswith("data:image/svg+xml,"), \
+        "the icon is a second request rather than an inline URI"
+
+    src = script_of(html)
+    fav_const(src, "FAV_IDLE"), fav_const(src, "FAV_WAIT")
+    first = DECLARED.search(src)
+    assert first, "the script declares no functions, so this file's machinery has moved"
+    for name in ("FAV_IDLE", "FAV_WAIT"):
+        assert src.index(f"const {name}") < first.start(), \
+            f"{name} sits below the first `function`, so regions() charges it to that function"
+
+
+def test_the_shipped_icon_and_the_idle_icon_are_one_string():
+    """The drift nothing but a test can catch.
+
+    The idle URI is written twice — in the tag the page ships and in FAV_IDLE,
+    which the poll writes back whenever no run is waiting. Change one and the tab
+    shows one icon on load and a different one four seconds later, for ever, with
+    the whole suite green. So the two are compared here character for character.
+
+    FAV_WAIT is the same drawing in the waiting pill's blue and nothing else, so
+    the tab and the rail say the same thing in the same colour. `%23` is the URI
+    encoding of `#`; a raw one would end the data URI at the colour and the
+    browser would render nothing.
+    """
+    html = ui.page_html()
+    _, shipped = favicon_link(html)
+    src = script_of(html)
+    idle, wait = fav_const(src, "FAV_IDLE"), fav_const(src, "FAV_WAIT")
+    assert shipped == idle, "the shipped icon and the idle icon have drifted apart"
+
+    fills = [re.findall(r"fill='(%23[0-9a-f]{6})'", u) for u in (idle, wait)]
+    assert [len(f) for f in fills] == [1, 1], "an icon does not carry exactly one fill colour"
+    for u in (idle, wait):
+        assert "#" not in u, "a raw # ends the data URI at the colour, so nothing renders"
+    dim, blue = fills[0][0], fills[1][0]
+    assert idle.replace(dim, blue) == wait, "the two icons differ somewhere other than the colour"
+
+    rule = re.search(r"\.blue \{([^}]*)\}", html)
+    assert rule, "the waiting pill has no rule, so there is no blue to match"
+    assert "#" + blue[len("%23"):] in rule.group(1), \
+        "the waiting icon is not the colour the waiting pill wears"
+
+
+def test_the_title_and_favicon_are_written_only_on_change():
+    """AC-3's last line and AC-4's. Both are written on the 4-second poll, and
+    both are read back before they are written.
+
+    document.title is not an element, so the setText rule that covers every other
+    word on this page does not reach it — the guard has to be written by hand and
+    pinned here.
+
+    The icon is read back through getAttribute rather than the `.href` property,
+    which is the URL the browser parsed and serialised again. This URI carries
+    spaces and angle brackets, and nothing promises a serialiser hands those back
+    untouched; where one does not, `.href` never equals the string we wrote, the
+    guard stops holding, and the icon is replaced every four seconds — the work
+    the guard exists to stop, on some browsers and not the one it was tried in.
+    """
+    src = function_source(ui.page_html(), "runs")
+    assert "document.title !==" in src, "the title is written without reading it back"
+    assert src.index("document.title !==") < src.index("document.title ="), \
+        "the title is assigned before anything compares it"
+
+    assert re.search(r"getAttribute\('href'\) !== \w+", src), \
+        "the icon is written without reading the attribute back"
+    assert re.search(r"setAttribute\('href', \w+\)", src), "the icon is set some other way"
+    assert src.index("getAttribute('href')") < src.index("setAttribute('href'"), \
+        "the icon is assigned before anything compares it"
+    assert not re.search(r"\.href\s*=", src), \
+        "the .href property is the browser's copy of the URL, not the string that was written"
+    assert "FAV_WAIT" in src and "FAV_IDLE" in src, "the poll writes an icon it did not declare"
+
+
+def test_archived_rows_do_not_count_toward_the_title():
+    """AC-3. N is counted off the reply, never off the rail.
+
+    The rail is what the reader chose to look at, and it answers the wrong
+    question twice over: an archived run they have hidden has no row to count, and
+    an archived run they are showing has a row that must not be counted. The reply
+    is the same list either way, so the count is taken from it and the filter says
+    which rows are in.
+
+    `archived` is the server's mark and Task 8 is what starts writing it. Until
+    then no reply carries the key, `!r.archived` reads undefined as not archived,
+    and every row counts — which is also the right reading afterwards: a row the
+    server never marked is not an archived run. So this pins the filter, not the
+    hiding, and the archived run itself is Task 8's to test.
+    """
+    src = function_source(ui.page_html(), "runs")
+    served = re.search(r"patchRuns\((\w+)\)", src)
+    assert served, "the poll no longer hands the reply's rows to patchRuns"
+
+    count = re.search(r"const (\w+) = (\w+)\.filter\((\w+) => ([^)]*)\)\.length", src)
+    assert count, "the poll never counts the waiting rows"
+    held, rows, row, expr = count.groups()
+    assert rows == served.group(1), \
+        "the count comes from something other than the reply the rows came from"
+    assert f"{row}.state === 'waiting'" in expr, "the count is not of the runs that are waiting"
+    assert f"!{row}.archived" in expr, "an archived run still counts toward the tab"
+
+    title = re.search(rf"{held} \? `\(\$\{{{held}\}}\) loopgraph` : 'loopgraph'", src)
+    assert title, \
+        "the tab does not read `(N) loopgraph` off the count, and `loopgraph` when it is zero"
+
+
 # ---------- the state board ----------
 
 
