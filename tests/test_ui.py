@@ -1553,8 +1553,14 @@ def test_the_load_selection_prefers_the_hash_and_keeps_the_guard():
     assert guard, "the row is clicked with no `if` in front of it, or not through a bare local"
     cond, held = guard.groups()
     assert re.search(r"!\s*sel\b", cond), "nothing stops the click firing again on every poll"
-    assert re.search(rf"\b{held}\b", cond), \
-        "the guard never asks whether there is a row to click at all"
+    # Both halves AND the operator joining them. `!sel` and `target` are each still
+    # there in `if (!sel || target)`, and once the rail has a row `target` is
+    # truthy on every poll: the click fires every 4 seconds, `sel` is set again,
+    # buildBoard runs, and the reader's selection and every log pane they had open
+    # go with it — which is word for word what the older guard test says it exists
+    # to stop, "with this suite green throughout".
+    assert re.search(rf"&&\s*{held}\b|{held}\s*&&", cond), \
+        f"the guard is not `nothing chosen yet` AND `a row to click`: `{cond.strip()}`"
 
     chosen = re.search(rf"const {held} = ([^;]+);", src)
     assert chosen, f"`{held}` is clicked without being worked out into a local first"
@@ -1571,8 +1577,11 @@ def test_the_load_selection_prefers_the_hash_and_keeps_the_guard():
     # into CSS.
     by_hash = re.fullmatch(rf"{rail}\.find\((\w+) => \1\.dataset\.id === (\w+)\)", halves[0])
     assert by_hash, f"the first choice is not the row whose id the hash names: `{halves[0]}`"
-    assert re.search(rf"{by_hash.group(2)} = decodeURIComponent\(location\.hash", src), \
-        "the rows are matched against something other than the decoded hash"
+    # `.slice(1)` and not `location.hash` whole: the property keeps the leading `#`,
+    # which is in no row's dataset.id, so every deep link falls through to the
+    # fallback and AC-13's load half is dead with nothing on screen to show it.
+    assert re.search(rf"{by_hash.group(2)} = decodeURIComponent\(location\.hash\.slice\(1\)", src), \
+        "the rows are matched against something other than the decoded hash, `#` and all"
 
     fallback = re.fullmatch(rf"{rail}\.find\((\w+) => \1\.dataset\.archived !== '1'\)", halves[1])
     assert fallback, \
@@ -1616,8 +1625,14 @@ AGO_BRANCH = re.compile(r"if \(\s*(\w+)\s*(<=?)\s*(\d+)\s*\)\s*return `\$\{(\w+)
 
 
 def ago_branches(src):
-    """Per unit word, the (tested name, operator, bound, printed name) of its line."""
-    return {m.group(5): (m.group(1), m.group(2), int(m.group(3)), m.group(4))
+    """Per unit word, the (tested name, operator, bound, printed name, offset) of its line.
+
+    Keyed on the unit, which is what every question below is about, and carrying
+    where the line sits, which the key throws away. Two `if`s that each return read
+    in the order they are written and in no other, so a dict of them alone is a
+    reading with the order missing.
+    """
+    return {m.group(5): (m.group(1), m.group(2), int(m.group(3)), m.group(4), m.start())
             for m in AGO_BRANCH.finditer(src)}
 
 
@@ -1629,11 +1644,13 @@ def test_ago_reads_minutes_hours_then_absolute():
     JavaScript: `35m ago` and `2h ago` are AC-14's illustrations of what the reader
     sees, the numbers in them are computed, and neither string exists anywhere to
     grep for. What is checked instead is what builds them — which value each line
-    prints, what that value was floored from, and where each branch stops. Those
-    are the three places this goes wrong quietly. `<=` at 60 makes an hour-old run
-    read `60m ago`; the two names swapped makes a 90-minute run read `90h ago`; the
-    difference taken the other way round makes every run on the rail read `-1m
-    ago`; and an unfloored one reads `2.5166h ago`.
+    prints, what that value was floored from, where each branch stops and which one
+    is reached first. Those are the places this goes wrong quietly. `<=` at 60 makes
+    an hour-old run read `60m ago`; the two names swapped makes a 90-minute run read
+    `90h ago`; the difference taken the other way round makes every run on the rail
+    read `-1m ago`; an unfloored one reads `2.5166h ago`; and the hours line first
+    makes every run under an hour read `0h ago`, because 0 hours is under 24 and the
+    minutes line is never reached at all.
     """
     src = function_source(ui.page_html(), "ago")
     params = re.match(r"function ago\((\w+), (\w+)\)", src.strip())
@@ -1649,7 +1666,7 @@ def test_ago_reads_minutes_hours_then_absolute():
     assert set(branches) == {"m", "h"}, \
         f"the relative forms are not `<n>m ago` and `<n>h ago`: {sorted(branches)}"
 
-    tested, op, bound, printed = branches["m"]
+    tested, op, bound, printed, at_minutes = branches["m"]
     assert printed == tested, "the minutes line prints a value other than the one it tested"
     assert (op, bound) == ("<", 60), \
         f"the minutes branch runs to `{op} {bound}`, so an hour old does not read in hours"
@@ -1658,13 +1675,21 @@ def test_ago_reads_minutes_hours_then_absolute():
         "the minutes are not how long it is since the start"
     assert "60000" in mins or ("1000" in mins and "60" in mins), "the minutes are not minutes"
 
-    tested_h, op_h, bound_h, printed_h = branches["h"]
+    tested_h, op_h, bound_h, printed_h, at_hours = branches["h"]
     assert printed_h == tested_h, "the hours line prints a value other than the one it tested"
     assert (op_h, bound_h) == ("<", 24), \
         f"the hours branch runs to `{op_h} {bound_h}`, so a day old never reaches its date"
     hours = floored(tested_h)
     assert re.search(rf"\b{tested}\s*/\s*60\b", hours) or "3600000" in hours, \
         "the hours are not the minutes over 60"
+
+    # Which line is reached first, and not only what each one says. Every bound and
+    # every name above is still right with the two swapped over, and the hours line
+    # answers first for every run there is: under an hour it is 0 hours, which is
+    # under 24, so a run started twenty minutes ago reads `0h ago` and the minutes
+    # line below is dead code. The rail then says `0h ago` on everything young.
+    assert at_minutes < at_hours, \
+        "the hours are tested before the minutes, so nothing young ever reads in minutes"
 
     assert src.strip().rstrip("}").strip().endswith(f"return {start}.toLocaleString();"), \
         "a run older than a day does not fall through to the date it has always shown"
