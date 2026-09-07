@@ -117,9 +117,31 @@ def _round_verdict(entry: dict) -> str:
 SWEEP_LINES = {
     "pass": "pass {n}: {k} candidates",
     "pass_incomplete": "pass {n}: {k} candidates (incomplete: {names})",
+    "pass_groups": "pass {n}: {k} candidates ({groups})",
+    "pass_incomplete_groups": "pass {n}: {k} candidates (incomplete: {names}) ({groups})",
     "ended": "ended: {reason}",
     "none": "(no passes yet)",
 }
+
+
+def _group_breakdown(entries: list[dict]) -> str:
+    """A pass's candidates by path group: `<name> <count>`, joined by `, `.
+
+    Summed across the pass's detectors, because two tools reporting the same
+    directory are one number the owner reads, not two. Sorted by name and not by
+    the order the detectors were run in: the loop rotates through the detectors,
+    so encounter order would move a directory around the line from one pass to
+    the next and nothing about the repo would have changed.
+
+    Empty when no detector carries `groups` — every pass recorded before this
+    phase — and the v1 line prints instead of empty brackets.
+    """
+    counts: dict[str, int] = {}
+    for entry in entries or []:
+        for group in entry.get("groups") or []:
+            counts[group.get("name", "")] = (counts.get(group.get("name", ""), 0)
+                                             + group.get("count", 0))
+    return ", ".join(f"{name} {counts[name]}" for name in sorted(counts))
 
 
 def format_status(ledger: dict) -> str:
@@ -168,6 +190,11 @@ def format_status(ledger: dict) -> str:
         # has no key: those runs had brief items and nothing else.
         kind = entry.get("kind", "brief")
         word = "" if kind == "brief" else f"{kind} "
+        # A sweep item takes one path group, and which one is all that tells two
+        # items of the same detector apart. An item from before the rotation has
+        # no `group`, and a convergence item never had one.
+        if kind == "sweep" and entry.get("group"):
+            word += f"{entry['group']} "
         items.append(f"  {entry.get('n', '')} {entry.get('status', '')} "
                      f"{word}{detail}".rstrip())
     if len(items) == 1:
@@ -186,9 +213,14 @@ def format_status(ledger: dict) -> str:
             # look at; a cut on an otherwise green pass stays in the ledger.
             names = ", ".join(d.get("name", "") for d in p.get("detectors") or []
                               if d.get("note"))
+            # The count says how much is left, the breakdown says where it is,
+            # which is what tells a rotation working through the repo from one
+            # circling a single directory. A pass with nothing to break down
+            # prints the line it printed before groups existed.
+            groups = _group_breakdown(p.get("detectors"))
             key = "pass" if p.get("complete") else "pass_incomplete"
-            block.append("  " + SWEEP_LINES[key].format(
-                n=p.get("pass", ""), k=p.get("total", ""), names=names))
+            block.append("  " + SWEEP_LINES[key + "_groups" if groups else key].format(
+                n=p.get("pass", ""), k=p.get("total", ""), names=names, groups=groups))
         if not passes:
             block.append("  " + SWEEP_LINES["none"])
         if sweep.get("ended"):

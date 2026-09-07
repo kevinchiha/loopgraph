@@ -624,6 +624,23 @@ def test_the_injected_pattern_survives_javascript():
 #     See: no sweep block at all and not one kind word in the items. Every run before
 #     this phase is that run, and a label on every row of them would be this change
 #     costing something and giving nothing back.
+#
+# 11. The group beside a sweep item and the breakdown on a pass, which need a sweep
+#     run whose passes carry groups — none on this machine the day this was written.
+#     Serve a hand-written ledger as in item 10, with `groups` on each pass's
+#     detectors, out of name order across the two detectors: the first
+#     `[{"name": "lib/", "count": 3}]`, the second
+#     `[{"name": "app/", "count": 5}, {"name": "scripts/", "count": 2}]`; and a
+#     `group` on each sweep item, one of them `<b>x</b>`.
+#     See: `sweep · app/` beside the item's status, in the one span the kind word
+#     had, and `sweep · <b>x</b>` on the other item as those eight characters, not
+#     as bold text; and the breakdown in brackets at the end of every pass line,
+#     sorted by name whatever order the detectors reported:
+#     `pass 1: 10 candidates (app/ 5, lib/ 3, scripts/ 2)`.
+#     Then click a brief run.
+#     See: neither. No group beside any item and no brackets on any pass line — a
+#     brief run has no sweep block, and a sweep recorded before groups existed
+#     prints its pass lines exactly as item 10 saw them.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
@@ -1286,6 +1303,43 @@ def test_the_items_row_has_a_kind_slot_written_by_the_patch():
     assert re.search(r"setText\(kind,", src), "the kind is written some way other than setText"
     assert re.search(r"!==\s*'brief'", src), \
         "a brief item is labelled `brief`, or a missing kind reaches the page as `undefined`"
+
+
+def test_a_sweep_item_row_shows_its_group_through_settext():
+    """AC-9. A sweep item takes one path group, and the row has to say which: two
+    items of one detector are otherwise the same number, the same pill and the
+    same line of text.
+
+    It goes in the span the kind word already has, because a column of its own
+    would be empty on every row of every brief run. And it is written as text like
+    everything else a poll writes, so a group named `<b>x</b>` reaches the reader
+    as those eight characters — this file cannot see that, and the browser
+    checklist's item 11 is where it is looked at.
+    """
+    src = function_source(ui.page_html(), "patchItemRow")
+    assert "entry.group" in src, "the row never reads the item's group"
+    assert "sweep · " in src, \
+        "the page puts something other than lg status's separator between the two words"
+    assert re.search(r"setText\(kind,", src), "the group is written some way other than setText"
+
+
+def test_pass_rows_carry_the_breakdown_through_settext():
+    """AC-9. The other half of the same line in `lg status`: how many candidates a
+    pass found in each directory, in brackets on the end of the pass row.
+
+    Sorted by name, as the terminal sorts it — the detectors report in whatever
+    order they were run, and a breakdown that follows them moves a directory
+    around the line from one pass to the next. The whole line is written with
+    setText, so a directory name is text and never markup.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchSweep")
+    assert ".groups" in src, "the pass rows never read the detectors' groups"
+    assert ".sort()" in src, \
+        "the breakdown keeps the order the detectors reported, which lg status sorts by name"
+    assert re.search(r"setText\(row,", src), "the row is written some way other than setText"
+    for piece in (" candidates (", ") ("):
+        assert piece in html, f"the page no longer says {piece!r}"
 
 
 def test_the_sweep_copy_is_pinned():

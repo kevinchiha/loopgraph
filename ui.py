@@ -472,8 +472,21 @@ function patchSweep(ledger) {
     // and each is written whole rather than pasted together from a stem and a
     // clause, so the two files cannot word one of them differently.
     const names = (p.detectors || []).filter(d => d.note).map(d => d.name).join(', ');
-    setText(row, p.complete ? `pass ${p.pass}: ${p.total} candidates`
-                            : `pass ${p.pass}: ${p.total} candidates (incomplete: ${names})`);
+    // How many candidates the pass found in each directory, summed across its
+    // detectors — two tools reporting one directory are one number to read — and
+    // sorted by name, which is the order lg status sorts them in and the only one
+    // that keeps a directory in the same place from pass to pass. A pass recorded
+    // before groups existed sums to nothing and prints the line it always did,
+    // rather than empty brackets.
+    const counts = new Map();
+    for (const d of p.detectors || [])
+      for (const g of d.groups || []) counts.set(g.name, (counts.get(g.name) || 0) + g.count);
+    const groups = [...counts.keys()].sort().map(name => `${name} ${counts.get(name)}`).join(', ');
+    setText(row, groups
+      ? (p.complete ? `pass ${p.pass}: ${p.total} candidates (${groups})`
+                    : `pass ${p.pass}: ${p.total} candidates (incomplete: ${names}) (${groups})`)
+      : (p.complete ? `pass ${p.pass}: ${p.total} candidates`
+                    : `pass ${p.pass}: ${p.total} candidates (incomplete: ${names})`));
     after = row;
   }
   for (const row of have.values()) row.remove();
@@ -522,7 +535,13 @@ function patchItemRow(row, entry) {
   // its execution position and the pending items after it move up, so the entry
   // under a row keyed `n` can be a different item from one poll to the next, and a
   // word left unwritten would be the old item's, under the new item's number.
-  setText(kind, entry.kind && entry.kind !== 'brief' ? entry.kind : '');
+  const word = entry.kind && entry.kind !== 'brief' ? entry.kind : '';
+  // A sweep item takes one path group, and which one is all that tells two items
+  // of the same detector apart. It goes in the word's own span: a column of its
+  // own would be empty on every row of every brief run, and every run before this
+  // phase is one of those. An item from before the rotation carries no `group`,
+  // and lg status prints the two words in this order too.
+  setText(kind, word === 'sweep' && entry.group ? `sweep · ${entry.group}` : word);
   // A done item's commit, cut to the length anyone actually reads, or a parked
   // item's reason, which is the only thing that says why the run moved on.
   setText(detail, entry.status === 'done' ? String(entry.commit || '').slice(0, 10)

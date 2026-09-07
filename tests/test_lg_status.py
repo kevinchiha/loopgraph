@@ -187,6 +187,74 @@ def test_a_non_brief_item_prints_its_kind(lg):
     assert "  4 pending" in out
 
 
+def test_a_sweep_item_prints_its_group_after_the_kind(lg):
+    """AC-8. Every sweep item takes one path group now, and two items of the same
+    detector read alike apart from that group, so it goes on the line: after the
+    kind word, before the commit or the reason. A running item has neither, and
+    the line is right-stripped rather than left with a space on the end. An entry
+    from a run older than the rotation carries no `group` and prints v1 AC-28's
+    line."""
+    out = lg.format_status({"status": "running", "items": [
+        {"n": 2, "item": "two", "status": "done", "commit": "3f2a1b0c9d5e",
+         "kind": "sweep", "group": "app/"},
+        {"n": 3, "item": "three", "status": "parked", "reason": "gates red",
+         "kind": "sweep", "group": "lib/"},
+        {"n": 4, "item": "four", "status": "running", "kind": "sweep", "group": "app/"},
+        {"n": 5, "item": "five", "status": "done", "commit": "aa11bb22cc33",
+         "kind": "sweep"},
+    ]}).splitlines()
+    assert "  2 done sweep app/ 3f2a1b0c9d" in out
+    assert "  3 parked sweep lib/ gates red" in out
+    assert "  4 running sweep app/" in out
+    assert "  5 done sweep aa11bb22cc" in out
+
+
+def test_a_pass_line_carries_the_group_breakdown(lg):
+    """AC-8. The count on its own says how much is left; the breakdown says where
+    it is, which is what tells the owner whether the rotation is working through
+    the repo or circling one directory.
+
+    Sorted by name, not by the order the detectors reported: pass 1's detectors
+    are deliberately out of name order and disjoint, so a breakdown built in
+    encounter order reads `lib/ 3, app/ 5, scripts/ 2` and fails here. Summed by
+    name, because two detectors reporting the same directory are one number to
+    read, not two.
+    """
+    ledger = {"status": "running", "sweep": {"passes": [
+        {"pass": 1, "total": 10, "complete": True, "detectors": [
+            {"name": "vulture", "note": "", "groups": [{"name": "lib/", "count": 3}]},
+            {"name": "ts-prune", "note": "", "groups": [{"name": "app/", "count": 5},
+                                                        {"name": "scripts/", "count": 2}]}]},
+        {"pass": 2, "total": 12, "complete": True, "detectors": [
+            {"name": "vulture", "note": "", "groups": [{"name": "app/", "count": 7}]},
+            {"name": "ts-prune", "note": "", "groups": [{"name": "app/", "count": 5}]}]},
+        {"pass": 3, "total": 4, "complete": False, "detectors": [
+            {"name": "vulture", "note": "", "groups": [{"name": "app/", "count": 4}]},
+            {"name": "ts-prune", "note": "timeout after 600s", "groups": []}]},
+    ], "ended": None}}
+    lines = lg.format_status(ledger).splitlines()
+    assert "  pass 1: 10 candidates (app/ 5, lib/ 3, scripts/ 2)" in lines
+    assert "  pass 2: 12 candidates (app/ 12)" in lines
+    assert "  pass 3: 4 candidates (incomplete: ts-prune) (app/ 4)" in lines
+
+
+def test_a_pass_without_groups_prints_the_v1_line(lg):
+    """AC-8 and AC-11. A pass recorded before this phase carries no `groups` on
+    any detector, and a pass whose detectors grouped nothing carries `[]` on each.
+    Neither has a breakdown, and empty brackets on the end of the line would say
+    less than no brackets at all."""
+    ledger = {"status": "running", "sweep": {"passes": [
+        {"pass": 1, "total": 12, "complete": True,
+         "detectors": [{"name": "vulture", "note": ""}]},
+        {"pass": 2, "total": 3, "complete": False,
+         "detectors": [{"name": "vulture", "note": "", "groups": []},
+                       {"name": "ts-prune", "note": "timeout after 600s", "groups": []}]},
+    ], "ended": None}}
+    lines = lg.format_status(ledger).splitlines()
+    assert "  " + lg.SWEEP_LINES["pass"].format(n=1, k=12) in lines
+    assert "  " + lg.SWEEP_LINES["pass_incomplete"].format(n=2, k=3, names="ts-prune") in lines
+
+
 def test_the_sweep_section_sits_between_items_and_rounds(lg):
     """AC-28, the whole printout. The passes are the only thing that says whether
     a sweep is getting anywhere, so they sit under the items they produced and
@@ -235,20 +303,36 @@ def test_the_sweep_section_renders_from_sweep_lines(lg):
     """The dashboard prints these same lines and cannot import them: `lg` has no
     extension, so `ui.py` cannot read this dict and its own copy is checked
     against it instead. Every line here is one of these templates, or the page
-    and the terminal go on saying different things about the same pass."""
-    assert set(lg.SWEEP_LINES) == {"pass", "pass_incomplete", "ended", "none"}
+    and the terminal go on saying different things about the same pass. Six of
+    them since the rotation: a pass whose detectors carry groups prints the
+    breakdown, and one from before they existed prints the line it always did."""
+    assert set(lg.SWEEP_LINES) == {"pass", "pass_incomplete", "pass_groups",
+                                   "pass_incomplete_groups", "ended", "none"}
     ledger = {"status": "running", "sweep": {
         "passes": [{"pass": 1, "total": 12, "complete": True,
                     "detectors": [{"name": "vulture", "note": ""}]},
                    {"pass": 2, "total": 3, "complete": False,
                     "detectors": [{"name": "vulture", "note": "exit 1"},
                                   {"name": "ts-prune", "note": "timeout after 600s"},
-                                  {"name": "ruff", "note": ""}]}],
+                                  {"name": "ruff", "note": ""}]},
+                   {"pass": 3, "total": 8, "complete": True,
+                    "detectors": [{"name": "vulture", "note": "",
+                                   "groups": [{"name": "app/", "count": 5},
+                                              {"name": "lib/", "count": 3}]}]},
+                   {"pass": 4, "total": 5, "complete": False,
+                    "detectors": [{"name": "vulture", "note": "",
+                                   "groups": [{"name": "app/", "count": 5}]},
+                                  {"name": "ts-prune", "note": "timeout after 600s",
+                                   "groups": []}]}],
         "ended": "converged: nothing reported"}}
     lines = lg.format_status(ledger).splitlines()
     assert "  " + lg.SWEEP_LINES["pass"].format(n=1, k=12) in lines
     assert "  " + lg.SWEEP_LINES["pass_incomplete"].format(
         n=2, k=3, names="vulture, ts-prune") in lines, "only the detectors that failed"
+    assert "  " + lg.SWEEP_LINES["pass_groups"].format(
+        n=3, k=8, groups="app/ 5, lib/ 3") in lines
+    assert "  " + lg.SWEEP_LINES["pass_incomplete_groups"].format(
+        n=4, k=5, names="ts-prune", groups="app/ 5") in lines
     assert "  " + lg.SWEEP_LINES["ended"].format(
         reason="converged: nothing reported") in lines
 
