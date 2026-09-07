@@ -93,15 +93,18 @@ PAGE = """<!doctype html>
   /* The state board: what the run is doing, what it is asking, what it is
      working through. The logs come after all three. */
   #state { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; margin-bottom:14px; }
-  #state .reason { color:var(--dim); font-size:12.5px; min-width:0; word-break:break-word; }
+  #state .reason { color:var(--dim); font-size:12.5px; min-width:0; word-break:break-word;
+                   max-width:80ch; }
   #why { color:var(--dim); font-size:12.5px; margin-bottom:16px; }
   #awaiting { background:var(--panel); border:1px solid var(--line);
               border-left:3px solid var(--accent); border-radius:10px;
               padding:13px 16px; margin-bottom:20px; }
   #awaiting h2 { font:700 11px/1.4 ui-monospace,monospace; letter-spacing:1px;
                  text-transform:uppercase; color:var(--accent); margin-bottom:9px; }
-  /* The question is the text of the card the owner saw, line breaks and all. */
-  #awaiting .q { white-space:pre-wrap; word-break:break-word; margin-bottom:10px; }
+  /* The question is the text of the card the owner saw, line breaks and all, and
+     the longest prose on the page: run.py puts the whole card here, uncut. */
+  #awaiting .q { white-space:pre-wrap; word-break:break-word; margin-bottom:10px;
+                 max-width:80ch; }
   #awaiting .opt { font-size:13px; }
   #awaiting .answer { margin-top:11px; }
   /* Beside the command and never inside it: user-select:all covers the element
@@ -149,11 +152,23 @@ PAGE = """<!doctype html>
   .round .field b { display:block; margin-bottom:2px; color:var(--dim);
                     font:700 10.5px/1.6 ui-monospace,monospace; letter-spacing:.9px;
                     text-transform:uppercase; }
-  /* The reasons and the files are patched in as one string with newlines between
-     them — one setText for the lot, so a poll that changes nothing touches
-     nothing — and this is what puts each of them back on its own line. */
+  /* The files, the directive and the two owner lines are patched in as one string
+     with newlines between them — one setText for the lot, so a poll that changes
+     nothing touches nothing — and this is what puts each of them back on its own
+     line. The reasons are not among them: they are a row each, styled below.
+     80ch because a line the width of the board ran to about 151 characters. */
   .round .field span { display:block; white-space:pre-wrap; word-break:break-word;
-                       font-size:12.5px; color:var(--fg); }
+                       font-size:12.5px; color:var(--fg); max-width:80ch; }
+  /* One row per reason, so a line that wrapped can be told from the next reason
+     starting: the padding pushes the row in and the negative text-indent pulls its
+     first line back out, which leaves every continuation line sitting past where
+     the reason itself began. The pair only works as a pair, and a single text node
+     could not be given it at all — which is why the reasons stopped being one
+     string. The size, the colour and the break are the field rule's above,
+     restated because a row is not that span: a supervisor quotes paths, and one
+     with nowhere to break spills past the edge of the card. */
+  .round .reason { padding-left:2ch; text-indent:-2ch; max-width:80ch;
+                   word-break:break-word; font-size:12.5px; color:var(--fg); }
   .round .panels { margin-top:11px; }
   .panels { display:flex; gap:14px; align-items:flex-start; }
   .panel { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:10px;
@@ -647,8 +662,10 @@ function buildRoundCard(key) {
   // Empty on purpose, exactly as a run row is: every word comes from
   // patchRoundCard, so there is one code path for the text instead of two that
   // have to agree, and nothing a supervisor wrote can reach the page as markup.
+  // The reasons are a box rather than a span: one row per reason, put there by
+  // patchReasons. Every other field is still one span holding one string.
   card.innerHTML = '<h2></h2><div class="verdict"></div>'
-                 + '<div class="field"><b>reasons</b><span></span></div>'
+                 + '<div class="field"><b>reasons</b><div class="rows"></div></div>'
                  + '<div class="field"><b>files</b><span></span></div>'
                  + '<div class="field"><b>directive</b><span></span></div>'
                  + '<div class="field"><b>owner asked</b><span></span></div>'
@@ -656,8 +673,25 @@ function buildRoundCard(key) {
                  + '<div class="panels"></div>';
   return card;
 }
+function buildReasonRow(i) {
+  const row = document.createElement('div');
+  row.className = 'reason';
+  // Keyed on its place in the list, the way an option row is keyed on its letter:
+  // that is how patchReasons finds this row again on the next poll. By index and
+  // not by the words, because the supervisor writes the list fresh every round —
+  // a re-ordered list is text that changed, never a row that moved.
+  row.dataset.i = i;
+  // Empty on purpose, exactly as a run row is: the words come from patchReasons,
+  // so nothing a supervisor wrote can reach the page as markup. No innerHTML here
+  // at all, which is why this builder is one createElement and a class.
+  return row;
+}
 // A labelled block that is not on the card at all when the round has nothing to
 // put in it. An empty box under the word `directive` says less than no box.
+//
+// Never the reasons field: its last element is the box of rows, and the setText
+// below would assign textContent to it and wipe every one of them. That field's
+// hide is written out in patchRoundCard for this reason.
 function patchField(field, text) {
   field.hidden = !text;
   setText(field.lastElementChild, text);
@@ -688,14 +722,57 @@ function patchRoundCard(card, row, live) {
   setText(head, `item ${item} · round ${round}` + (running ? ' · in progress' : ''));
   verdict.hidden = !word;
   setText(verdict, word);
-  // One string with newlines in it rather than a row per reason: the whole lot
-  // is one setText, so a poll that changes nothing replaces nothing, and the
-  // stylesheet puts each entry back on its own line.
-  patchField(reasons, (entry.verdict_reasons || []).join('\\n'));
+  // A row per reason rather than one string with newlines in it. One string was
+  // one setText, and a wrapped line inside it looked exactly like the next reason
+  // starting — eight reasons, eleven lines, nothing marking which was which. A
+  // text node cannot be styled per line, so the hanging indent that tells them
+  // apart needs an element each.
+  //
+  // What the single setText gave, the diff below keeps: patchReasons finds each
+  // row by its index and writes it through setText too, so a poll that changes no
+  // reason still replaces no node and the reader's selection lives through it.
+  //
+  // Read once and used twice: the same list decides whether the field is on the
+  // card at all. That hide is patchField's, written out here because this field
+  // cannot go through patchField — its last element is the box, not a span, and
+  // one setText on it would take every row down. Without it a parked round and a
+  // round the executor is still inside both grow a bare REASONS heading over
+  // nothing.
+  const reasonList = entry.verdict_reasons || [];
+  reasons.hidden = !reasonList.length;
+  patchReasons(reasons.lastElementChild, reasonList);
   patchField(files, (entry.files || []).join('\\n'));
   patchField(directive, entry.directive || '');
   patchField(asked, entry.owner_question || '');
   patchField(replied, entry.owner_reply || '');
+}
+// The reasons, one row each, diffed against the rows already on screen — the same
+// map patchOptions is written on, and never an empty-and-refill, which would look
+// identical and lose the reader's selection every 2 seconds.
+function patchReasons(box, reasons) {
+  const rows = new Map([...box.children].map(row => [row.dataset.i, row]));
+  let after = null;
+  for (let i = 0; i < reasons.length; i++) {
+    // dataset values are strings whatever they were assigned, so the lookup has
+    // to be one too or every row is a miss and gets built again.
+    let row = rows.get(String(i));
+    if (row) {
+      rows.delete(String(i));
+    } else {
+      row = buildReasonRow(i);
+      box.insertBefore(row, after ? after.nextSibling : box.firstChild);
+    }
+    // String() and not the reason itself. `.join` used to do this without anyone
+    // asking it to: verdict_reasons is the audit model's JSON, audit.py fills it
+    // in with setdefault and checks no types, and run.py copies it into the
+    // ledger as it stands, so an entry that is not a string arrives here as one.
+    // setText compares with !==, where a string never equals an object, so an
+    // uncoerced reason would fail that test for ever and build a new text node
+    // every 2 seconds — the exact churn this whole shape exists to avoid.
+    setText(row, String(reasons[i]));
+    after = row;
+  }
+  for (const row of rows.values()) row.remove();
 }
 function buildLogPane(dir, name, label) {
   // <details> carries "open" itself and fires toggle, so there is no collapse

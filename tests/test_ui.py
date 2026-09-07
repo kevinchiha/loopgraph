@@ -2250,18 +2250,220 @@ def test_only_a_run_that_is_still_open_claims_a_round_is_in_progress():
         f"the suffix is gated on {guard.group(1)!r} rather than the run's own liveness"
 
 
+def css_rules(html):
+    """(selector, declarations) for every rule in the page's stylesheet.
+
+    Comments stripped, and the one @media block flattened: the rules inside it come
+    back as rules of their own, which is all anything here asks of them. Not a CSS
+    parser — it is the same "read the source as text" this whole file does, and the
+    stylesheet is what nothing in it could see when a `display` beat `[hidden]`.
+    """
+    style = re.search(r"<style>(.*?)</style>", html, re.S)
+    assert style, "the page serves no stylesheet"
+    css = re.sub(r"/\*.*?\*/", "", style.group(1), flags=re.S)
+    css = re.sub(r"@media[^{]*\{", "", css)
+    return [(sel.strip(), body) for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)]
+
+
+def declarations(html, selector):
+    """Everything the stylesheet declares for one selector, from every rule carrying
+    it, whether it stands alone or sits in a comma-separated list."""
+    return " ".join(body for sel, body in css_rules(html)
+                    if selector in [p.strip() for p in sel.split(",")])
+
+
+def reason_row_declarations(html):
+    """The same, for a round's reason rows, wherever the page chose to put them.
+
+    A row of its own rule and a row folded into the selector the other fields use
+    are the same page to the reader, so this reads any selector piece ending in
+    `.reason` — the state line's own `#state .reason` excepted, which is a
+    different element with a different job.
+    """
+    out = []
+    for sel, body in css_rules(html):
+        pieces = [p.strip() for p in sel.split(",")]
+        if any(p.endswith(".reason") and not p.startswith("#state") for p in pieces):
+            out.append(body)
+    return " ".join(out)
+
+
 def test_a_round_card_carries_what_ac8_asks_for():
-    """Verdict, reasons one per line, files one per line, the directive when there
-    is one, and the owner's question with the answer when the round asked. All of
-    it written through setText, so a poll that changes nothing touches no node."""
-    src = function_source(ui.page_html(), "patchRoundCard")
+    """Verdict, every reason, files one per line, the directive when there is one,
+    and the owner's question with the answer when the round asked. All of it
+    written through setText, so a poll that changes nothing touches no node.
+
+    The reasons stopped being one `\\n`-joined string (AC-5), so this pins what the
+    card owes the reader rather than how it is built: each reason reaches the page
+    as its own element, made by a builder and written through the guarded setter,
+    with no innerHTML anywhere on the way. The fields that still join are pinned
+    exactly as before — the files are one string with newlines in it and the
+    pre-wrap rule is the only thing putting them back on their own lines, and a
+    rewrite of this test that quietly stopped watching them would let a five-file
+    list run together into one line with the suite green.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchRoundCard")
     for field in ("verdict_reasons", "files", "directive", "owner_question", "owner_reply"):
         assert field in src, f"a round card says nothing about {field}"
-    assert src.count("'\\n'") >= 2, "the reasons and the files are not one per line"
-    assert ".textContent =" not in src, "a poll writes text without checking it changed"
-    rule = re.search(r"\.round \.field span \{([^}]*)\}", ui.page_html())
-    assert rule and "pre-wrap" in rule.group(1), \
-        "the lines a round is patched with are collapsed back into one"
+    assert re.search(r"patchReasons\(\w+\.lastElementChild, \w+\)", src), \
+        "the reasons do not reach the page an element at a time"
+    rows = function_source(html, "patchReasons")
+    assert "buildReasonRow(" in rows, "the rows come from somewhere other than a builder"
+    assert re.search(r"setText\(\w+,", rows), "a reason is written without the guarded setter"
+    for name in ("patchRoundCard", "patchReasons"):
+        assert ".textContent =" not in function_source(html, name), \
+            f"{name} runs on every poll and writes text without checking it changed"
+    assert "innerHTML" not in function_source(html, "buildReasonRow"), \
+        "a reason row is poured out of markup, so a supervisor's `<b>` would arrive bold"
+
+    assert re.search(r"\(\w+\.files \|\| \[\]\)\.join\('\\n'\)", src), \
+        "the files no longer reach the page one per line"
+    assert "pre-wrap" in declarations(html, ".round .field span"), \
+        "the lines the joined fields are patched with are collapsed back into one"
+
+
+def test_reason_rows_are_keyed_and_diffed_not_rebuilt():
+    """AC-5's second sentence: a poll that changes no reason replaces no node.
+
+    One `\\n`-joined string got that for free — one setText, one comparison, and a
+    reader's selection survived every poll that changed nothing. A row per reason
+    only keeps it if the rows are found again rather than made again, so this is
+    the map diff patchOptions and the pass rows are written on: existing rows read
+    out by their key, a new one inserted where the list has it, and the ones past
+    the end removed. Emptying the box and refilling it would look identical on
+    screen and lose the selection every 2 seconds.
+
+    Keyed on the index because the supervisor writes the list fresh each round, so
+    a re-ordered list is a text change and never a move.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchReasons")
+    assert re.search(r"new Map\(\[\.\.\.\w+\.children\]", src), \
+        "the rows already on screen are not read out before the list is walked"
+    assert "dataset.i" in src, "a row is matched to its reason by position alone"
+    assert "insertBefore" in src, "a new reason cannot arrive without moving the rows around it"
+    assert ".remove()" in src, "a reason the round no longer carries stays on screen for ever"
+    assert "replaceChildren" not in src, "the box is emptied and filled back up"
+    for m in re.finditer(r"\bbuildReasonRow\(", src):
+        assert src[:m.start()].rstrip().endswith("="), \
+            "patchReasons calls buildReasonRow for what it does, not for the row it hands back"
+    build = function_source(html, "buildReasonRow")
+    assert re.search(r"dataset\.i\s*=", build), \
+        "a reason row carries no key, so its text could only be matched to it by position"
+
+
+def test_a_reason_is_coerced_before_it_is_written():
+    """`.join('\\n')` was doing one thing nobody wrote down: it made a string.
+
+    `verdict_reasons` is the audit model's own JSON. `activities/audit.py` fills it
+    in with `pkt.setdefault("reasons", [])` and checks no types, `workflows/run.py`
+    copies it into the ledger as it stands, and `/api/run` hands it on, so an entry
+    that is not a string arrives here as one. setText compares with `!==`, and a
+    string is never equal to an object, so an uncoerced reason would fail that
+    comparison for ever: a new text node every 2 seconds, on the one element this
+    task exists to hold still, taking the reader's selection with it each time.
+
+    patchOptions, the diff this one is modelled on, coerces by accident — it
+    concatenates — so copying it literally is what lands the bug.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchReasons")
+    assert re.search(r"setText\(\w+, String\(", src), \
+        "a reason is written without being made a string first"
+
+    card = function_source(html, "patchRoundCard")
+    call = re.search(r"patchReasons\((\w+)\.lastElementChild, \w+\)", card)
+    assert call, "the reasons box is filled by something other than patchReasons"
+    assert not re.search(rf"patchField\(\s*{call.group(1)}\b", card), \
+        "the reasons field also goes through patchField, whose setText wipes every row"
+
+
+def test_a_round_with_no_reasons_hides_the_field():
+    """AC-5's last sentence. patchField is what takes an empty field off the card,
+    and the reasons no longer go through it — so the hide is written out here, or
+    a parked round and a round the executor is still inside both grow a bare
+    REASONS heading over nothing. Task 4 makes exactly that round's card the open
+    one, so it is the heading the reader would meet first.
+
+    The other fields still get their hide from patchField, which is the reason
+    this is the only one written by hand.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchRoundCard")
+    held = re.search(r"const (\w+) = \w+\.verdict_reasons \|\| \[\];", src)
+    assert held, "the reasons list is not read once and used for both the hide and the rows"
+    hide = re.search(rf"(\w+)\.hidden = !{held.group(1)}\.length", src)
+    assert hide, "the reasons field is drawn whether or not the round has any reasons"
+    assert re.search(rf"patchReasons\({hide.group(1)}\.lastElementChild, {held.group(1)}\)", src), \
+        "the field that is hidden and the box that is filled are not the same field"
+    assert re.search(r"\.hidden = !\w+;", function_source(html, "patchField")), \
+        "the fields that still go through patchField lost their hide with it"
+
+
+def test_a_reason_that_wraps_is_indented_past_its_first_line():
+    """AC-6, and the whole reason a reason is an element rather than a line.
+
+    Eight reasons rendered as eleven wrapped lines with nothing saying where one
+    ended and the next began: a wrapped line read as a new reason. The fix is a
+    hanging indent, which only works as a pair — the padding pushes the whole row
+    in, the negative text-indent pulls the FIRST line back out, so everything after
+    the wrap sits further in than the reason's own start. Either half alone indents
+    the block and marks nothing, so the two numbers are checked against each other
+    and not merely for being present.
+
+    A single text node cannot be given this at all, which is what the spec rejected
+    a CSS-only fix over.
+    """
+    body = reason_row_declarations(ui.page_html())
+    assert body, "the reason rows have no style of their own"
+    pad = re.search(r"padding-left:\s*(-?[\d.]+)ch", body)
+    indent = re.search(r"text-indent:\s*(-?[\d.]+)ch", body)
+    assert pad and indent, "a reason row carries no hanging indent, so a wrap reads as a new reason"
+    assert float(pad.group(1)) > 0, "the rows are not indented, so there is nothing to hang from"
+    assert float(indent.group(1)) == -float(pad.group(1)), \
+        "the first line is not pulled back out by what the row was pushed in, so the whole reason moves together"
+
+
+def test_a_reason_row_keeps_the_field_typography():
+    """A reason row is a field on the card like any other, and it has to read like
+    one: 14px reasons beside 12.5px files is one card in two type sizes.
+
+    The break matters more than it looks. A supervisor's reason quotes paths and
+    URLs, and an unbroken 200-character one with nowhere to break spills straight
+    past the card boundary Task 4 adds. Whether the declarations are restated on
+    the rows or the selector the other fields use is widened to reach them is the
+    page's business; what lands on the row is not.
+    """
+    html = ui.page_html()
+    body = reason_row_declarations(html)
+    field = declarations(html, ".round .field span")
+    for piece in ("font-size:12.5px", "word-break:break-word"):
+        assert piece.replace(" ", "") in body.replace(" ", ""), \
+            f"a reason row does not carry {piece}, which every other field on the card has"
+        assert piece.replace(" ", "") in field.replace(" ", ""), \
+            f"the fields that still join lost {piece}, so the card is in two type sizes"
+
+
+def test_board_prose_is_capped_at_80ch():
+    """AC-7. Measured on a 1440px viewport a reason ran 151 characters to the line,
+    which is roughly twice what anyone reads without losing their place. The cap
+    goes on the four blocks of sentences the board shows and nowhere wider.
+
+    Not on `.round`, `.panels` or `.panel`: a cap there is inherited into the log
+    panes and the diff, where it would hold an open pane to about 610px against
+    the 900px AC-12 asks for two tasks later — and the suite would never see it,
+    because the only thing that can is a browser.
+    """
+    html = ui.page_html()
+    for selector in (".round .field span", "#awaiting .q", "#state .reason"):
+        assert "max-width:80ch" in declarations(html, selector).replace(" ", ""), \
+            f"{selector} is prose and runs the full width of the board"
+    assert "max-width:80ch" in reason_row_declarations(html).replace(" ", ""), \
+        "the reason rows are prose and run the full width of the board"
+    for wide in (".round", ".panels", ".panel"):
+        assert "max-width" not in declarations(html, wide), \
+            f"{wide} carries a max-width, which every log and diff pane inside it inherits"
 
 
 # ---------- the diff pane ----------

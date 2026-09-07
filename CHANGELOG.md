@@ -17,6 +17,14 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   them, `loopgraph` with none. Its icon is a dot that turns blue at the same moment,
   so a dashboard left open in a background tab tells you a run needs you without you
   going and looking.
+- You can tell one of the supervisor's reasons from the next. Each one starts at the
+  left and its wrapped lines are indented under it, so eight reasons read as eight
+  things and not as eleven lines running together — a reason that wrapped used to
+  look exactly like a new reason starting.
+- Sentences on the board stop at about 80 characters instead of running the full
+  width of the window: the reasons, the rest of a round's fields, the question a run
+  is asking and the line beside its status. The logs and the diff are untouched and
+  still get the whole width.
 
 ## 0.2.0 - 2026-09-07
 
