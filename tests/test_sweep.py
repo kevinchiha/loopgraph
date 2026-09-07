@@ -22,8 +22,8 @@ from activities.config import parse_run_config
 from activities.execute_round import clean_candidates
 from workflow_fake import (ACCEPT, COMMITTED, DEFAULT_CONFIG, GREEN_ROUND, START,
                            ScriptedWorkflow, drive)
-from workflows.run import (EXTRAS_CAP, build_sweep_item, merge_extras, pick_detector,
-                           sweep_end_reason, trim_pass)
+from workflows.run import (EXTRAS_CAP, build_sweep_item, detector_groups, merge_extras,
+                           pick_detector, pick_group, sweep_end_reason, trim_pass)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -108,6 +108,19 @@ def _det(name: str = "vulture", count: int = 3, note: str = "") -> dict:
             "note": note, "stderr_tail": ""}
 
 
+def _grouped(groups: dict[str, int], name: str = "vulture") -> dict:
+    """One detector entry carrying `groups`, from `{group name: count}` pairs.
+
+    The detector counts what its groups count, the way `discover` returns it,
+    and each group's sample lines are named after the group, so a test can read
+    which group an item took out of the item's own text.
+    """
+    made = [{"name": g, "count": count,
+             "lines": [f"{g}f{i}.py:{i}: unused" for i in range(1, min(count, 3) + 1)]}
+            for g, count in sorted(groups.items())]
+    return dict(_det(name, count=sum(groups.values())), groups=made)
+
+
 def _pass(*dets: dict) -> dict:
     """A `discover` result over those detector entries."""
     return {"complete": all(not d["note"] for d in dets),
@@ -181,6 +194,20 @@ def test_trim_pass_keeps_ten_lines_and_a_tail_only_where_there_is_a_note():
                            "stderr_tail"}
     assert failed["cmd"] == "ts-prune .", "which command failed is the owner's next move"
     assert failed["stderr_tail"] == "boom\n"
+
+
+def test_trim_pass_keeps_group_names_and_counts_but_no_lines():
+    """AC-7. A group's sample is the detector's own lines cut up again, and the
+    ledger is carried whole on every dashboard poll. The names and the counts
+    are what the per-pass breakdown reads, so they stay; the lines go. A pass
+    recorded before this phase has no `groups` and grows none here: the key
+    would print nothing and change the shape of every pass already recorded."""
+    trimmed = trim_pass(_pass(_grouped({"lib/": 2, "app/": 5}),
+                              _det(name="ts-prune", count=1)), 2)
+    kept, old = trimmed["detectors"]
+    assert kept["groups"] == [{"name": "app/", "count": 5}, {"name": "lib/", "count": 2}]
+    assert set(kept) == {"name", "cmd", "exit_code", "count", "note", "lines", "groups"}
+    assert set(old) == {"name", "cmd", "exit_code", "count", "note", "lines"}
 
 
 def test_the_ledger_keeps_a_trimmed_pass_and_the_item_the_whole_sample():
@@ -431,6 +458,36 @@ def test_round_robin_skips_empty_detectors_and_continues_from_the_last():
         passes=passes)
     ledger = drive(fake)
     assert _detectors_used(ledger) == ["a", "c", "a"]
+
+
+# ---------- which of that detector's groups the item takes ----------
+
+def test_pick_group_takes_the_next_name_and_wraps():
+    """AC-4. The pointer is a name, not an index, because the set of groups
+    changes from pass to pass and from detector to detector: an index would
+    point at a different group the moment a directory emptied. A name that has
+    left the list still lands on the next name after it."""
+    groups = _grouped({"app/": 4, "lib/": 2, "scripts/": 1})["groups"]
+    assert [g["name"] for g in groups] == ["app/", "lib/", "scripts/"]
+    assert pick_group(groups, None) == 0, "the first item starts at the front"
+    assert pick_group(groups, "app/") == 1
+    assert pick_group(groups, "scripts/") == 0, "past the end, back to the front"
+    assert pick_group(groups, "b/") == 1, "gone from the list, still the next name along"
+    assert pick_group(groups, "zz/") == 0
+    assert pick_group([], "app/") is None
+    assert pick_group([], None) is None
+
+
+def test_detector_groups_reads_a_missing_key_as_one_group_all():
+    """AC-5. A run that started before this phase has no `groups` in its
+    history, and Temporal replays that history through today's code. Raising
+    would fail the workflow task and leave the run stuck, so the whole detector
+    reads as one group and the item comes out as it did in v1."""
+    old = _det(count=3)
+    assert detector_groups(old) == [{"name": "(all)", "count": 3, "lines": old["lines"]}]
+    grouped = _grouped({"app/": 4, "lib/": 2})
+    assert detector_groups(grouped) == grouped["groups"]
+    assert detector_groups(_grouped({})) == [], "an empty list is an answer, not a gap"
 
 
 # ---------- what the executor found by hand ----------

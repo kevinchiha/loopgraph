@@ -245,6 +245,10 @@ def trim_pass(found: dict, pass_no: int) -> dict:
     and the dashboard use to decide whether to name the detector at all. `cmd`
     stays whatever the note says: it is one short string, and an owner reading a
     failed pass wants to see which command it was.
+
+    A group keeps its name and its count and never its sample: the sample is the
+    detector's own lines split up again, and the names and counts are all the
+    per-pass breakdown reads.
     """
     detectors = []
     for d in found["detectors"]:
@@ -253,6 +257,12 @@ def trim_pass(found: dict, pass_no: int) -> dict:
                 "lines": d["lines"][:LEDGER_LINES]}
         if d["note"]:
             kept["stderr_tail"] = d["stderr_tail"]
+        # The one guarded read of `groups` outside `detector_groups`: a pass
+        # recorded before this phase has to keep the exact shape it had, and
+        # writing `groups: []` there would change every one of them for a key
+        # that prints nothing.
+        if "groups" in d:
+            kept["groups"] = [{"name": g["name"], "count": g["count"]} for g in d["groups"]]
         detectors.append(kept)
     return {"pass": pass_no, "complete": found["complete"], "total": found["total"],
             "detectors": detectors}
@@ -302,6 +312,42 @@ def pick_detector(entries: list[dict], last_used: int | None) -> int | None:
     start = 0 if last_used is None else last_used + 1
     order = [(start + step) % len(entries) for step in range(len(entries))]
     return next((i for i in order if entries[i]["count"]), None)
+
+
+def pick_group(groups: list[dict], last: str | None) -> int | None:
+    """Which of that detector's groups the next item takes, or None if it has none.
+
+    The next name along, wrapping to the front when there is none. `groups` is
+    name-sorted (`discover` sorts it), so "the first name after `last`" is the
+    next group. The pointer is a name rather than an index because the set of
+    groups changes from pass to pass and from detector to detector: an index
+    would point at a different group the moment a directory emptied. A name that
+    has left the list still lands on the next name after it, which is what one
+    pointer shared across detectors needs.
+
+    The loop never asks about a detector with no groups: `pick_detector` skips a
+    detector on 0, and a counted detector has at least one group. None is the
+    answer for anyone who asks anyway.
+    """
+    if not groups:
+        return None
+    if last is None:
+        return 0
+    return next((i for i, g in enumerate(groups) if g["name"] > last), 0)
+
+
+def detector_groups(entry: dict) -> list[dict]:
+    """A detector entry's groups, with a pass that predates them read as one group.
+
+    Every read of a detector's groups in the workflow goes through here. A run
+    that started before groups existed has no `groups` in its history, and
+    Temporal replays that history through today's code: raising would fail the
+    workflow task and leave the run stuck with nothing to do about it. Reading
+    the whole detector as one group named `(all)` builds the item v1 built.
+    """
+    if "groups" in entry:
+        return entry["groups"]
+    return [{"name": "(all)", "count": entry["count"], "lines": entry["lines"]}]
 
 
 def merge_extras(extras: list[str], candidates: list[str], cap: int = EXTRAS_CAP) -> list[str]:
