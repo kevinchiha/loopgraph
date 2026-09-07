@@ -2660,10 +2660,32 @@ def test_a_round_card_has_a_visible_boundary():
     sel, body = seps[0]
     assert re.search(r"content:\s*'[^']*·[^']*'", body), \
         "the separator rule generates something other than the board's own `·`"
-    # A round with no verdict and no files has two empty spans, and a dot in
-    # front of each is `item 1 · round 4 · ·` on the card the reader meets first.
-    assert ":empty" in sel, \
-        "the separator goes in front of every span, empty ones included"
+    # A round with no verdict and no files has two empty spans, and a dot in front
+    # of each is `item 1 · round 4 · ·` on the card the reader meets first — the
+    # round the executor is still inside, which is the one card that opens.
+    #
+    # So the guard has to sit on the span RECEIVING the pseudo-element, and asking
+    # only whether the selector says `:empty` anywhere does not check that.
+    # `span:not(:empty) ~ span::before` keeps the word and loses the rule: the
+    # head is never empty, so the sibling half is true for every span after it and
+    # the dot comes back in front of both empty ones. Read off the last part of
+    # each selector rather than off the selector as a whole, so a rule written any
+    # other way that still guards the right span still passes.
+    #
+    # The comma split is this file's usual "read the source as text", not a CSS
+    # parser: a `:not(a, b)` would defeat it, and the page has none.
+    guarded = 0
+    for piece in sel.split(","):
+        # `:not( :empty )` is the same guard spaced out, and the split below reads
+        # whitespace as a descendant combinator. Closed up first so it is not.
+        piece = re.sub(r"\s*([()])\s*", r"\1", piece.strip())
+        if "::" not in piece:
+            continue
+        subject = re.split(r"[>+~\s]+", piece)[-1]
+        assert ":not(:empty)" in subject, \
+            f"`{subject}` takes a separator without being asked whether it has anything in it"
+        guarded += 1
+    assert guarded, "no part of the rule generates a separator at all"
 
 
 def test_board_prose_is_capped_at_80ch():
