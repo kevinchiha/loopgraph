@@ -254,6 +254,56 @@ def test_a_failed_pass_reporting_nothing_names_the_detectors():
     assert [c[0] for c in fake.cards] == ["merge-ready"]
 
 
+class _DiscoverDiesOnPass(ScriptedWorkflow):
+    """A fake whose `discover` dies on the nth pass. `fails` kills an activity on
+    its first call, and what this test needs is a pass that dies with an accepted
+    item already behind it."""
+
+    def __init__(self, pass_no: int, **kw) -> None:
+        super().__init__(**kw)
+        self._dies_on = pass_no
+        self._passes_run = 0
+
+    async def execute_activity(self, fn, args=None, **kwargs):
+        result = await super().execute_activity(fn, args=args, **kwargs)
+        if fn.__name__ == "discover":
+            self._passes_run += 1
+            if self._passes_run >= self._dies_on:
+                raise RuntimeError("boom")
+        return result
+
+
+def test_a_dead_discover_activity_ends_the_sweep_with_a_card():
+    """A pass that fails both its attempts is a Temporal error rather than a
+    detector's exit code, and letting it raise killed the whole workflow: the
+    ledger was never written on the way out, so the `ledger` query went on saying
+    `running` and no card ever went out. The audit call already closed the same
+    hole inside an item."""
+    fake = ScriptedWorkflow(config=_sweep(), fails={"discover": RuntimeError("boom")})
+    ledger = drive(fake)
+    assert ledger["sweep"]["ended"].startswith("discover failed:")
+    assert "RuntimeError: boom" in ledger["sweep"]["ended"]
+    assert ledger["reason"] == ledger["sweep"]["ended"]
+    assert ledger["status"] == "stopped"
+    assert "execute_round" not in _names(fake)
+    assert ledger["sweep"]["passes"] == [], "a pass that never returned is not a pass"
+    assert [c[0] for c in fake.cards] == ["run stopped"]
+    assert fake.cards[0][3].startswith("why: discover failed:")
+    assert "item " not in fake.cards[0][3], "no item ran, so there is nowhere to speak from"
+
+
+def test_a_dead_discover_after_an_accepted_item_still_offers_the_merge():
+    """AC-22. The pass that died says nothing about the work the auditor already
+    passed, so the accepted item still gets its merge card, the way a pass whose
+    detectors all failed does."""
+    fake = _DiscoverDiesOnPass(2, config=_sweep(), passes=[_pass(_det(count=5))])
+    ledger = drive(fake)
+    assert _names(fake).count("execute_round") == 1
+    assert [e["status"] for e in ledger["items"]] == ["done"]
+    assert [c[0] for c in fake.cards] == ["merge-ready"]
+    assert "\n\nsweep ended: discover failed:" in fake.cards[0][3]
+
+
 def test_the_deadline_is_checked_after_a_pass_and_the_item_in_flight_finishes():
     """AC-18. "Done by Monday" is a real need, and the check sits after a pass so
     the item already running is never thrown away half-finished."""

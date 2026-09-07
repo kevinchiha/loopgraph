@@ -1,10 +1,12 @@
+import asyncio
 import inspect
 import re
 
 import pytest
+from temporalio.exceptions import ApplicationError
 
-from activities.config import (DEFAULT_CONVERGENCE, parse_deadline, parse_run_config,
-                               read_run_config)
+from activities.config import (DEFAULT_CONVERGENCE, load_run_config, parse_deadline,
+                               parse_run_config, read_run_config)
 
 DEFAULTS = {"convergence": {"enabled": True, "every_items": 5, "net_lines": 400}, "sweep": None}
 
@@ -157,6 +159,20 @@ def test_a_sweep_needs_a_floor_and_at_least_one_detector(text, message):
     refused(text, message)
 
 
+def test_a_detector_cmd_that_is_not_a_string_is_refused():
+    """The YAML 1.1 trap again, this time in a value: `cmd: yes` is the boolean
+    True and `cmd: 0755` the integer 493, and str() would hand the shell "True"
+    or "493" to run. Quote them and they are commands again."""
+    for value in ("yes", "0755"):
+        refused(f"sweep:\n  yield_floor: 0\n  detectors:\n    - name: a\n      cmd: {value}\n",
+                "run.yaml: sweep.detectors[0] needs name and cmd")
+    refused("sweep:\n  yield_floor: 0\n  detectors:\n    - name: yes\n      cmd: x\n",
+            "run.yaml: sweep.detectors[0] needs name and cmd")
+    quoted = parse_run_config("sweep:\n  yield_floor: 0\n  detectors:\n"
+                              "    - name: 'no'\n      cmd: '0755'\n")
+    assert quoted["sweep"]["detectors"][0] == {"name": "no", "cmd": "0755", "timeout": 600}
+
+
 def test_a_sweep_brief_with_work_items_is_refused():
     refused(SWEEP, WORK_ITEMS_MESSAGE, brief=WORK_ITEMS_BRIEF)
 
@@ -188,6 +204,24 @@ def test_read_run_config_reads_both_files_from_the_run_dir(tmp_path):
     with pytest.raises(ValueError) as err:
         read_run_config(str(tmp_path))
     assert str(err.value) == WORK_ITEMS_MESSAGE
+
+
+def test_a_bad_run_yaml_is_a_non_retryable_error(tmp_path):
+    """AC-3. The activity refuses a bad file itself, so Temporal never asks the
+    same broken file the same question again, and the retry policy is left free
+    to cover what it used to hide: a worker restart on the run's first
+    activity."""
+    (tmp_path / "run.yaml").write_text("yeild_floor: 3\n")
+    with pytest.raises(ApplicationError) as err:
+        asyncio.run(load_run_config(str(tmp_path)))
+    assert err.value.non_retryable is True
+    assert err.value.type == "ValueError"
+    # `.message` is the bare line the checker wrote; str() prepends the type,
+    # which would push `run.yaml:` off the front of the owner's note.
+    assert err.value.message == "run.yaml: unknown key 'yeild_floor'"
+
+    (tmp_path / "run.yaml").write_text(SWEEP)
+    assert asyncio.run(load_run_config(str(tmp_path)))["sweep"]["yield_floor"] == 3
 
 
 def test_load_run_config_is_registered():

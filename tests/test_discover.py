@@ -14,6 +14,7 @@ import time
 
 import pytest
 import yaml
+from temporalio.testing import ActivityEnvironment
 
 from activities.discover import LINES_SHOWN, STDERR_TAIL, STDOUT_CAP, discover, run_detector
 
@@ -160,6 +161,22 @@ def test_detectors_run_in_the_worktree_after_a_reset(run_dir, repo):
     r = _pass(run_dir, repo)
     assert r["detectors"][0]["lines"] == ["cli.py"], "the parked item's junk was counted"
     assert r["detectors"][1]["lines"] == [str(worktree)]
+
+
+def test_discover_heartbeats_before_the_first_detector(run_dir, repo):
+    """`git worktree add` on a large repo can outlast Temporal's three-minute
+    heartbeat window, and nothing heartbeated between the activity starting and
+    the first detector. A pass killed there is retried from the top, into the
+    same slow setup again."""
+    (run_dir / "run.yaml").write_text(
+        yaml.safe_dump({"sweep": {"yield_floor": 0,
+                                  "detectors": [_detector("echo x", name="dead")]}}))
+    beats: list[str] = []
+    env = ActivityEnvironment()
+    env.on_heartbeat = lambda *details: beats.append(details[0])
+    asyncio.run(env.run(discover, str(run_dir), str(repo), TOKEN, _head(repo)))
+    assert beats[:3] == ["setting up the worktree", "reading the detectors",
+                         "detector dead"]
 
 
 def test_discover_is_registered():

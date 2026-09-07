@@ -138,16 +138,24 @@ async def discover(run_dir: str, target_repo: str, run_token: str, base_commit: 
     detectors' own timeouts; nothing here reads a timeout of its own.
     """
     worktree, branch = run_paths(run_dir, run_token)
+    hb = activity.heartbeat if activity.in_activity() else None
+    # The setup heartbeats: `git worktree add` on a large repo can outlast the
+    # three-minute heartbeat window on its own, and a pass killed there is
+    # retried straight back into the same slow clone. Nothing else here spoke
+    # until the first detector was already running.
+    if hb:
+        hb("setting up the worktree")
     await ensure_worktree(target_repo, worktree, branch)
     # Detectors measure the committed state. A parked item leaves its rejected
     # changes uncommitted in the shared worktree, and a pass that read those
     # would count junk as yield.
     await reset_to_checkpoint(worktree, base_commit)
+    if hb:
+        hb("reading the detectors")
     # Read as a plain function: this is already inside an activity, and going
     # through Temporal for a file the worker can open would be a round trip for
     # nothing.
     detectors = read_run_config(run_dir)["sweep"]["detectors"]
-    hb = activity.heartbeat if activity.in_activity() else None
     results = []
     for det in detectors:
         if hb:

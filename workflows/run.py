@@ -144,7 +144,10 @@ def config_error_reason(e: BaseException) -> str:
         # the activity raised, which would push `run.yaml:` off the front.
         text = " ".join((getattr(cur, "message", None) or str(cur)).split())
         if text.startswith("run.yaml:"):
-            return text
+            # Capped like the audit reason: this goes on a card and into the
+            # ledger, and a YAML parser's own line can run to thousands of
+            # characters.
+            return text[:AUDIT_REASON_CAP]
         cur = cur.__cause__
         seen += 1
     return audit_failure_reason(e)
@@ -327,13 +330,16 @@ class LoopGraphRun:
         # run.yaml first, and once. A knob the schema does not know is an error,
         # not a default taken quietly, and finding it after the baseline would
         # mean the run had already started work on a config nobody could trust.
-        # Retrying would only ask the same broken file the same question.
+        # The retry policy is run_baseline's: the activity refuses a bad file
+        # itself and is never asked twice about it, so what is left for the
+        # policy to cover is a worker restart or a slow disk, which used to end
+        # the run for good on an `ActivityError` nobody could act on.
         try:
             self._config = await workflow.execute_activity(
                 load_run_config,
                 args=[run_dir],
                 start_to_close_timeout=timedelta(minutes=1),
-                retry_policy=RetryPolicy(maximum_attempts=1),
+                retry_policy=RetryPolicy(maximum_attempts=3),
             )
         except Exception as e:  # noqa: BLE001 - a broken run.yaml ends the run, cleanly
             reason = config_error_reason(e)
@@ -497,13 +503,24 @@ class LoopGraphRun:
 
         while True:
             pass_no += 1
-            found = await workflow.execute_activity(
-                discover,
-                args=[run_dir, target_repo, self._run_token(), self._base_commit],
-                start_to_close_timeout=pass_timeout,
-                heartbeat_timeout=timedelta(minutes=3),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
+            try:
+                found = await workflow.execute_activity(
+                    discover,
+                    args=[run_dir, target_repo, self._run_token(), self._base_commit],
+                    start_to_close_timeout=pass_timeout,
+                    heartbeat_timeout=timedelta(minutes=3),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            # A pass that failed both attempts ends the sweep the way a pass whose
+            # detectors all died does, and for the same reason: there is no number
+            # to build an item from. Letting it raise killed the workflow with the
+            # ledger unwritten, so the `ledger` query went on saying `running` and
+            # no card went out — the failure the audit call already closed inside
+            # an item. Nothing is appended to `passes`: a pass that never returned
+            # measured nothing.
+            except Exception as e:  # noqa: BLE001 - the sweep ends, the run reports
+                reason = f"discover failed: {audit_failure_reason(e)}"
+                break
             # `found` stays a local: the item text below quotes all 60 of a
             # detector's lines, and the ledger keeps ten of them.
             self._ledger["sweep"]["passes"].append(trim_pass(found, pass_no))

@@ -42,6 +42,7 @@ from pathlib import Path
 
 import yaml
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from activities.items import HEADING
 
@@ -52,20 +53,24 @@ DEFAULT_DETECTOR_TIMEOUT = 600
 DEADLINE_RE = re.compile(r"^(\d+)(m|h|d)$")
 _UNITS = {"m": 60, "h": 3600, "d": 86400}
 
-_TOP_LEVEL = "the top level"
 
-
-def _check_keys(block: dict, allowed: tuple[str, ...], section: str) -> None:
+def _check_keys(block: dict, allowed: tuple[str, ...], section: str | None = None) -> None:
     """Refuse a key that is not a name first, then one the schema does not know.
+
+    `section` is the block being checked, or None for the top level, which is the
+    one section with no name of its own. It used to be named by the same string
+    the message shows, so rewording that string would have silently moved every
+    top-level message under a section called "the top level".
 
     Both passes run over the whole block before any value is looked at, so the
     message names the first thing actually wrong rather than a type error further
     down."""
+    shown = section or "the top level"
     for key in block:
         if not isinstance(key, str):
-            raise ValueError(f"run.yaml: key {key} under {section} is not a name "
+            raise ValueError(f"run.yaml: key {key} under {shown} is not a name "
                              "(YAML reads bare off/on/yes/no as booleans)")
-    where = "" if section == _TOP_LEVEL else f" under {section}"
+    where = f" under {section}" if section else ""
     for key in block:
         if key not in allowed:
             raise ValueError(f"run.yaml: unknown key {key!r}{where}")
@@ -125,11 +130,14 @@ def _sweep(block) -> dict | None:
         if not isinstance(d, dict):
             raise ValueError(f"run.yaml: {section} needs name and cmd")
         _check_keys(d, ("name", "cmd", "timeout"), section)
-        if not d.get("name") or not d.get("cmd"):
+        # A string, not anything str() would take: `cmd: yes` is the boolean True
+        # and `cmd: 0755` the integer 493, so coercing them handed the shell
+        # "True" or "493" to run and the owner a command they never wrote.
+        if not all(isinstance(d.get(key), str) and d[key] for key in ("name", "cmd")):
             raise ValueError(f"run.yaml: {section} needs name and cmd")
         detectors.append({
-            "name": str(d["name"]),
-            "cmd": str(d["cmd"]),
+            "name": d["name"],
+            "cmd": d["cmd"],
             "timeout": _integer(d.get("timeout", DEFAULT_DETECTOR_TIMEOUT), f"{section}.timeout", 1),
         })
     return {"yield_floor": floor,
@@ -151,7 +159,7 @@ def parse_run_config(text: str, brief: str = "") -> dict:
         data = {}
     if not isinstance(data, dict):
         raise ValueError("run.yaml: expected a mapping at the top level")
-    _check_keys(data, ("convergence", "sweep"), _TOP_LEVEL)
+    _check_keys(data, ("convergence", "sweep"))
     convergence = _convergence(data.get("convergence"))
     sweep = _sweep(data.get("sweep"))
     # The workflow reads no disk, so the one place that has both files is here.
@@ -173,4 +181,15 @@ def read_run_config(run_dir: str) -> dict:
 
 @activity.defn
 async def load_run_config(run_dir: str) -> dict:
-    return read_run_config(run_dir)
+    """The activity behind `read_run_config`, with one thing added: a file the
+    checker refuses is refused for good.
+
+    Temporal retries an activity that raises, and asking the same broken file the
+    same question three times can only get the same answer. The type is kept so
+    the workflow's `config_error_reason` still finds the bare `run.yaml:` line on
+    `__cause__`; everything else that can go wrong here is a worker restart or a
+    slow disk, which the retry policy is there to cover."""
+    try:
+        return read_run_config(run_dir)
+    except ValueError as e:
+        raise ApplicationError(str(e), type="ValueError", non_retryable=True) from e

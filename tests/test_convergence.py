@@ -29,13 +29,13 @@ def _call(fake, name: str) -> tuple:
 
 
 def _config_failure(message: str = BAD_YAML) -> ActivityError:
-    """What Temporal really raises when the config activity raises ValueError: an
+    """What Temporal really raises when the config activity refuses the file: an
     ActivityError whose own message says nothing, with the useful half on
-    `__cause__`."""
+    `__cause__` as the non-retryable error the activity raised."""
     err = ActivityError("Activity task failed", scheduled_event_id=1, started_event_id=2,
                         identity="worker", activity_type="load_run_config",
                         activity_id="1", retry_state=None)
-    err.__cause__ = ApplicationError(message, type="ValueError")
+    err.__cause__ = ApplicationError(message, type="ValueError", non_retryable=True)
     return err
 
 
@@ -61,12 +61,25 @@ def test_the_convergence_text_is_exact():
 
 def test_config_is_the_first_activity_and_runs_once():
     """AC-3. Reading the config after the baseline would mean a misspelt knob is
-    found only once the run has started work, and a retried config activity would
-    ask the same broken file three times for the same answer."""
+    found only once the run has started work, and reading it again later would
+    let a run change its own rules halfway through."""
     fake = ScriptedWorkflow()
     drive(fake)
     assert _names(fake)[:2] == ["load_run_config", "run_baseline"]
-    assert fake.scheduled[0][2]["retry_policy"].maximum_attempts == 1
+    assert _names(fake).count("load_run_config") == 1
+
+
+def test_load_run_config_is_retried_like_run_baseline():
+    """AC-3. The bad file is refused by the activity itself now, so the policy no
+    longer has to stand in for that check. At one attempt a worker restart or a
+    slow disk on the run's very first activity ended the run for good, reported
+    as an `ActivityError` nobody could act on."""
+    fake = ScriptedWorkflow()
+    drive(fake)
+    config, baseline = fake.scheduled[0][2], _call(fake, "run_baseline")[2]
+    assert config["retry_policy"].maximum_attempts == 3
+    assert config["retry_policy"].maximum_attempts == \
+        baseline["retry_policy"].maximum_attempts
 
 
 def test_a_bad_run_yaml_stops_the_run_before_anything_runs():
@@ -92,6 +105,17 @@ def test_config_error_reason_finds_the_run_yaml_line():
     # Nothing in the chain names run.yaml, so the owner gets the whole chain, the
     # way a failed audit is reported.
     assert "RuntimeError" in config_error_reason(RuntimeError("no worker"))
+
+
+def test_config_error_reason_is_capped():
+    """The line rides on a Telegram card and in the ledger the `ledger` query
+    hands back on every dashboard poll, and a YAML parser's own message runs to
+    thousands of characters. The audit failure text is capped for the same
+    reason."""
+    from workflows.run import AUDIT_REASON_CAP, config_error_reason
+
+    long_line = "run.yaml: not valid YAML: " + "x" * 2000
+    assert config_error_reason(_config_failure(long_line)) == long_line[:AUDIT_REASON_CAP]
 
 
 # ---------- every item knows what kind of item it is ----------
