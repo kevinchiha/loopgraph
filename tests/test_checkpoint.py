@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import os
 import subprocess
 
 import pytest
@@ -202,6 +203,78 @@ def test_a_whitespace_refusal_keeps_its_reason_under_a_cap(worktree):
         f.write("y = 2 \n")  # trailing whitespace, and net +1 over the cap
     r = run(worktree, ["base.py"], max_net=0)
     assert not r["committed"] and r["reason"] == "git diff --cached --check failed"
+
+
+# ---------- the two ways a file can be gone ----------
+
+def _tracked(worktree, name, lines=3):
+    """A committed file with `lines` lines in it, for a test that removes it."""
+    with open(f"{worktree}/{name}", "w") as f:
+        f.write("".join(f"x{i} = {i}\n" for i in range(lines)))
+    git(worktree, "add", name)
+    git(worktree, "commit", "-qm", f"add {name}")
+
+
+def _names_and_status(worktree):
+    """`git show --name-status HEAD` as (status letter, path) pairs."""
+    out = subprocess.run(["git", "show", "--name-status", "--format=", "HEAD"],
+                         cwd=worktree, capture_output=True, text=True).stdout
+    return sorted(tuple(line.split("\t")) for line in out.splitlines() if line.strip())
+
+
+def test_a_file_the_executor_removed_with_git_rm_still_commits(worktree):
+    """The live bug that killed a sweep run. `git rm` stages the deletion and
+    empties the path from both places `git add` looks, so `git add -- helpers.py`
+    died on "did not match any files", the checkpoint failed both its attempts,
+    and the ActivityError took the whole run with it."""
+    _tracked(worktree, "helpers.py")
+    git(worktree, "rm", "-q", "helpers.py")
+    r = run(worktree, ["helpers.py"])
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (0, 3, -3)
+    assert r["files"] == ["helpers.py"]
+    assert _names_and_status(worktree) == [("D", "helpers.py")]
+
+
+def test_a_write_set_of_only_removed_files_runs_no_git_add(worktree, monkeypatch):
+    """Their removal is already in the index, so there is nothing left to stage,
+    and `git add --` with no paths is a hint about `git add .` rather than a
+    command."""
+    import activities.checkpoint as cp
+    real = cp._git
+    calls = []
+
+    async def recorder(*args, cwd=None):
+        calls.append(args)
+        return await real(*args, cwd=cwd)
+
+    monkeypatch.setattr(cp, "_git", recorder)
+    _tracked(worktree, "helpers.py")
+    git(worktree, "rm", "-q", "helpers.py")
+    assert run(worktree, ["helpers.py"])["committed"]
+    assert [c for c in calls if c[0] == "add"] == []
+
+
+def test_a_removed_file_and_a_modified_one_commit_together(worktree):
+    """A round that deleted one module and edited another is one write set, and
+    the half that still needs staging must still be staged."""
+    _tracked(worktree, "helpers.py")
+    git(worktree, "rm", "-q", "helpers.py")
+    with open(f"{worktree}/base.py", "a") as f:
+        f.write("y = 2\n")
+    r = run(worktree, ["helpers.py", "base.py"])
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (1, 3, -2)
+    assert _names_and_status(worktree) == [("D", "helpers.py"), ("M", "base.py")]
+
+
+def test_a_file_removed_with_plain_rm_still_commits(worktree):
+    """The kind of deletion that always worked, pinned so both kinds stay
+    covered: the path is gone from the tree but still in the index, so `git add`
+    finds it there and stages its removal."""
+    _tracked(worktree, "helpers.py")
+    os.remove(f"{worktree}/helpers.py")
+    r = run(worktree, ["helpers.py"])
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (0, 3, -3)
+    assert _names_and_status(worktree) == [("D", "helpers.py")]
 
 
 def test_max_net_is_the_last_parameter_of_both_functions():

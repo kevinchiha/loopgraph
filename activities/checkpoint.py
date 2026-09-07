@@ -112,7 +112,17 @@ async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict
         return {"committed": False, "reason": f"declared files not in git status: {missing}"}
     leftovers = [f for f in status_files if f not in files]
 
-    await _git("add", "--", *files, cwd=worktree)
+    # A declared file that is on neither the disk nor the index is a deletion the
+    # executor staged itself with `git rm`: that empties the path from both the
+    # places `git add` looks, so `git add -- dead.py` dies on "did not match any
+    # files" — which failed the checkpoint of an accepted round and took the whole
+    # run with it. A path that reads as gone is one git has already recorded, so
+    # stage only the rest, and stage nothing at all when there is no rest. The
+    # cached diff every step below reads already holds those removals.
+    indexed = set((await _git("ls-files", "-z", "--", *files, cwd=worktree)).split("\0"))
+    staging = [f for f in files if Path(worktree, f).exists() or f in indexed]
+    if staging:
+        await _git("add", "--", *staging, cwd=worktree)
     check = await _run_one({"name": "cached-check", "cmd": "git diff --cached --check",
                             "green_exit": 0, "timeout": 60}, worktree)
     if check["status"] == "red":
