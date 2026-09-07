@@ -180,14 +180,30 @@ def test_a_broken_run_yaml_keeps_its_own_reason():
 
 def test_an_activity_that_dies_mid_sweep_ends_the_sweep_with_the_same_reason():
     """`lg status`, the dashboard and the merge card all read why a sweep ended
-    off one key. A sweep that stopped because the engine broke and left that key
-    empty would print as a sweep still deciding."""
-    fake = ScriptedWorkflow(config=_sweep_config(), passes=[_pass(5)],
+    off one key. A sweep still running when the engine broke has no ending of
+    its own, and leaving that key empty would print as a sweep still deciding.
+    The break here is the park note: the item's checkpoint is refused, the note
+    about it dies, and the sweep had not ended."""
+    refused = {"committed": False, "reason": "net lines +3 exceed the cap of 0"}
+    fake = ScriptedWorkflow(config=_sweep_config(), passes=[_pass(5)], checkpoints=[refused],
                             fails={"send_card": _boom()})
     ledger = drive(fake)
     assert ledger["status"] == "stopped"
     assert ledger["reason"].startswith("engine failure:")
+    assert ledger["items"][0]["status"] == "parked"
     assert ledger["sweep"]["ended"] == ledger["reason"]
+
+
+def test_a_sweep_that_already_ended_keeps_its_own_reason_when_the_card_dies():
+    """The detectors stopped reporting, and then the merge card died. The sweep's
+    ending is the detectors' verdict, not the sender's, and `lg status` prints
+    it on its own line: overwriting it would say the engine broke the sweep."""
+    fake = ScriptedWorkflow(config=_sweep_config(), passes=[_pass(5), _pass(0)],
+                            fails={"send_card": _boom()})
+    ledger = drive(fake)
+    assert ledger["status"] == "stopped"
+    assert ledger["reason"].startswith("engine failure:")
+    assert ledger["sweep"]["ended"] == "converged: nothing reported"
 
 
 def test_a_dead_card_sender_does_not_turn_a_written_ledger_into_a_raised_one():

@@ -120,7 +120,10 @@ async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict
     # stage only the rest, and stage nothing at all when there is no rest. The
     # cached diff every step below reads already holds those removals.
     indexed = set((await _git("ls-files", "-z", "--", *files, cwd=worktree)).split("\0"))
-    staging = [f for f in files if Path(worktree, f).exists() or f in indexed]
+    # `is_symlink` too: `exists` follows a link, and a dangling one would read
+    # as gone when it is a file git still has to stage.
+    staging = [f for f in files
+               if Path(worktree, f).exists() or Path(worktree, f).is_symlink() or f in indexed]
     if staging:
         await _git("add", "--", *staging, cwd=worktree)
     check = await _run_one({"name": "cached-check", "cmd": "git diff --cached --check",

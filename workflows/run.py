@@ -584,9 +584,11 @@ class LoopGraphRun:
         except Exception as e:  # noqa: BLE001 - the run ends, and reports it
             reason = "engine failure: " + audit_failure_reason(e)
             self._ledger.update(status="stopped", reason=reason)
-            if "sweep" in self._ledger:
+            if "sweep" in self._ledger and self._ledger["sweep"].get("ended") is None:
                 # Why a sweep ended is read off this one key by `lg status`,
-                # the dashboard and the merge card.
+                # the dashboard and the merge card. A sweep that had already
+                # ended keeps its own reason: a merge card that died is not why
+                # the detectors stopped reporting.
                 self._ledger["sweep"]["ended"] = reason
             try:
                 await self._stopped_note(run_dir, reason, None, None)

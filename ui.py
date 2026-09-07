@@ -1226,7 +1226,9 @@ def diff_payload(wf_id: str, feed, runs_dir: Path) -> dict:
         rounds = ledger.get("rounds") or []
         if not rounds:
             return _reason("no rounds yet")
-        last = rounds[-1]
+        # The last round that ran: a round whose executor died before it made a
+        # worktree has none to diff, and the pane should show the round before it.
+        last = next((r for r in reversed(rounds) if r.get("worktree")), rounds[-1])
         repo, why = resolve_repo(last.get("worktree", ""), runs_dir,
                                  read_env(ROOT / ".env").get("LOOPGRAPH_PROJECTS_DIR"))
         if repo is None:
