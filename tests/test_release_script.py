@@ -57,13 +57,20 @@ def _plant(clone_repo, changelog: str = CHANGELOG, pyproject: str = PYPROJECT) -
     clone_repo.push()
 
 
-def _release(clone_repo, *args: str, release_tests: str | None = "true"):
-    """Run the clone's copy. `release_tests` of None removes RELEASE_TESTS."""
+def _release(clone_repo, *args: str, release_tests: str | None = "true",
+             path_prefix: Path | None = None):
+    """Run the clone's copy. `release_tests` of None removes RELEASE_TESTS.
+
+    `path_prefix` goes on the front of PATH, which is how a test puts a stand-in
+    for one of the programs the script calls in front of the real one.
+    """
     env = dict(os.environ)
     if release_tests is None:
         env.pop("RELEASE_TESTS", None)
     else:
         env["RELEASE_TESTS"] = release_tests
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
     return subprocess.run([str(clone_repo.root / "release.sh"), *args],
                           cwd=clone_repo.root.parent, capture_output=True, text=True, env=env)
 
@@ -147,6 +154,80 @@ def test_refuses_a_tag_that_already_exists_on_origin(clone_repo):
     done = _release(clone_repo, "0.2.0")
     assert done.returncode == 1
     assert done.stderr.strip() == "refuse: tag v0.2.0 already exists on origin."
+
+
+def _git_that_cannot_reach_origin(tmp_path) -> Path:
+    """A `git` for PATH that is the real one except for `ls-remote`, which fails.
+
+    The script fetches from origin and then asks it about the tag, and only the
+    second of those may fail for this to be a test of anything: the fixture's
+    origin is a directory beside the clone, so nothing about the remote itself
+    can be broken for one command and whole for the other. A wrapper puts the
+    failure exactly where the network would have put it — after a fetch that
+    already worked — and it is the trick `_fake_python` plays further down.
+    """
+    binaries = tmp_path / "fakebin"
+    binaries.mkdir()
+    fake = binaries / "git"
+    fake.write_text('#!/bin/sh\nif [ "$1" = "ls-remote" ]; then\n'
+                    '  echo "fatal: could not read from remote repository" >&2\n'
+                    "  exit 128\nfi\n"
+                    f'exec {shutil.which("git")} "$@"\n', encoding="utf-8")
+    fake.chmod(0o755)
+    return binaries
+
+
+def test_refuses_when_the_tag_check_cannot_reach_origin(clone_repo, tmp_path):
+    """An ls-remote that failed prints nothing, and reading that silence as "no
+    such tag on origin" is how a release lands on top of somebody else's tag on
+    the one afternoon the network was the problem. git keeps its own line above
+    the refusal, the way it does when the fetch is what failed."""
+    _plant(clone_repo)
+    done = _release(clone_repo, "0.2.0",
+                    path_prefix=_git_that_cannot_reach_origin(tmp_path))
+    assert done.returncode == 1
+    assert done.stderr.strip().splitlines()[-1] == "refuse: could not reach origin."
+    assert not _tags(clone_repo)
+    assert _read(clone_repo, "CHANGELOG.md") == CHANGELOG
+
+
+def test_a_missing_changelog_refuses_in_one_line(clone_repo):
+    """grep and awk both name the file they could not open, and those lines
+    beside the refusal bury the one sentence that says what to do. The refusal
+    already names CHANGELOG.md."""
+    _plant(clone_repo)
+    clone_repo.git("rm", "--quiet", "CHANGELOG.md")
+    clone_repo.git("commit", "-m", "no changelog")
+    clone_repo.push()
+    done = _release(clone_repo, "0.2.0")
+    assert done.returncode == 1
+    assert done.stderr == ("refuse: CHANGELOG.md has nothing under ## Unreleased "
+                           "and no ## 0.2.0 section.\n")
+
+
+TWO_VERSIONS = PYPROJECT + """
+[tool.example]
+version = "0.1.0"
+"""
+
+
+def test_refuses_a_pyproject_with_two_version_lines_and_writes_nothing(clone_repo):
+    """The bump rewrites a column-0 `version = "..."` line, and it used to
+    rewrite every one it found: a [tool] table with a version of its own would
+    have been set to the release's. Counting first is the difference between a
+    release that refuses and one that quietly edits a setting nobody looked at.
+
+    The check runs in the write step, before the write: the changelog heading is
+    still `## Unreleased` afterwards.
+    """
+    _plant(clone_repo, pyproject=TWO_VERSIONS)
+    done = _release(clone_repo, "0.2.0")
+    assert done.returncode == 1
+    assert done.stderr.strip() == ('refuse: pyproject.toml must have exactly one '
+                                   'version = "..." line, found 2.')
+    assert _read(clone_repo, "pyproject.toml") == TWO_VERSIONS
+    assert _read(clone_repo, "CHANGELOG.md") == CHANGELOG
+    assert not _tags(clone_repo)
 
 
 def test_refuses_an_empty_unreleased_with_no_version_section(clone_repo):

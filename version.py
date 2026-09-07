@@ -50,8 +50,11 @@ def _sections(text: str) -> list[tuple[str | None, list[str]]]:
 
     Each is the version its heading names, or None for `## Unreleased`, and the
     lines from the heading to the one before the next `## `. Anything above the
-    first heading belongs to no section. Only the heading line is ever matched,
-    so a bullet that quotes `## 0.3.0` stays body text.
+    first heading belongs to no section. The rule is the whole of it: a bullet
+    that quotes `## 0.3.0` mid-line stays body text, and a line of its own that
+    starts `## ` opens a section wherever it sits, a wrapped bullet included.
+    tests/test_version.py pins that second half, which is what a rule this short
+    costs.
     """
     out: list[tuple[str | None, list[str]]] = []
     for line in text.splitlines():
@@ -101,14 +104,19 @@ def changelog_has(text: str, version: str) -> bool:
 def _installs(text: str) -> tuple[list, str] | None:
     """The two fields of a pyproject.toml that change what gets installed.
 
-    None when there is nothing to read: an unparsable text, or the empty string
-    `git show <commit>:pyproject.toml` returns when the file was not there.
+    None when there is nothing to read: an unparsable text, the empty string
+    `git show <commit>:pyproject.toml` returns when the file was not there, or a
+    `project` that parsed into something other than a table. `project = 5` is
+    valid TOML, and asking a 5 for its keys is an AttributeError raised in the
+    middle of an update that has already moved the checkout.
     """
     if not text.strip():
         return None
     try:
         project = tomllib.loads(text).get("project", {})
     except tomllib.TOMLDecodeError:
+        return None
+    if not isinstance(project, dict):
         return None
     return (project.get("dependencies", []), project.get("requires-python", ""))
 

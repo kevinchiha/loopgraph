@@ -42,16 +42,24 @@ git fetch --quiet --no-tags origin || die "could not reach origin."
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   die "tag $TAG already exists locally."
 fi
-if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+# Captured first, then tested: an ls-remote that failed prints nothing, and
+# reading that silence as "no such tag on origin" would release on top of
+# somebody else's tag the one time the network was the problem.
+REMOTE_TAG="$(git ls-remote --tags origin "refs/tags/$TAG")" || die "could not reach origin."
+if [ -n "$REMOTE_TAG" ]; then
   die "tag $TAG already exists on origin."
 fi
 
 # Whole lines, both of them. The file's intro names `## Unreleased` in code spans
 # above the real heading, and a substring match would find those instead.
+#
+# Both reads are quiet about a file they could not open. With no CHANGELOG.md at
+# all the refusal below is the answer, and grep's and awk's own "No such file"
+# lines beside it only bury the sentence that says what to do.
 SECTION="^## ${VERSION//./\\.} - "
 has_notes(){ awk '/^## Unreleased$/{under=1; next} /^## /{under=0} under && NF {found=1}
-                  END {exit !found}' CHANGELOG.md; }
-if ! grep -qE "$SECTION" CHANGELOG.md && ! has_notes; then
+                  END {exit !found}' CHANGELOG.md 2>/dev/null; }
+if ! grep -qE "$SECTION" CHANGELOG.md 2>/dev/null && ! has_notes; then
   die "CHANGELOG.md has nothing under ## Unreleased and no ## $VERSION section."
 fi
 
@@ -66,8 +74,21 @@ VERSION="$VERSION" TODAY="$(date +%Y-%m-%d)" python3 - <<'PY'
 import os
 import pathlib
 import re
+import sys
 
 version, today = os.environ["VERSION"], os.environ["TODAY"]
+
+# The line to bump is found before either file is written. A pyproject.toml with
+# a second column-0 `version = "..."` — a [tool] table carrying one of its own —
+# used to have every one of them rewritten, and by the time anyone read the file
+# the changelog heading had already been renamed.
+pyproject = pathlib.Path("pyproject.toml")
+declared = pyproject.read_text(encoding="utf-8").splitlines(keepends=True)
+at = [n for n, line in enumerate(declared)
+      if re.fullmatch(r'version = ".*"', line.rstrip("\n"))]
+if len(at) != 1:
+    sys.exit('refuse: pyproject.toml must have exactly one version = "..." line, '
+             f"found {len(at)}.")
 
 # Only whole heading lines, the rule version.py reads the file by.
 changelog = pathlib.Path("CHANGELOG.md")
@@ -85,11 +106,8 @@ if not any(dated.match(line) for line in lines):
             out.append(line)
     changelog.write_text("".join(out), encoding="utf-8")
 
-pyproject = pathlib.Path("pyproject.toml")
-bumped = [f'version = "{version}"\n'
-          if re.fullmatch(r'version = ".*"', line.rstrip("\n")) else line
-          for line in pyproject.read_text(encoding="utf-8").splitlines(keepends=True)]
-pyproject.write_text("".join(bumped), encoding="utf-8")
+declared[at[0]] = f'version = "{version}"\n'
+pyproject.write_text("".join(declared), encoding="utf-8")
 PY
 
 git add CHANGELOG.md pyproject.toml

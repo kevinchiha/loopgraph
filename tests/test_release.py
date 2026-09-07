@@ -188,10 +188,18 @@ def _reachable_tag() -> str:
     the files against. `installed` names the nearest tag reachable from HEAD, so a
     branch behind the newest one is judged against its own release and not the
     latest.
+
+    A tag that is not a release is the same case. `git describe --match 'v*'`
+    names a hand-made `v0.2.0-rc1` as happily as it names `v0.2.0`, and both
+    guards below would then read `0.2.0-rc1` as the version the changelog and
+    pyproject.toml are supposed to declare — two red tests over a tag nobody
+    released.
     """
     tag = version.installed(ROOT)["tag"]
     if tag is None:
         pytest.skip("no release tag reachable from HEAD")
+    if version.parse_version(tag) is None:
+        pytest.skip(f"release tag {tag} is not vX.Y.Z; nothing to check")
     return tag
 
 

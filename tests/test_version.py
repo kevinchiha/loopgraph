@@ -172,6 +172,45 @@ def test_changelog_has_reads_the_dots_literally():
     assert not changelog_has("## 0x4x0 - 2026-09-06\n", "0.4.0")
 
 
+WRAPPED_BULLET = """\
+# Changelog
+
+## 0.5.0 - 2026-09-06
+
+- the fifth thing, written long enough that it wrapped and the second line reads
+## 0.3.0 - which is where the trouble starts
+
+## 0.4.0 - 2026-09-01
+
+- the fourth thing
+"""
+
+
+def test_a_wrapped_bullet_beginning_with_a_heading_is_read_as_one_anyway():
+    """The trade-off this module accepts, written down so nobody fixes it by
+    accident. The section rule is one line long — the line starts with `## ` —
+    and that is what makes it a rule a maintainer can hold in mind while writing
+    the file. The price is here: a bullet whose text wraps onto a line beginning
+    `## 0.3.0 - ` opens a 0.3.0 section right there, so the rest of that bullet
+    leaves the release it belongs to and is skipped along with the old section.
+
+    Writing it any other way means a parser that has to know what a list is, and
+    a changelog nobody can predict by looking at it. Keep the wrap out of column
+    zero instead.
+    """
+    out = changelog_between(WRAPPED_BULLET, "v0.3.0", "v0.5.0")
+    assert out == ("## 0.5.0 - 2026-09-06\n"
+                   "\n"
+                   "- the fifth thing, written long enough that it wrapped and "
+                   "the second line reads\n"
+                   "\n"
+                   "## 0.4.0 - 2026-09-01\n"
+                   "\n"
+                   "- the fourth thing")
+    assert "which is where the trouble starts" not in out
+    assert changelog_has(WRAPPED_BULLET, "0.3.0"), "the wrapped line is a section"
+
+
 # ------------------------------------------------------- what an update needs ---
 
 def test_a_version_only_bump_is_a_restart_with_no_venv_refresh():
@@ -221,6 +260,14 @@ def test_a_missing_or_broken_pyproject_counts_as_changed():
     to be wrong: a needless venv refresh costs seconds, a skipped one breaks lg."""
     assert deps_changed("", PYPROJECT) is True
     assert deps_changed(PYPROJECT, "[project\nname =") is True
+
+
+def test_a_project_that_is_not_a_table_counts_as_changed_too():
+    """`project = 5` parses: it is a number where a table was expected, and
+    asking a number for its keys is an AttributeError, not a refusal. It counts
+    the way an unreadable file counts, because it is one."""
+    assert deps_changed(PYPROJECT, "project = 5\n") is True
+    assert deps_changed("project = 5\n", PYPROJECT) is True
 
 
 # ------------------------------------------------------------- new settings ---
@@ -949,27 +996,37 @@ SAME_DEPS = bumped(PYPROJECT, "0.2.0")
 WITH_SDK = NEW_DEPS.replace('"pyyaml>=6.0",', '"pyyaml>=6.0",\n    "claude-agent-sdk>=0.1",')
 
 
-def _ps(*services: str, code: int = 0, stderr: str = "") -> dict:
-    """What `compose ps --services --status running` answers, as a table entry."""
-    argv = ["docker", "compose", "ps", "--services", "--status", "running"]
+def _ps(*services: str, code: int = 0, stderr: str = "", docker: str = "docker") -> dict:
+    """What `compose ps --services --status running` answers, as a table entry.
+
+    `docker` is what LOOPGRAPH_DOCKER puts in front of every compose command, and
+    the key has to carry it: a table entry spelled `docker ...` does not match a
+    `sudo docker ...` argv, and the update would read the miss as a stack that is
+    not running rather than as the test's own mistake.
+    """
+    argv = [*docker.split(), "compose", "ps", "--services", "--status", "running"]
     listed = "".join(f"{s}\n" for s in services)
     return {tuple(argv): subprocess.CompletedProcess(argv, code, listed, stderr)}
 
 
-def stack_run(table=None, logs: str = BANNERS):
+def stack_run(table=None, logs: str = BANNERS, poll_code: int = 0, poll_stderr: str = ""):
     """fake_run, plus the one docker read whose argv a test cannot spell out.
 
     Every log poll carries the timestamp the update took a moment earlier, so no
     table can name it: any `--since` poll is answered with `logs`, which by
-    default holds both banners and ends the poll on its first try. The closing
+    default holds both banners and ends the poll on its first try. `poll_code`
+    and `poll_stderr` are how a test makes that read fail instead. The closing
     `--tail` read is not a poll and stays the table's to answer.
+
+    Nothing here spells `docker`: the polls are recognised by `logs` and
+    `--since`, which is true of a `sudo docker` argv as well.
     """
     inner = fake_run(table)
 
     def run(argv, cwd, timeout=None, stream=False):
         done = inner(argv, cwd, timeout, stream)
         if "logs" in argv and "--since" in argv:
-            return subprocess.CompletedProcess(argv, 0, logs, "")
+            return subprocess.CompletedProcess(argv, poll_code, logs, poll_stderr)
         return done
 
     run.table, run.calls = inner.table, inner.calls
@@ -1078,6 +1135,39 @@ def test_a_venv_refresh_failure_exits_1_after_the_code_moved(
     assert out.splitlines()[0] == "updated v0.1.0 → v0.2.0"
     assert clone_repo.git("rev-parse", "HEAD") == clone_repo.git("rev-parse", "v0.2.0^{commit}")
     assert not _ran(runner, "compose")
+
+
+def test_a_hung_venv_refresh_gives_up_on_the_stack_timeout(clone_repo, monkeypatch, capsys):
+    """A resolver waiting on an index that stopped answering. Without a deadline
+    on it the update sits there for good with the checkout already moved, which
+    is the one place `lg update` must never stop without saying anything."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": NEW_DEPS})
+    monkeypatch.setattr(lg.shutil, "which", lambda name: "/usr/bin/uv")
+    argv = ["uv", "sync"]
+    runner = stack_run({("uv", "sync"): subprocess.CompletedProcess(
+        argv, 124, "", "timed out after 1800s")})
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (1, "venv refresh failed: timed out after 1800s\n")
+    assert [(a, timeout) for a, _, timeout, _ in runner.calls if a[0] == "uv"] == [
+        (["uv", "sync"], lg.STACK_TIMEOUT)]
+    assert not _ran(runner, "compose")
+
+
+def test_the_pip_fallback_carries_the_same_deadline(clone_repo, monkeypatch, capsys):
+    """The other half of the refresh, on a machine with no uv. pip resolves over
+    the network too, and a hang there is the same hang."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": NEW_DEPS})
+    monkeypatch.setattr(lg.shutil, "which", lambda name: None)
+    runner = stack_run(_ps("worker", "dispatcher"))
+    code, _, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert [timeout for a, _, timeout, _ in runner.calls if "pip" in a] == [lg.STACK_TIMEOUT]
 
 
 def test_the_venv_refresh_runs_before_the_settings_message(clone_repo, monkeypatch, capsys):
@@ -1247,6 +1337,51 @@ def test_a_failing_stack_command_is_compose_failed(
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
     assert (code, err) == (1, f"{line}\n")
     assert not _ran(runner, "logs")
+
+
+def test_a_log_poll_that_fails_is_compose_failed_too(clone_repo, monkeypatch, capsys):
+    """The restart went through and the read after it is what broke — a daemon
+    that went away mid-update, or a socket the user's group no longer opens.
+    Treating that as "not up yet" would spend two minutes on it and then blame
+    the worker for a silence that was never the worker's."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT,
+                       "ui.py": "# released\n"})
+    runner = stack_run(_ps("worker", "dispatcher"), logs="", poll_code=1,
+                       poll_stderr="\nerror during connect: dial unix docker.sock\n")
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (
+        1, "compose failed: error during connect: dial unix docker.sock\n")
+    assert len(_ran(runner, "logs", "--since")) == 1, "it polled on after the failure"
+    assert not _ran(runner, "logs", "--tail"), "the closing log belongs to the timeout"
+
+
+def test_the_docker_prefix_leads_every_compose_command_the_update_runs(
+        clone_repo, monkeypatch, capsys):
+    """`LOOPGRAPH_DOCKER=sudo docker` is what install.sh writes for a user who is
+    not in the docker group, and every compose command has to carry it: one that
+    did not would prompt for nothing, fail on the socket, and read as a stack
+    that is not running."""
+    lg = _lg()
+    _behind_a_release(lg, clone_repo, monkeypatch,
+                      {"pyproject.toml": PYPROJECT},
+                      {"pyproject.toml": PYPROJECT,
+                       "ui.py": "# released\n"})
+    (clone_repo.root / ".env").write_text("LOOPGRAPH_DOCKER=sudo docker\n", encoding="utf-8")
+    runner = stack_run(_ps("worker", "dispatcher", docker="sudo docker"))
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, runner)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[-1] == "now on v0.2.0"
+    compose = _ran(runner, "compose")
+    assert compose, "no compose command ran at all"
+    assert all(argv[:3] == ["sudo", "docker", "compose"] for argv in compose), compose
+    assert _ran(runner, "compose", "ps") == [
+        ["sudo", "docker", "compose", "ps", "--services", "--status", "running"]]
+    assert _ran(runner, "compose", "restart") == [
+        ["sudo", "docker", "compose", "restart", "worker", "dispatcher"]]
+    assert [argv[-1] for argv in _ran(runner, "logs", "--since")] == ["worker", "dispatcher"]
 
 
 def test_now_on_the_tag_once_both_banners_appear(clone_repo, monkeypatch, capsys):

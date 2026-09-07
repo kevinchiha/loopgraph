@@ -272,14 +272,22 @@ class Counting:
     `hold_at` holds the checker's thread inside the nth call until `release` is
     set. That is what makes a count read from the test's own thread a count of
     what has finished rather than a race with the next tick.
+
+    `args` keeps what each call was given, recorded before the hold so a test can
+    read it while the thread is still inside. Without it the fake swallowed its
+    arguments and nothing proved the checker's own remote deadline ever reached
+    `version.remote_newest` — a checker that passed no timeout would keep every
+    one of these tests green and hang the dashboard's thread on a real network.
     """
 
     def __init__(self, answer, hold_at=None):
         self.answer, self.hold_at, self.calls = answer, hold_at, 0
+        self.args: list[tuple] = []
         self.reached, self.release = threading.Event(), threading.Event()
 
     def __call__(self, *args):
         self.calls += 1
+        self.args.append(args)
         if self.calls == self.hold_at:
             self.reached.set()
             self.release.wait(5)
@@ -388,7 +396,12 @@ def test_the_loop_reads_the_tag_every_tick_and_the_remote_every_few(monkeypatch,
     local one every period, the remote one every remote_every-th wake. Held still
     inside the third remote read, the counts are exact — one local read in
     start(), one per tick since, and the remote at the thread's own first read
-    and then at ticks 3 and 6."""
+    and then at ticks 3 and 6.
+
+    The arguments are asserted here too, because the remote read is the only one
+    with a deadline and the deadline is the whole reason it is safe to run on
+    this thread: `remote_timeout` has to arrive at `version.remote_newest`, not
+    stop at the checker."""
     local, remote = Counting(THIS_CHECKOUT), Counting("v0.2.0", hold_at=3)
     patch_version(monkeypatch, local, remote)
 
@@ -397,6 +410,9 @@ def test_the_loop_reads_the_tag_every_tick_and_the_remote_every_few(monkeypatch,
     try:
         assert remote.reached.wait(5), "the loop never reached its sixth tick"
         assert (local.calls, remote.calls) == (7, 3)
+        assert remote.args == [(tmp_path, 10.0)] * 3, \
+            "the checker's remote deadline never reached version.remote_newest"
+        assert local.args == [(tmp_path,)] * 7
     finally:
         remote.release.set()
         checker.stop()

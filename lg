@@ -538,13 +538,18 @@ def _refresh_venv(root: str, new_pyproject: str) -> subprocess.CompletedProcess[
     uv when the machine has one, because that is what install.sh built the venv
     with. The fallback runs `.venv/bin/python -m pip` and never `.venv/bin/pip`:
     a venv uv built has no pip script in it at all.
+
+    Both get STACK_TIMEOUT, the deadline the compose build runs under and for the
+    same reason: a resolver waiting on an index that stopped answering would
+    otherwise hang here for good, with the checkout already on the new release
+    and nothing on the terminal to say what it is waiting for.
     """
     if shutil.which("uv"):
-        return _run(["uv", "sync"], root)
+        return _run(["uv", "sync"], root, timeout=STACK_TIMEOUT)
     python = os.path.join(root, ".venv", "bin", "python")
     deps = _host_deps(new_pyproject)
     return _run([python, "-m", "pip", "install", "--quiet", "--upgrade", *deps, "pytest"],
-                root)
+                root, timeout=STACK_TIMEOUT)
 
 
 async def _restart_stack(root: str, docker: str, action: str, tag: str) -> int:
@@ -695,6 +700,10 @@ async def cmd_update(args: argparse.Namespace) -> int:
             print(f"  {workflow.id}    lg status {workflow.id}", file=sys.stderr)
         return 1
 
+    # These three reads go through version._git rather than the _run above, so
+    # they never reach the recorder the AC-14 test counts git commands off; they
+    # are describe, rev-parse and rev-list, and the guard in tests/test_ui.py is
+    # what keeps that list read-only.
     here = version.installed(root)
     old, old_tag = installed_line(here), here["tag"]
     if git("merge", "--ff-only", tag).returncode != 0:
