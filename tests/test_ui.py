@@ -4334,13 +4334,25 @@ def test_a_logs_only_row_archives_without_temporal(server, tmp_path):
 def test_get_archive_is_405_and_other_posts_are_405(server, tmp_path):
     """AC-19. /api/archive is the one path that takes anything but a GET, and it
     takes only POST. Everything else the dashboard serves stays read-only, which
-    is what lets it be pointed at a repository the owner is working in."""
+    is what lets it be pointed at a repository the owner is working in.
+
+    Every path here, and paths the dashboard serves nothing at all on, because the
+    edit this is written against is a second one smuggled into do_POST's guard —
+    `... != "/api/archive" and self.path != "/api/wipe"`. Read off the source that
+    looks like the guard it replaced. What it cannot do is refuse a POST to the
+    path it added, and the body below is a logs-only id that needs no Temporal, so
+    anything let through here writes the store rather than stopping at a 409.
+    """
     assert status_of(server + "/api/archive") == 405
 
-    code, answer = post(server + "/api/runs", {"id": "2026-01-01-demo", "archived": True})
-    assert code == 405 and "error" in answer
-    assert not (tmp_path / ".archived.json").exists(), \
-        "a POST to another path was answered by the archive writer"
+    body = {"id": "2026-01-01-demo", "archived": True}
+    for path in ["/", "/api/runs", "/api/run", "/api/logs", "/api/log", "/api/diff",
+                 "/api/wipe", "/api/archive/", "/api/archives", "/nothing/here"]:
+        code, answer = post(server + path, body)
+        assert code == 405, f"POST {path} answered {code} rather than refusing the method"
+        assert "error" in answer, f"POST {path} was refused with no body"
+        assert not (tmp_path / ".archived.json").exists(), \
+            f"POST {path} reached the archive writer"
 
 
 def test_mark_archived_rereads_before_writing(tmp_path):
@@ -4575,9 +4587,28 @@ def test_the_dashboard_has_no_write_methods():
     assert body.count("/api/archive") == 1, "do_POST names a path other than /api/archive"
     statements = [ln.strip() for ln in body.splitlines()
                   if ln.strip() and not ln.strip().startswith("#")]
-    assert statements[0].startswith("if ") and "!=" in statements[0] \
-        and "/api/archive" in statements[0], \
-        f"do_POST opens with `{statements[0]}` rather than turning every other path away"
+
+    # ONE comparison, against ONE literal. A compound guard is how a second write
+    # path gets in without looking like one:
+    #   if urlparse(self.path).path != "/api/archive" and self.path != "/api/wipe":
+    # That reads like the line it replaced, names /api/archive once, still opens
+    # with `if`, still answers 405 below — and serves POST /api/wipe a 200 that
+    # writes the store. So no `and`, no `or`, and nothing on the right of the
+    # comparison but the one path.
+    guard = statements[0]
+    assert guard.startswith("if ") and guard.endswith(":"), \
+        f"do_POST opens with `{guard}` rather than a guard turning every other path away"
+    condition = guard[len("if "):-1]
+    assert not re.search(r"\b(and|or|not|in|if|else)\b", condition), \
+        f"do_POST's guard is a compound condition, so a path can be let through beside " \
+        f"/api/archive: `{condition}`"
+    assert condition.count("!=") == 1 and "==" not in condition, \
+        f"do_POST's guard is not one comparison: `{condition}`"
+    subject, wanted = condition.split("!=")
+    assert wanted.strip() == '"/api/archive"', \
+        f"do_POST's guard compares against `{wanted.strip()}` rather than \"/api/archive\""
+    assert "path" in subject, \
+        f"do_POST's guard turns requests away on `{subject.strip()}` rather than on the path"
     assert statements[1].startswith("return") and "405" in statements[1], \
         f"the path guard answers `{statements[1]}` rather than a 405"
 
