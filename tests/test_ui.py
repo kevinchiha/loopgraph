@@ -2302,9 +2302,14 @@ def test_only_the_newest_card_is_created_open():
     assert re.search(rf"buildRoundCard\(\w+, \w+ === {keys.group(1)}\[0\]\)", rounds), \
         "a card is not created open exactly when its key is the newest one on the board"
     build = function_source(html, "buildRoundCard")
-    assert re.match(r"function buildRoundCard\(\w+, \w+\)", build), \
-        "buildRoundCard is not told whether the card it is making is the newest one"
-    assert re.search(r"\w+\.open = \w+;", build), "the builder never opens the newest card"
+    took = re.match(r"function buildRoundCard\(\w+, (\w+)\)", build)
+    assert took, "buildRoundCard is not told whether the card it is making is the newest one"
+    # The flag itself, not merely something. `card.open = true;` keeps the
+    # signature, keeps patchRounds working out which key is newest, and passes
+    # every other line of this test — while opening all twelve cards of a
+    # twelve-round board, which is the one thing AC-9 forbids.
+    assert re.search(rf"\w+\.open = {took.group(1)};", build), \
+        "the card is opened on something other than the flag the builder was handed"
     for name, s, e in regs:
         if name.startswith("patch"):
             assert not re.search(r"\.open\s*=[^=]", src[s:e]), \
@@ -2641,6 +2646,24 @@ def test_a_round_card_has_a_visible_boundary():
     assert "cursor:pointer" in summary, "the summary does not say it can be clicked"
     assert "text-transform:uppercase" in summary, \
         "the summary is not dressed as the heading it replaced"
+
+    # AC-10's read result rests on this rule and nothing else. The `·` inside
+    # `item 1 · round 2` is text, but the two separators joining the three spans
+    # are generated content, and without them the line renders
+    # `item 1 · round 2accept4 files`. Nothing else can catch that: every source
+    # check above stays green with the rule deleted, and so does a scripted
+    # browser, because innerText and textContent both leave generated content out.
+    # A screenshot is the only other witness, which is what the checklist is for.
+    seps = [(sel, body) for sel, body in css_rules(html)
+            if ".round" in sel and "summary" in sel and "::" in sel]
+    assert seps, "nothing separates the summary's three spans, so its words run together"
+    sel, body = seps[0]
+    assert re.search(r"content:\s*'[^']*·[^']*'", body), \
+        "the separator rule generates something other than the board's own `·`"
+    # A round with no verdict and no files has two empty spans, and a dot in
+    # front of each is `item 1 · round 4 · ·` on the card the reader meets first.
+    assert ":empty" in sel, \
+        "the separator goes in front of every span, empty ones included"
 
 
 def test_board_prose_is_capped_at_80ch():
