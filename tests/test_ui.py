@@ -899,7 +899,10 @@ def test_the_injected_pattern_survives_javascript():
 #     `name=undefined` in a `/api/log` row is the log poll having picked up the
 #     diff pane, which is a `.panel` too and holds no log name. Any other method is
 #     a dashboard that is no longer read-only. Any other path is a request nobody
-#     meant to send.
+#     meant to send. Touch nothing while you watch: the archive button posts, and a
+#     `POST /api/archive` in this window means it has reached a timer, which is
+#     item 15's failure and the worst one on this page — the dashboard hiding runs
+#     nobody asked it to hide.
 #
 #  9. Only when a run is actually holding a card. There was no such run on this
 #     machine the day this was written, so this item goes unrun more often than
@@ -979,6 +982,31 @@ def test_the_injected_pattern_survives_javascript():
 #     either and the full local timestamp comes up as a tooltip.
 #     A run started seconds ago reads `0m ago`, which is right — it is the last
 #     whole minute that has passed, not a rounding mistake.
+#
+# 15. Archiving, which is the one thing on this page that changes anything and the
+#     only item here that needs a run you are willing to hide. Pick a run that has
+#     finished and click `archive` at the right-hand end of the strip.
+#     See: the row leaves the rail within a second — not on the next 4-second poll,
+#     because the click asks for the list again — the header count goes up by one,
+#     and the button turns into `unarchive`. The board stays exactly as it was: the
+#     run you archived is still the selected one, still named on the strip, still
+#     showing its rounds. That is deliberate, not a bug to report.
+#     Now tick `archived (N)` in the header.
+#     See: the hidden row comes back where it was, marked `archived` in purple
+#     beside its detail, and the count does not change — it counts what the server
+#     says is archived, not what is on screen. Untick it and the row goes again.
+#     Then click `unarchive` and watch it come back with the toggle off.
+#     Now click a run that is still running and press `archive`.
+#     See: the server's own sentence in red beside the button —
+#     `workflow still open: finish or answer it before archiving` — and the row
+#     still on the rail with nothing else changed. A 409 in the console is the
+#     browser reporting the status, not an error the page failed to handle. Click
+#     another run and the sentence goes with the board it was on.
+#     Finally, with every run on the rail archived, reload the page.
+#     See: an empty rail, `select a run`, and `archived (N)` in the header saying
+#     where they went. Tick the toggle and the top run selects itself within four
+#     seconds. A rail that fills up and stays unselected is the load-time fallback
+#     skipping archived rows the toggle is showing.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
@@ -1590,10 +1618,16 @@ def test_the_load_selection_prefers_the_hash_and_keeps_the_guard():
     Not `firstElementChild`. Archiving the newest finished run is the ordinary
     case and what `lg rm` produces, and row zero is then a `display:none` row: the
     page would open every time on the one run the reader deliberately took off the
-    rail, with `.sel` on something nobody can see. The stamp arrives with the
-    archived toggle; until then no row carries it and this reads as today's first
-    row, which is also the right reading afterwards — a row the server never marked
-    is not an archived run.
+    rail, with `.sel` on something nobody can see. A row the server never marked is
+    not an archived run, so the stamp reads the same way on a rail where nothing is
+    archived.
+
+    "The row the reader can see" is the toggle's question as well as the stamp's,
+    so the fallback is two things ORed and this checks the shape of both. Which
+    reading of the toggle is the right one — and that it is not inverted, which
+    would open the page on a hidden run every time — is
+    test_the_load_selection_skips_an_archived_first_row's, with the rest of the
+    toggle.
 
     The row is worked out into a local before the guard because the guard's shape
     is pinned and narrowly: test_the_first_run_is_clicked_only_when_nothing_is_
@@ -1620,9 +1654,14 @@ def test_the_load_selection_prefers_the_hash_and_keeps_the_guard():
 
     chosen = re.search(rf"const {held} = ([^;]+);", src)
     assert chosen, f"`{held}` is clicked without being worked out into a local first"
-    halves = [h.strip() for h in " ".join(chosen.group(1).split()).split("||")]
-    assert len(halves) == 2, \
-        f"the row is not `the one the hash names, or else the first one showing`: {halves}"
+    # The two searches and the `||` between them, taken as a whole rather than by
+    # splitting on `||`: the fallback carries one of its own now that the toggle is
+    # in it, and a split would hand back three pieces of a two-part expression.
+    expr = " ".join(chosen.group(1).split())
+    pair = re.fullmatch(r"(\w+\.find\(.+?\)) \|\| (\w+\.find\(.+\))", expr)
+    assert pair, \
+        f"the row is not `the one the hash names, or else the first one showing`: `{expr}`"
+    halves = list(pair.groups())
 
     listed = re.search(r"const (\w+) = \[\.\.\.document\.getElementById\('runs'\)\.children\]", src)
     assert listed, "the rows are not taken off the rail"
@@ -1639,9 +1678,13 @@ def test_the_load_selection_prefers_the_hash_and_keeps_the_guard():
     assert re.search(rf"{by_hash.group(2)} = decodeURIComponent\(location\.hash\.slice\(1\)", src), \
         "the rows are matched against something other than the decoded hash, `#` and all"
 
-    fallback = re.fullmatch(rf"{rail}\.find\((\w+) => \1\.dataset\.archived !== '1'\)", halves[1])
+    fallback = re.fullmatch(
+        rf"{rail}\.find\((\w+) => (\w+) \|\| \1\.dataset\.archived !== '1'\)", halves[1])
     assert fallback, \
-        f"the fallback is not the first row that carries no archived stamp: `{halves[1]}`"
+        ("the fallback is not `the toggle is showing them, or this row carries no archived "
+         f"stamp`: `{halves[1]}`")
+    assert re.search(rf"const {fallback.group(2)} = ", src), \
+        f"`{fallback.group(2)}` is read out of nowhere rather than worked out in the poll"
     assert "firstElementChild" not in src, \
         "the fallback is the rail's first row, archived or not"
 
@@ -2417,7 +2460,10 @@ def test_the_board_builds_a_strip_before_the_state():
     assert strip, "the strip is not a div of its own in the board's markup"
     assert "hidden" in strip.group(1), \
         "the strip is on screen before a run is chosen, naming nothing"
-    assert [m.group(1) for m in re.finditer(r'<span class="(\w+)"></span>', strip.group(2))] \
+    # The first three, and not the whole list: the archive control's own error line
+    # is a span too and follows them. What it says and where it is written from is
+    # test_the_strip_carries_the_archive_control's.
+    assert [m.group(1) for m in re.finditer(r'<span class="(\w+)"></span>', strip.group(2))][:3] \
         == ["dir", "pill", "dur"], \
         "the strip's slots are not the name, the pill and the duration, in that order"
 
@@ -4523,6 +4569,307 @@ def test_workflow_open_reports_three_states(monkeypatch):
     assert down.connected is False
     assert down.workflow_open("wf-done") is None, \
         "a feed with no client answered for a workflow it cannot have asked about"
+
+
+# ---------- archiving: the rail, the toggle and the strip's control ----------
+
+# The page half of AC-17. Nothing here executes JavaScript, so what these hold is
+# the source: which class the stylesheet hides on, which flag the stamp is written
+# from, which word the button offers and which id it posts. The hiding itself, the
+# toggle and one refusal on screen were watched in a browser while this was
+# written, and that is checklist item 15 — the only place any of it can be seen.
+
+
+def archive_closure(html):
+    """The click handler behind the strip's archive button.
+
+    Found by the path it posts to rather than by the name above it: regions()
+    charges a closure to whichever `function NAME(` sits over it, and this one's
+    name is buildBoard's. That it is a closure at all — a gesture, reachable from
+    no interval — is the point, and test_the_archive_post_is_gesture_only is where
+    that is asserted rather than assumed.
+    """
+    handlers = [c for c in closures(script_of(html)) if "/api/archive" in c]
+    assert len(handlers) == 1, \
+        f"expected one closure that posts to /api/archive, found {len(handlers)}"
+    return handlers[0]
+
+
+def test_the_load_selection_skips_an_archived_first_row():
+    """AC-13 and AC-17 meeting on one line. With no hash the page opens the first
+    row the reader can SEE, and row zero is a `display:none` row whenever the newest
+    finished run has been archived — the ordinary case, and what `lg rm` leaves
+    behind.
+
+    Two ways to get this wrong, and the obvious one is not the dangerous one.
+    Skipping every archived row unconditionally is right while the toggle is off
+    and matches nothing at all when it is on and every run is archived: no row is
+    clicked, `sel` stays null, and the board reads `select a run` for ever under a
+    rail full of runs, with no error anywhere to say why. Inverting the toggle read
+    is the other, and it opens the page on a hidden run every time, `.sel` on
+    something nobody can see — which is what the skip exists to prevent.
+
+    So the fallback asks the stylesheet's own question off the stylesheet's own
+    class, and this pins which way round it is. The whole `A || B` shape is
+    test_the_load_selection_prefers_the_hash_and_keeps_the_guard's; this is the
+    half that arrived with the toggle.
+    """
+    src = function_source(ui.page_html(), "runs")
+    showing = re.search(r"const (\w+) = document\.getElementById\('runs'\)"
+                        r"\.classList\.contains\('show-archived'\);", src)
+    assert showing, \
+        ("the poll never asks whether the toggle is showing archived rows, asks it inverted, "
+         "or asks the checkbox instead of the class the stylesheet actually hides on")
+    rail = re.search(r"const (\w+) = \[\.\.\.document\.getElementById\('runs'\)\.children\];", src)
+    assert rail, "the rows are not taken off the rail"
+    # The operator as much as the two halves. `&&` reads "showing AND not archived",
+    # which selects nothing whenever the toggle is off — every load, on every
+    # dashboard — and both halves are still there for a substring to find.
+    assert re.search(rf"\|\| {rail.group(1)}\.find\((\w+) => {showing.group(1)} "
+                     rf"\|\| \1\.dataset\.archived !== '1'\);", " ".join(src.split())), \
+        "the fallback is not `the toggle is showing them, OR this row is not archived`"
+
+
+def test_a_row_is_stamped_and_worded_archived():
+    """AC-17's mark, in the two forms the page needs it in: the attribute the
+    stylesheet hides on, and the word the reader sees on the row once the toggle is
+    showing them. `archived (3)` in the header with three unmarked rows underneath
+    it would be the page hiding something and not saying which.
+
+    Both off the reply's own flag and neither worked out twice. The stamp is read
+    back by three different readers — the stylesheet, the load-time selection and
+    the strip's button — so a row that carries the word and not the stamp is a run
+    that reads archived and never leaves the rail.
+    """
+    html = ui.page_html()
+    build = function_source(html, "buildRunRow")
+    meta = re.search(r'<div class="meta">(.*?)</div>', build, re.S)
+    assert meta, "the row's meta line is no longer a div of its own"
+    assert re.findall(r'<span(?: class="(\w*)")?></span>', meta.group(1)) \
+        == ["pill", "", "arch"], \
+        "the row's meta line is not the pill, the detail and an empty archived slot"
+
+    patch = function_source(html, "patchRunRow")
+    entry = re.match(r"function patchRunRow\((\w+), (\w+)\)", patch)
+    assert entry, "patchRunRow is not the (row, entry) pair the rest of this reads"
+    row, served = entry.groups()
+    parts = re.search(rf"const \[\w+, (\w+), \w+\] = {row}\.children;", patch)
+    assert parts, "the row's three lines are not read out as its children"
+    word = re.search(rf"const \[\w+, \w+, (\w+)\] = {parts.group(1)}\.children;", patch)
+    assert word, "the archived word is not read out as the third child of the meta line"
+
+    # The stamp's value and the selector's, tied together: they are one agreement
+    # written in two languages, and `data-archived="yes"` in the stylesheet against
+    # `'1'` here is a rule that matches nothing, with every other check green and
+    # every archived run still on the rail.
+    hide = [sel for sel, _ in css_rules(html) if ".show-archived" in sel]
+    assert len(hide) == 1, "the stylesheet does not hide archived rows in exactly one rule"
+    stamped = re.search(r"\[data-archived=\"(\w+)\"\]", hide[0])
+    assert stamped, f"the hiding rule is not keyed on a data-archived value: `{hide[0]}`"
+    assert f"{row}.dataset.archived = {served}.archived ? '{stamped.group(1)}' : '';" in patch, \
+        "the row is not stamped with the value the stylesheet hides on, or not off the reply's flag"
+    assert f"setText({word.group(1)}, {served}.archived ? 'archived' : '');" in patch, \
+        "the row says nothing when it is archived, says it the wrong way round, or writes it " \
+        "straight into the node instead of through setText"
+
+
+def test_archived_rows_hide_behind_the_toggle():
+    """AC-17. An archived run is off the rail; the header's toggle brings the whole
+    set back and takes it away again.
+
+    Hiding is one CSS rule off the stamp, and that is the whole of it. Not `hidden`
+    and not a row removed: the reply goes on carrying every run, so the toggle needs
+    no second request and the poll goes on patching a hidden row where it stands —
+    a row removed for being archived would be built again four seconds later, which
+    is the run-list bug this page was rewritten to kill.
+
+    So the handler is one line and this pins the whole of it. A fetch in there is a
+    request nobody meant to send; an `add` where a `toggle` belongs is a toggle that
+    only goes one way; `!checked` is the page showing archived runs when the box is
+    clear and hiding them when it is ticked, with every other check in this file
+    green and nothing on screen to say which way round it is meant to be.
+    """
+    html = ui.page_html()
+    hide = [(sel, body) for sel, body in css_rules(html) if ".show-archived" in sel]
+    assert len(hide) == 1, "the stylesheet does not hide archived rows in exactly one rule"
+    sel, body = hide[0]
+    assert " ".join(sel.split()) == '#runs:not(.show-archived) .run[data-archived="1"]', \
+        f"the hiding rule is not `an archived row on a rail that is not showing them`: `{sel}`"
+    assert "display:none" in body.replace(" ", ""), \
+        "the rule leaves the row in the layout, so an archived run keeps its space on the rail"
+
+    label = re.search(r'<label id="showarch">(.*?)</label>', html, re.S)
+    assert label, "the header carries no archived toggle"
+    assert '<input type="checkbox">' in label.group(1), "the toggle is not a checkbox"
+    assert '<span id="archn">' in label.group(1), \
+        "the count is not a span of the toggle's own, so runs() has nothing to write it into"
+
+    src = script_of(html)
+    box = re.search(r"const (\w+) = document\.getElementById\('showarch'\)\.firstElementChild;",
+                    src)
+    assert box, "nothing on the page reaches the toggle's checkbox"
+    assert re.search(rf"{box.group(1)}\.onchange = \(\) => \{{", src), \
+        "the checkbox's change is not what flips the rail"
+    handler = [c for c in closures(src) if "show-archived" in c]
+    assert len(handler) == 1, \
+        f"expected one closure that touches the rail's class, found {len(handler)}"
+    assert " ".join(handler[0].split()) == \
+        ("{ document.getElementById('runs').classList.toggle('show-archived', "
+         f"{box.group(1)}.checked); }}"), \
+        f"the change handler does more or less than toggle the class: `{handler[0]}`"
+
+
+def test_the_toggle_counts_from_the_reply():
+    """AC-17's `archived (N)`. Counted off the reply, never off the rail.
+
+    The rail is what the reader is looking at, and it answers the wrong question
+    both ways round: with the toggle off the archived rows are hidden, and with it
+    on they are indistinguishable from the rest without reading a stamp back out of
+    the DOM. The reply carries every run and its flag either way, so the number is
+    the same whichever way the toggle is set — which is what makes it a label worth
+    reading before you flip it.
+
+    Written through setText like every other word a poll puts on the page, and off
+    the same rows patchRuns was handed, so the count and the rail are never one
+    poll apart.
+    """
+    src = function_source(ui.page_html(), "runs")
+    served = re.search(r"patchRuns\((\w+)\)", src)
+    assert served, "the poll no longer hands the reply's rows to patchRuns"
+    count = re.search(r"const (\w+) = (\w+)\.filter\((\w+) => \3\.archived\)\.length;", src)
+    assert count, "nothing counts the archived rows off the reply's own flags"
+    held, rows, _ = count.groups()
+    assert rows == served.group(1), \
+        "the count comes from something other than the reply the rows came from"
+    assert f"setText(document.getElementById('archn'), `archived (${{{held}}})`);" in src, \
+        "the toggle's label is not `archived (N)` off that count, written through setText"
+    # Below the waiting count, which is the other `.filter(…).length` in this
+    # function and the one test_archived_rows_do_not_count_toward_the_title finds
+    # with a re.search that takes the first.
+    waiting = re.search(r"const \w+ = \w+\.filter\(\w+ => \w+\.state === 'waiting'", src)
+    assert waiting and waiting.start() < count.start(), \
+        "the archived count sits above the waiting count, where the tab's own test reads it"
+
+
+def test_the_strip_carries_the_archive_control():
+    """AC-17's gesture. The button lives on the strip, which is the one line on the
+    board that names the run it would act on, and it says which direction it goes
+    in.
+
+    The word comes off the same stamp the stylesheet hides on, so the button and
+    the rail cannot come to disagree about one run: a button reading `archive` on a
+    run that is already off the rail is a click that does nothing and looks broken.
+
+    Shown as soon as there is a row behind the strip, open run or not. AC-18 puts
+    the refusal on the server, where it is true whatever the page believes — the
+    page greying the button out would be it guessing, and guessing wrong costs the
+    owner a click they were entitled to. The refusal they get instead is
+    test_a_refusal_reaches_the_error_span's.
+    """
+    html = ui.page_html()
+    w = strip_wiring(html)
+    src = w["src"]
+    btn = re.search(r"const (\w+) = " + w["strip"] + r"\.querySelector\('\.archbtn'\);", src)
+    assert btn, "patchStrip never reaches the strip's archive button"
+    assert f"{btn.group(1)}.hidden = false;" in src, \
+        "the button is labelled and never shown, so it stays hidden for the life of the board"
+    assert src.index(f"if (!{w['row']}) return;") < src.index(f"{btn.group(1)}.hidden = false"), \
+        "the button is shown above the guard, on a strip with no row behind it"
+    assert f"setText({btn.group(1)}, {w['row']}.dataset.archived === '1' " \
+           "? 'unarchive' : 'archive');" in src, \
+        "the button's word is not the row's own stamp read back, or it is the wrong way round"
+
+    # The direction is the word the reader was offered, and the id is the row's own.
+    # `sel.dir` is the other key on that object and two workflows of one run
+    # directory share it: posted instead of the id it archives a row that may not
+    # exist and leaves the one they clicked on the rail.
+    handler = archive_closure(html)
+    want = re.search(rf"const (\w+) = (\w+)\.textContent === 'archive';", handler)
+    assert want, "the direction is not read off the word on the button"
+    assert "JSON.stringify({id: sel.id, archived: " + want.group(1) + "})" in handler, \
+        "the request does not carry the selected run's id and the direction the button offered"
+
+
+def test_the_archive_post_is_gesture_only():
+    """AC-19 from the page's end, and checklist item 8's guarantee: a dashboard
+    nobody is touching sends four GETs and nothing else.
+
+    /api/archive is named in one closure and in no function an interval can reach.
+    Written into patchStrip it would post on every 4-second poll — the page
+    archiving runs by itself, which is the worst thing in this phase that could
+    reach a reader — and every naming rule in this file would wave it through,
+    because patchStrip is a `patch…` function doing exactly what its name says.
+
+    The count of non-GET requests is pinned at one for the same reason: this is the
+    only write the dashboard makes, and a second one added later would be a second
+    thing to think about wherever this endpoint is reasoned about.
+    """
+    src, regs = regions(ui.page_html())
+    reached = poll_path(src, regs)
+    hits = [m.start() for m in re.finditer("/api/archive", src)]
+    assert hits, "the page never posts to /api/archive at all"
+    for i in hits:
+        owner = next((n for n, s, e in regs if s <= i < e), None)
+        assert owner not in reached, \
+            f"/api/archive is written into {owner}, which an interval reaches"
+
+    handler = archive_closure(ui.page_html())
+    assert "method: 'POST'" in handler, "the archive request is not a POST"
+    assert src.count("method:") == 1, \
+        "the page makes a request with a method of its own somewhere else as well"
+    assert re.search(r"(\w+)\.onclick = async \(\) => \{", function_source(ui.page_html(),
+                                                                          "buildBoard")), \
+        "the archive request is not hung on a click at all"
+    assert "onclick()" not in src, "something calls a click handler rather than waiting for one"
+
+
+def test_a_refusal_reaches_the_error_span(archiving):
+    """AC-18's sentence, on screen. The server refuses an open run with a line
+    written to be read by whoever clicked, and the page shows that line rather than
+    a status number, a console message or nothing at all.
+
+    A control that fails silently is worse than no control: the reader clicks,
+    the run stays where it is, and the page they are looking at says the same thing
+    it said before. So every way the request can fail writes something — the
+    server's own words when it answered, and the page's `server error` when it did
+    not.
+
+    The last half is the cross-check the source alone cannot make. The page reads
+    one key out of the refusal's body; this asks a real dashboard for a real
+    refusal and looks for that key in it, so the two halves of this feature cannot
+    drift apart with both files' own tests green.
+    """
+    html = ui.page_html()
+    handler = archive_closure(html)
+    reply = re.search(r"(\w+) = await fetch\('/api/archive'", handler)
+    assert reply, "the reply is not held anywhere, so nothing can read a status off it"
+    assert f"if (!{reply.group(1)}.ok)" in handler, \
+        "nothing branches on the status, so a refusal reads as a success and the rail repolls"
+
+    body = re.search(r"const (\w+) = await \w+\.json\(\)", handler)
+    assert body, "the refusal's body is never read"
+    shown = re.search(rf"setText\((\w+), {body.group(1)}\.(\w+) \|\| ", handler)
+    assert shown, "the body's own words are not written into anything, or not through setText"
+    assert re.search(rf"\b{shown.group(1)} = \w+\.querySelector\('\.archerr'\);?", script_of(html)), \
+        f"`{shown.group(1)}` is not the strip's error line"
+    # The catch's own block, counted out rather than searched for past the word
+    # `catch`: everything below it in this closure writes the error line too, so a
+    # substring is satisfied by a catch that has been emptied — which is the page
+    # saying nothing at all on the one failure that leaves no status to read.
+    caught = [h for _, h in try_blocks(handler) if "fetch('/api/archive'" in _]
+    assert len(caught) == 1, "the archive request sits inside no try of its own"
+    assert re.search(rf"setText\({shown.group(1)}, '[^']+'\);", caught[0]), \
+        "a request that never reached the server leaves the reader with nothing on screen"
+    assert f"setText({shown.group(1)}, '');" in handler, \
+        "a refusal's words stay on the strip after the next click succeeds"
+
+    key = shown.group(2)
+    url = archiving.make(dead_run_feed({KNOWN: True}))
+    code, refusal = post(url + "/api/archive", {"id": KNOWN, "archived": True})
+    assert code == 409, "the server no longer refuses an open run, so there is nothing to show"
+    assert refusal.get(key), \
+        f"the page shows `{key}` and the server's refusal carries {list(refusal)}"
+    assert refusal[key] == STILL_OPEN, "the refusal is not the sentence AC-18 asks for"
 
 
 def test_agents_md_no_longer_calls_the_dashboard_read_only():

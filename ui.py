@@ -70,13 +70,34 @@ PAGE = """<!doctype html>
   header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; gap:10px; align-items:baseline; }
   header b { font-size:15px; letter-spacing:.4px; }
   header span { color:var(--dim); font-size:12px; }
+  /* The archived toggle, pushed to the far end of the header: it says something
+     about the rail rather than about the run on screen, and the reader looks at it
+     once a week. The count beside the box is a header span, so it is already the
+     same dim 12px as everything else on this line. */
+  #showarch { margin-left:auto; display:flex; gap:6px; align-items:center; cursor:pointer;
+              user-select:none; }
   main { flex:1; display:flex; min-height:0; }
   #runs { width:320px; flex:none; overflow-y:auto; background:var(--pane); border-right:1px solid var(--line); }
   .run { padding:11px 15px; border-bottom:1px solid var(--line); cursor:pointer; border-left:3px solid transparent; }
   .run:hover { background:#171d29; }
   .run.sel { background:#1a2231; border-left-color:var(--accent); }
+  /* A run the owner has taken off the rail, and the whole of hiding and showing it.
+     The row is never removed and never gets `hidden`: the reply goes on carrying
+     every run, so the toggle needs no second request, and the poll goes on patching
+     the row where it stands. A row removed for being archived would be built again
+     four seconds later — the run-list bug this page was rewritten to kill — and the
+     row the reader has selected is allowed to be a hidden one. */
+  #runs:not(.show-archived) .run[data-archived="1"] { display:none; }
   .run .dir { font:600 12px/1.3 ui-monospace,Menlo,monospace; word-break:break-all; }
   .run .meta { margin-top:5px; display:flex; gap:8px; align-items:center; font-size:11px; color:var(--dim); }
+  /* The word on a shown archived row, in the purple this page already uses for its
+     own annotations beside a run's own words. Not dim, which is what the state
+     detail next to it is: `archived` is why the row is there at all with the toggle
+     on, and it must not read as more of the detail. The meta line is a flex row
+     with a gap, so an empty span on every unarchived row would be an 8px hole in
+     every one of them. */
+  .run .arch { color:var(--purple); }
+  .run .arch:empty { display:none; }
   /* Tabular figures so a duration counting up does not shuffle the line sideways
      under a reader trying to select it. */
   .run .when { margin-top:4px; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; }
@@ -117,6 +138,19 @@ PAGE = """<!doctype html>
   /* Tabular figures for the rail's own reason: a duration counting up must not
      shuffle the line sideways under a reader trying to read it. */
   #strip .dur { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
+  /* The one control on this page that changes anything, at the far end of the line
+     naming the run it acts on. Quiet, and no red on it: the gesture is reversible
+     and the same button is what reverses it. */
+  #strip .archbtn { margin-left:auto; padding:4px 10px; border-radius:6px;
+                    background:var(--panel); border:1px solid var(--line); color:var(--dim);
+                    font:12px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; cursor:pointer; }
+  #strip .archbtn:hover { color:var(--fg); border-color:var(--dim); }
+  /* What the server said when it refused, in the reader's line of sight rather than
+     in a console they do not have open. Empty until something is refused, and an
+     empty flex item is still a gap — `.item .detail` is emptied for the same
+     reason. */
+  #strip .archerr { color:#f85149; font-size:12px; max-width:44ch; }
+  #strip .archerr:empty { display:none; }
   .empty { color:var(--dim); text-align:center; padding:40px 0; font-size:13px; }
   /* The state board: what the run is doing, what it is asking, what it is
      working through. The logs come after all three. */
@@ -277,7 +311,12 @@ PAGE = """<!doctype html>
   @media (max-width:900px) { .panels { flex-direction:column; align-items:stretch; }
                              #runs { width:240px; } }
 </style></head><body>
-<header><b>loopgraph</b><span id="ver"></span><span id="hdr">engine dashboard</span></header>
+<header><b>loopgraph</b><span id="ver"></span><span id="hdr">engine dashboard</span>
+<!-- The archived runs, and the way back to them. A label around the box so the
+     words are part of the target, and the count starts at 0 because runs() writes
+     it on the first reply and a blank pair of brackets before then reads as the
+     page having failed to load. -->
+<label id="showarch"><input type="checkbox"> <span id="archn">archived (0)</span></label></header>
 <main><div id="runs"></div><div id="board"><div class="empty">select a run</div></div></main>
 <script>
 // Two kinds of function on this page, and the names are the contract.
@@ -400,7 +439,7 @@ function buildRunRow(entry) {
   // is one code path for the text instead of two that have to agree, and nothing
   // a run directory is called can reach the page as markup.
   div.innerHTML = '<div class="dir"></div><div class="meta"><span class="pill"></span><span></span>'
-                + '</div><div class="when"><span></span><span></span></div>';
+                + '<span class="arch"></span></div><div class="when"><span></span><span></span></div>';
   // The closure keeps the reply this row was first built from, and that is safe
   // because neither field it reads ever moves: the id is what the row is found by
   // from here on, and the server works the directory out from the id.
@@ -428,11 +467,22 @@ function buildRunRow(entry) {
 }
 function patchRunRow(row, entry) {
   const [dir, meta, when] = row.children;
-  const [state, detail] = meta.children;
+  const [state, detail, arch] = meta.children;
   setText(dir, entry.dir);
   state.className = 'pill ' + pill(entry.state);
   setText(state, entry.state);
   setText(detail, entry.detail || '');
+  // Whether the owner has taken this run off the rail, in the two places it is
+  // needed: the stamp the stylesheet hides on, and the word the reader sees on the
+  // row when the toggle is showing archived runs. Both off the reply's own flag,
+  // which /api/runs puts on every row it serves — a row the server never marked is
+  // not archived, so a reply from an older dashboard reads as nothing hidden.
+  //
+  // The stamp is also what the load-time selection skips, and it is read back by
+  // patchStrip for the direction the strip's button offers. One mark, three
+  // readers, and none of them works out the answer a second time.
+  row.dataset.archived = entry.archived ? '1' : '';
+  setText(arch, entry.archived ? 'archived' : '');
   // Whether the run is still open, stamped where a poll can read it back rather
   // than inferred from the words above. All three shapes are in these two
   // fields: a start and no close is running, both is finished, and neither is a
@@ -522,8 +572,14 @@ function buildBoard(id) {
   // scrolls away, and the stylesheet can only pin it to the top of what it is
   // inside. Empty, like a run row: every word in it is written by patchStrip off
   // the rail, so nothing a run directory is called reaches the page as markup.
+  //
+  // The strip's last two children are the archive control and the line the server
+  // gets to answer with. The button ships hidden because patchStrip is what shows
+  // it, and it is empty for the same reason the three spans are: patchStrip writes
+  // `archive` or `unarchive` off the row's own stamp.
   sections.innerHTML =
-      '<div id="strip" hidden><span class="dir"></span><span class="pill"></span><span class="dur"></span></div>'
+      '<div id="strip" hidden><span class="dir"></span><span class="pill"></span><span class="dur"></span>'
+    + '<button class="archbtn" hidden></button><span class="archerr"></span></div>'
     + '<div id="state" hidden><span class="pill"></span><span class="reason"></span></div>'
     + '<div id="why" hidden></div>'
     + '<section id="awaiting" hidden><h2></h2><div class="q"></div><div class="opts"></div>'
@@ -540,6 +596,52 @@ function buildBoard(id) {
   // and the worktree from the run token, so every round of a run diffs to the
   // same thing and a copy under each card would be the same patch drawn twice.
   sections.lastElementChild.append(buildDiffPane(id));
+  // The dashboard's one gesture that changes anything, wired here on the button
+  // this function has just made. Here and not in patchStrip, because a click is
+  // not a poll: /api/archive is named in no runs(), poll() or patch… function, so
+  // a page nobody touches goes on sending its four GETs and nothing else, which is
+  // what checklist item 8 is watching for.
+  //
+  // Nothing is done to the row before the server has answered. The rail is patched
+  // from the next reply and from nothing else, so a run leaves it because the flag
+  // is written and never because the page assumed it would be — a refusal then
+  // needs nothing put back, which is the failure mode this control could most
+  // easily have shipped.
+  const btn = sections.querySelector('.archbtn'), err = sections.querySelector('.archerr');
+  btn.onclick = async () => {
+    // The direction is the word on the button, which patchStrip wrote off the row's
+    // own stamp: what the reader was offered is what gets asked for, and the two
+    // cannot come apart between the poll and the click. `sel` is read here, with no
+    // await above it, so it is the run the strip is naming as the button is
+    // pressed.
+    const want = btn.textContent === 'archive';
+    let r;
+    try {
+      r = await fetch('/api/archive', {method: 'POST',
+                                       headers: {'Content-Type': 'application/json'},
+                                       body: JSON.stringify({id: sel.id, archived: want})});
+    } catch (e) {
+      // The dashboard's own server, the word the header and the diff pane already
+      // use for it. A click that does nothing and says nothing is worse than no
+      // button at all.
+      setText(err, 'server error');
+      return;
+    }
+    if (!r.ok) {
+      // The server's sentence, verbatim: AC-18's refusals are written to be read by
+      // whoever clicked. The fallback is for a body that is not the JSON this
+      // endpoint always answers with — a proxy in the way, or a 500 from something
+      // that never got as far as the handler.
+      const d = await r.json().catch(() => ({}));
+      setText(err, d.error || `archive failed (${r.status})`);
+      return;
+    }
+    setText(err, '');
+    // Now rather than on whichever of the next four seconds the run list lands on.
+    // runs() is the one path that repatches the rail, so the row is stamped, the
+    // count is rewritten and the button's word turns round together.
+    runs();
+  };
 }
 // The selected run's name over the board, with the pill and the duration beside
 // it — copied off the rail row the run list keeps fresh, never worked out again
@@ -587,6 +689,17 @@ function patchStrip() {
   // The row writes ` · 4m 12s`, where the dot holds the duration off the time
   // beside it. Nothing sits to the strip's left for it to hold off.
   setText(dur, when.lastElementChild.textContent.replace(/^ · /, ''));
+  // The archive control, shown as soon as there is a row behind the strip — which
+  // is every run the reader can select, open or finished. The page does not grey
+  // it out on an open run: AC-18 puts that refusal on the server, where it is true
+  // whatever the page believes, and showing the sentence the server sends back
+  // beats the page guessing at it and being wrong in the direction that costs the
+  // owner a click they were entitled to.
+  const btn = strip.querySelector('.archbtn');
+  btn.hidden = false;
+  // The stamp the stylesheet hides on, read back for the word the button offers,
+  // so the button and the rail can never say opposite things about one run.
+  setText(btn, row.dataset.archived === '1' ? 'unarchive' : 'archive');
 }
 function buildOptionRow(letter) {
   const row = document.createElement('div');
@@ -1282,12 +1395,20 @@ async function runs() {
     // Found in the list rather than by selector, for patchRuns' reason: an id is
     // a workflow id or a directory name, and a directory name is not ours to
     // paste into CSS. The hash's row is taken archived or not, so a link to an
-    // archived run still opens it. The fallback skips the archived, because
-    // archiving the newest finished run is the ordinary case: row zero is then a
-    // row nobody can see, and the page would open on the one run the reader
-    // deliberately took off the rail with `.sel` on a hidden row. A row the
-    // server never marked is not archived, so `!== '1'` is the right reading
-    // before anything writes that stamp as well as after.
+    // archived run still opens it. The fallback skips the archived while the
+    // toggle is off, because archiving the newest finished run is the ordinary
+    // case: row zero is then a row nobody can see, and the page would open on the
+    // one run the reader deliberately took off the rail with `.sel` on a hidden
+    // row. A row the server never marked is not archived, so `!== '1'` is the
+    // right reading on a rail where nothing is.
+    //
+    // `showing` is what makes it "the first row the reader can see" rather than
+    // "the first unarchived row", and it is the class the stylesheet hides on
+    // rather than the checkbox, so the question asked is exactly the one the CSS
+    // answers. Without it a rail whose runs are ALL archived, opened with the
+    // toggle on, matches no row at all: nothing is clicked, nothing is selected,
+    // and the board reads `select a run` for ever with every run on screen and
+    // nothing to say why.
     //
     // The row is worked out here and not inside the `if`, because the guard's
     // shape is pinned by test: an `if` with no call in its condition, and a bare
@@ -1295,8 +1416,9 @@ async function runs() {
     // click fires on every poll, the board is built again and the reader's
     // selection and every log pane they had open go with it.
     const shown = [...document.getElementById('runs').children];
+    const showing = document.getElementById('runs').classList.contains('show-archived');
     const target = shown.find(r => r.dataset.id === want)
-                || shown.find(r => r.dataset.archived !== '1');
+                || shown.find(r => showing || r.dataset.archived !== '1');
     if (!sel && target) target.click();
     // After the click, which is the only line on the page that ever sets `sel`:
     // above it the first load would find no selection and leave the strip empty
@@ -1304,6 +1426,18 @@ async function runs() {
     // nothing selected, which on a rail with no rows is every poll there will be.
     patchStrip();
     setText(hdr, d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only');
+    // How many runs are off the rail, on the toggle that brings them back. Counted
+    // off the reply for the reason the waiting count above it is: the rail is what
+    // the reader is looking at, and with the toggle off the archived rows are
+    // precisely the ones not on it. The reply carries them all either way, so the
+    // number does not change when the toggle is flipped — which is the point of a
+    // label that says how many are hidden.
+    //
+    // Below the waiting count and not above it: both are the poll's only
+    // `.filter(…).length`s, and test_archived_rows_do_not_count_toward_the_title
+    // reads the first one it finds.
+    const arch = rows.filter(r => r.archived).length;
+    setText(document.getElementById('archn'), `archived (${arch})`);
     // Read off the reply the rows came from, so the release and the runs on
     // screen are never one poll apart. A checkout with no tag still gets a word:
     // an empty span beside the name reads as the page having failed to load.
@@ -1352,6 +1486,16 @@ async function poll() {
   } catch(e) { /* the board keeps what it has until the next poll */ }
   patchOpenPanes();
 }
+// The archived toggle, and the whole of what it does. One class on the rail, and
+// the stylesheet decides what is on screen: no fetch, no row moved, no row
+// removed, so flipping it costs the page nothing and the poll never learns it
+// happened. The rows are all there either way — the archived ones are hidden, not
+// missing — which is why the count beside the box does not change when it is
+// flipped and why the selected run stays selected through it.
+const archBox = document.getElementById('showarch').firstElementChild;
+archBox.onchange = () => {
+  document.getElementById('runs').classList.toggle('show-archived', archBox.checked);
+};
 runs(); setInterval(runs, 4000); setInterval(poll, 2000);
 </script></body></html>"""
 

@@ -45,6 +45,16 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   Temporal about: a run that vanished mid-round is a run you stopped watching
   without meaning to. This is the only thing the dashboard writes; everything else
   it serves still only reads.
+- There is a button for it. The run you are reading has `archive` at the end of the
+  line naming it at the top of the board, and clicking it takes the run off the rail
+  there and then. `archived (3)` in the header says how many you have hidden; tick it
+  and they come back, each one marked `archived`, with the same button now offering
+  to put one back. Nothing is hidden until the dashboard has said yes: when it says
+  no — a run that is still working, or a Temporal it cannot reach — you get the
+  reason in red beside the button and the run stays where it was.
+- The dashboard no longer opens on a run you have archived. With no run in the URL it
+  picks the first one you can actually see, which is the point of hiding the newest
+  finished run in the first place.
 - A run has an address. Clicking one puts its id in the URL, so reloading the page
   comes back to the run you were reading instead of the top of the rail, and the URL
   is something you can bookmark or send to someone else. A hash naming a run that is
