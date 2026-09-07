@@ -20,7 +20,11 @@ produces bug reports nobody can reproduce.
 - `activities/` — everything with a side effect: executor, gates, audit,
   checkpoint, learning, notifications, and the record of what the owner answered.
 - `graphs/round_graph.py` — the LangGraph loop inside one round.
-- `lg` — the host CLI. No `.py` extension, so tests load it by path.
+- `lg` — the host CLI: `start`, `status`, `approve`, `where`, `version`,
+  `update`, `ui`, and `lg rm`, the only one that deletes anything — a run
+  directory, its worktree registrations, and its rows off the dashboard's rail.
+  It refuses while a workflow of that run is open, or while Temporal cannot be
+  asked. No `.py` extension, so tests load it by path.
 - `dispatcher.py` — the only process that reads Telegram. Routes each update to
   the run it belongs to (`activities/route.py`) and signals it. Nothing else may
   call `getUpdates`: Telegram allows one poller per bot, and a second one steals

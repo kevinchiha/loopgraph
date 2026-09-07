@@ -1,4 +1,10 @@
-"""Taking one run's worktrees out of their repositories, and what must survive it.
+"""`lg rm`: what it refuses, what it asks, and what it is allowed to delete.
+
+Two halves. The first is `clean_worktrees`, which takes one run's worktrees out
+of their repositories and deletes nothing. The second is the command itself,
+which refuses, prompts, deletes and archives — the one thing in this repository
+with no undo behind it, so the tests below assert on the tree that is left and
+not only on an exit code.
 
 A run's worktree is registered inside the owner's real repository under a
 container path, `/app/runs/<slug>/worktrees/<token>`, because `git worktree add`
@@ -26,9 +32,13 @@ registrations, both records rewritten the way a containerised run leaves them.
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
+import json
 import os
 import subprocess
+import sys
+from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
@@ -496,3 +506,563 @@ def test_a_remove_that_fails_is_one_line_and_the_next_worktree_still_runs(lg, wo
     assert clean(lg, world, "doomed") == ["aa11: fatal: nope"]
     assert container_path("doomed", "bb22") not in world.listed(repo_b), \
         "the worktree after the failed one was never cleaned"
+
+
+# ---------- the command: what it may be pointed at ----------
+
+CLOSED = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+
+
+class Workflows:
+    """A Temporal holding LoopGraphRun rows, and what each answers to `ledger`.
+
+    A row is `(id, close_time)`, and `None` for the close time is the only thing
+    that makes a workflow open — never the ledger, whose `status` reads `running`
+    for ever on a run whose engine died. `ledgers` maps an id to the ledger it
+    answers with, or to the exception the query raises.
+    """
+
+    def __init__(self, rows=(), ledgers=None, stall=0):
+        self.rows = list(rows)
+        self.ledgers = dict(ledgers or {})
+        self.stall = stall
+        self.listed: list[str] = []
+        self.queried: list[tuple[str, str]] = []
+
+    def list_workflows(self, query):
+        self.listed.append(query)
+        feed = self
+
+        async def rows():
+            # A server that accepted the connection and then said nothing. The
+            # wait goes here rather than in the connect because that is where a
+            # real one goes: nothing is sent until the listing is iterated.
+            if feed.stall:
+                await asyncio.sleep(feed.stall)
+            for wf_id, close_time in feed.rows:
+                yield SimpleNamespace(id=wf_id, close_time=close_time)
+        return rows()
+
+    def get_workflow_handle(self, wf_id):
+        feed = self
+
+        class Handle:
+            async def query(self, name):
+                feed.queried.append((wf_id, name))
+                answer = feed.ledgers.get(wf_id, {})
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        return Handle()
+
+
+@pytest.fixture
+def rm(lg, world, tmp_path, monkeypatch):
+    """`lg rm ...` end to end — argparse, ROOT and .env all under tmp_path.
+
+    ROOT is the temporary tree, so the command's `runs/` is world's runs
+    directory and the .env it reads is the one written here. Nothing points at
+    the real checkout, because this is the command that deletes things.
+
+    `typed` is what the operator types at the prompt, one string per read, and
+    an exception in the list is raised instead. Leaving it out means the command
+    must not prompt at all: a stray read fails the test rather than hanging it.
+    """
+    (tmp_path / ".env").write_text(f"LOOPGRAPH_PROJECTS_DIR={world.projects}\n")
+    monkeypatch.setattr(lg, "ROOT", str(tmp_path))
+    prompts: list[str] = []
+
+    def go(*argv, client=None, typed=None) -> int:
+        async def connect():
+            if isinstance(client, Exception):
+                raise client
+            return Workflows() if client is None else client
+        monkeypatch.setattr(lg, "_client", connect)
+        answers = [] if typed is None else list(typed)
+
+        def read(prompt=""):
+            sys.stdout.write(prompt)
+            prompts.append(prompt)
+            if typed is None:
+                raise AssertionError(f"the command prompted with nothing to answer: {prompt!r}")
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        monkeypatch.setattr("builtins.input", read)
+        monkeypatch.setattr(sys, "argv", ["lg", "rm", *argv])
+        return lg.main()
+
+    return SimpleNamespace(go=go, prompts=prompts, runs=world.runs, root=tmp_path,
+                           address=lg.ADDRESS)
+
+
+def everything_under(root: Path) -> set[str]:
+    """Every path in a tree, relative to it. What must not have moved."""
+    return {str(p.relative_to(root)) for p in root.rglob("*")}
+
+
+@pytest.mark.parametrize("flag", [[], ["--yes"]], ids=["asks", "--yes"])
+@pytest.mark.parametrize("arg", [".", "./", "..", "runs/..", "", "a/b"])
+def test_a_slug_that_escapes_runs_is_refused(rm, capsys, arg, flag):
+    """AC-28, and the only bug in this phase that could take the repository with
+    it. `run_slug` validates nothing — it splits on `/`, drops the empties and
+    hands back the last part — so `.`, `..` and `` all come through it unchanged,
+    and every later stop lets them past: all three directories exist, `run-.-`
+    matches no workflow and a run with no workflow is not a refusal, and the
+    prompt asks the operator to retype the same `.` they just typed, or to press
+    Enter for the empty one.
+
+    So `lg rm .` and `lg rm ./` would rmtree every run directory, `lg rm ..`
+    would take the checkout — source, `.git` and all — and `lg rm --yes "$SLUG"`
+    with `SLUG` unset would empty `runs/` and exit 0. `--yes` is parametrised for
+    exactly that: the flag skips the prompt and nothing else.
+
+    The assertion is on the tree and not only on the exit code, because the
+    version of this bug that matters deletes the files and *then* raises. And
+    Temporal is never asked: the refusal comes before the listing, so a machine
+    with the stack down still refuses rather than refusing for the wrong reason.
+    """
+    feed = Workflows([("run-keep-ab12cd", CLOSED)])
+    (rm.runs / "keep" / "logs").mkdir(parents=True)
+    (rm.runs / "other" / "logs").mkdir(parents=True)
+    (rm.runs / ".archived.json").write_text('["run-gone-ff00aa"]')
+    (rm.root / "beside.txt").write_text("not a run\n")
+    before = everything_under(rm.root)
+
+    code = rm.go(arg, *flag, client=feed)
+
+    out, err = capsys.readouterr()
+    assert (code, out) == (1, "")
+    assert err == f"not a run name: {arg}\n"
+    assert everything_under(rm.root) == before, "a refused argument still changed the tree"
+    assert feed.listed == [], "the refusal asked Temporal before deciding"
+
+
+def test_the_slug_passes_the_same_check_a_value_off_the_wire_passes(rm, capsys):
+    """AC-28 names `bad_param` and not a check of its own, and this is the case
+    only `bad_param` catches: a slug with `..` inside it that is neither `..` nor
+    an escape. `weird..name` resolves to a perfectly ordinary child of `runs/`,
+    so the shape check and the resolve check both wave it through.
+
+    One guard, one case that needs it. Without this the whole of `bad_param` can
+    be deleted from the command and every other test here still passes, which is
+    the shape a refusal that has quietly stopped running takes.
+    """
+    (rm.runs / "weird..name" / "logs").mkdir(parents=True)
+    before = everything_under(rm.root)
+
+    assert rm.go("weird..name", "--yes") == 1
+    assert capsys.readouterr().err == "not a run name: weird..name\n"
+    assert everything_under(rm.root) == before
+
+
+def test_a_run_directory_that_is_a_symlink_out_of_runs_is_refused(rm, world, capsys):
+    """The case the resolve is there for, and the one that reads as a plain run
+    name all the way up to the rmtree. `runs/evil` is a perfectly good child of
+    `runs/` by its name; it is only a child by its path once the link is
+    followed, which is what resolve() does and what nothing before it does."""
+    (rm.runs / "keep" / "logs").mkdir(parents=True)
+    (rm.runs / "evil").symlink_to(world.projects)
+    before = everything_under(Path(world.projects))
+
+    assert rm.go("evil", "--yes") == 1
+    assert capsys.readouterr().err == "not a run name: evil\n"
+    assert everything_under(Path(world.projects)) == before
+    assert (rm.runs / "evil").is_symlink(), "the link itself was removed"
+
+
+def test_a_missing_run_directory_is_one_line_and_no_lookup(rm, capsys):
+    """Archiving a row whose directory was never there is the dashboard's job,
+    not this command's, and it is a typo far more often than anything else. The
+    listing is not worth a round trip to Temporal to say so."""
+    (rm.runs / "keep" / "logs").mkdir(parents=True)
+    feed = Workflows([("run-typo-ab12cd", CLOSED)])
+
+    assert rm.go("runs/typo", "--yes", client=feed) == 1
+    out, err = capsys.readouterr()
+    assert (out, err) == ("", "no run directory runs/typo\n")
+    assert feed.listed == [], "a missing directory still asked Temporal"
+    assert (rm.runs / "keep").is_dir()
+
+
+# ---------- the command: what it refuses ----------
+
+def test_rm_refuses_while_a_workflow_is_open_and_names_the_condition(rm, world, capsys):
+    """AC-21. Open is Temporal's close time and nothing else, and the line says
+    which of the two conditions stopped it, because they need different things
+    from the owner: one wants an answer, the other wants waiting.
+
+    Both open workflows are named, not just the first: a run directory can hold
+    two, and stopping at the first would leave the owner answering one and
+    meeting the other on the next attempt.
+    """
+    repo = world.repository()
+    world.container(repo, "doomed", "tok1")
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    feed = Workflows(
+        [("run-doomed-aa11aa", None), ("run-doomed-bb22bb", None),
+         ("run-doomed-cc33cc", CLOSED)],
+        {"run-doomed-aa11aa": {"status": "running",
+                               "awaiting": {"kind": "decision", "question": "which port?"}},
+         "run-doomed-bb22bb": {"status": "running"}})
+
+    assert rm.go("doomed", "--yes", client=feed) == 1
+
+    out, err = capsys.readouterr()
+    assert err.splitlines() == [
+        "refuse: run-doomed-aa11aa is waiting on you — answer it: "
+        "lg approve run-doomed-aa11aa <answer>",
+        "refuse: run-doomed-bb22bb is still running",
+    ]
+    assert out == "", "a refusal printed a deletion plan"
+    assert (rm.runs / "doomed" / "logs").is_dir(), "the run directory was deleted anyway"
+    assert container_path("doomed", "tok1") in world.listed(repo), \
+        "the worktree was de-registered by a command that refused"
+
+
+def test_a_closed_workflow_whose_ledger_still_says_running_is_removed(rm, capsys):
+    """AC-21's other half, and the runs `lg rm` exists for. An activity that
+    escapes `run` leaves the workflow closed with its ledger frozen at the
+    failure — `status: running`, `awaiting` still set — for ever. Read off the
+    ledger, that run can never be removed; read off the close time, it goes.
+    """
+    (rm.runs / "dead" / "logs").mkdir(parents=True)
+    feed = Workflows([("run-dead-aa11aa", CLOSED)],
+                     {"run-dead-aa11aa": {"status": "running",
+                                          "awaiting": {"kind": "decision"}}})
+
+    assert rm.go("dead", "--yes", client=feed) == 0
+
+    assert capsys.readouterr().err == ""
+    assert not (rm.runs / "dead").exists()
+    assert json.loads((rm.runs / ".archived.json").read_text()) == ["run-dead-aa11aa"]
+    assert feed.queried == [], "a closed workflow's ledger was queried to decide this"
+
+
+def test_an_open_workflow_whose_ledger_cannot_be_read_is_still_running(rm, capsys):
+    """A query replays the whole history against the workflow code registered
+    now, so one written by older code fails with a nondeterminism error — 7 of
+    the 15 runs on the owner's machine. The workflow is open either way, and a
+    line that cannot say which condition still has to say it is open."""
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    feed = Workflows([("run-doomed-aa11aa", None)],
+                     {"run-doomed-aa11aa": RuntimeError("[TMPRL1100] Nondeterminism error")})
+
+    assert rm.go("doomed", "--yes", client=feed) == 1
+    assert capsys.readouterr().err == "refuse: run-doomed-aa11aa is still running\n"
+    assert (rm.runs / "doomed").is_dir()
+
+
+def test_rm_refuses_when_temporal_cannot_be_asked(rm, capsys):
+    """AC-21. A stack that is down cannot say whether this run is mid-round, and
+    a run mid-round has a worktree the executor is writing into. Guessing is the
+    one thing a command with no undo may not do."""
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+
+    assert rm.go("doomed", "--yes", client=RuntimeError("connection refused")) == 1
+
+    out, err = capsys.readouterr()
+    assert (out, err) == ("", f"cannot reach Temporal at {rm.address}; "
+                              "lg rm cannot prove the run is not mid-round\n")
+    assert (rm.runs / "doomed" / "logs").is_dir()
+
+
+def test_a_temporal_that_never_answers_is_a_refusal_and_not_a_hang(rm, lg, monkeypatch, capsys):
+    """The deadline covers the listing and not just the connect. `list_workflows`
+    sends no request until it is iterated, so a client that connected proves
+    nothing about the server behind it — the same reason `lg update` wraps
+    `_open_runs` whole rather than wrapping the connect."""
+    monkeypatch.setattr(lg, "TEMPORAL_TIMEOUT", 0.05)
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+
+    assert rm.go("doomed", "--yes", client=Workflows(stall=5)) == 1
+    assert capsys.readouterr().err.startswith("cannot reach Temporal at ")
+    assert (rm.runs / "doomed" / "logs").is_dir()
+
+
+def test_another_runs_workflows_are_neither_archived_nor_a_refusal(rm, capsys):
+    """The id shape is `run-<slug>-` plus a token holding no `-`, which is what
+    `cmd_start` builds and `resolve_run_arg` inverts. Without the no-dash rule
+    `lg rm foo` claims every run whose own slug starts with `foo-`, and both
+    halves of that are wrong at once: it refuses because a different, live run is
+    open, and if that run were closed it would archive its row while deleting
+    nothing of it — a row off the rail with its directory still there."""
+    (rm.runs / "foo" / "logs").mkdir(parents=True)
+    (rm.runs / "foo-bar" / "logs").mkdir(parents=True)
+    feed = Workflows([("run-foo-aa11aa", CLOSED), ("run-foo-bar-bb22bb", None)])
+
+    assert rm.go("foo", "--yes", client=feed) == 0
+
+    assert capsys.readouterr().err == ""
+    assert json.loads((rm.runs / ".archived.json").read_text()) == ["run-foo-aa11aa"]
+    assert (rm.runs / "foo-bar" / "logs").is_dir(), "the neighbouring run was deleted"
+
+
+# ---------- the command: the prompt ----------
+
+def test_the_prompt_wants_the_slug_back(rm, world, capsys):
+    """AC-22. `y` is what a person types without reading, and this command has no
+    undo, so what it asks for is the name of the thing it is about to delete.
+    Anything else stops it, and it stops before the first change: the worktree is
+    still registered and the directory is still there afterwards."""
+    repo = world.repository()
+    world.container(repo, "doomed", "tok1")
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    feed = Workflows([("run-doomed-aa11aa", CLOSED)])
+
+    assert rm.go("doomed", client=feed, typed=["y"]) == 1
+    err = capsys.readouterr().err
+    assert err == "stopped; nothing was touched\n"
+    assert rm.prompts == ["type doomed to delete, or anything else to stop: "]
+    assert (rm.runs / "doomed" / "logs").is_dir()
+    assert container_path("doomed", "tok1") in world.listed(repo)
+    assert not (rm.runs / ".archived.json").exists()
+
+    assert rm.go("doomed", client=feed, typed=["doomed"]) == 0
+    assert not (rm.runs / "doomed").exists()
+    assert container_path("doomed", "tok1") not in world.listed(repo)
+
+
+def test_yes_skips_the_prompt_and_nothing_else(rm, capsys):
+    """--yes is for a script that has already decided. It answers the question
+    and takes no refusal with it: the fixture fails the test if the command reads
+    from a stdin nothing is holding."""
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+
+    assert rm.go("doomed", "--yes", client=Workflows([("run-doomed-aa11aa", CLOSED)])) == 0
+    assert rm.prompts == []
+    assert not (rm.runs / "doomed").exists()
+
+
+def test_a_closed_stdin_stops_instead_of_raising(rm, world, capsys):
+    """AC-22. Run from a script or a pipe without --yes, `input()` raises
+    EOFError. `main()` has no top-level handler, so that reaches the terminal as
+    a traceback — which is not an answer to a plain question, and every other
+    refusal in `lg` is one line and a 1. A read that gets no line at all is not
+    the slug, so it stops exactly the way a wrong answer stops."""
+    repo = world.repository()
+    world.container(repo, "doomed", "tok1")
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+
+    code = rm.go("doomed", client=Workflows([("run-doomed-aa11aa", CLOSED)]),
+                 typed=[EOFError()])
+
+    assert code == 1
+    assert capsys.readouterr().err == "stopped; nothing was touched\n"
+    assert (rm.runs / "doomed" / "logs").is_dir()
+    assert container_path("doomed", "tok1") in world.listed(repo)
+
+
+def test_it_prints_what_it_is_about_to_delete(rm, world, capsys):
+    """AC-22's first half. The operator is being asked to confirm, and a question
+    with nothing above it is a question about nothing: the directory, every
+    worktree under it and every row that will leave the rail, before the prompt
+    that asks about them."""
+    repo = world.repository()
+    world.container(repo, "doomed", "tok1")
+    world.container(repo, "doomed", "tok2")
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    feed = Workflows([("run-doomed-aa11aa", CLOSED), ("run-doomed-bb22bb", CLOSED)])
+
+    assert rm.go("doomed", client=feed, typed=["doomed"]) == 0
+
+    # The prompt is written without a newline after it, so the summary line
+    # afterwards shares its line. The plan is the part above it.
+    out = capsys.readouterr().out.splitlines()
+    assert out[:5] == [
+        f"about to delete {rm.runs / 'doomed'}",
+        f"  worktree {rm.runs / 'doomed' / 'worktrees' / 'tok1'}",
+        f"  worktree {rm.runs / 'doomed' / 'worktrees' / 'tok2'}",
+        "  archive run-doomed-aa11aa",
+        "  archive run-doomed-bb22bb",
+    ]
+    assert out[5].startswith("type doomed to delete, or anything else to stop: ")
+
+
+# ---------- the command: what it deletes, and in what order ----------
+
+def test_a_removal_de_registers_then_deletes_then_archives(rm, world, capsys, monkeypatch):
+    """The whole successful path, and the order it has to happen in.
+
+    The worktrees go first because `clean_worktrees` finds them by reading
+    `runs/<slug>/worktrees/`: after the rmtree there is nothing left to read and
+    the registration would stay in the owner's repository for ever, unreported.
+    The archive write goes last because the two halves have to work together —
+    a row taken off the rail by a delete that then failed is a run the owner can
+    no longer see and has not lost.
+    """
+    repo = world.repository()
+    world.container(repo, "doomed", "tok1")
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    still_there = []
+    real = ui.mark_archived
+
+    def watched(runs, ids, archived):
+        still_there.append((rm.runs / "doomed").exists())
+        return real(runs, ids, archived)
+
+    monkeypatch.setattr(ui, "mark_archived", watched)
+
+    assert rm.go("runs/doomed/", "--yes", client=Workflows([("run-doomed-aa11aa", CLOSED)])) == 0
+
+    out, err = capsys.readouterr()
+    assert out.splitlines()[-1] == "removed runs/doomed; archived 1 workflow row(s)"
+    assert err == ""
+    assert container_path("doomed", "tok1") not in world.listed(repo), \
+        "the worktree was still registered after the directory went"
+    assert not (rm.runs / "doomed").exists()
+    assert json.loads((rm.runs / ".archived.json").read_text()) == ["run-doomed-aa11aa"]
+    assert still_there == [False], "the archive was written while the directory was still there"
+
+
+def test_rm_archives_both_workflows_of_a_shared_directory(rm, capsys):
+    """AC-20. Two workflows really do share one run directory — a restart, or a
+    second `lg start` on the same brief — and the dashboard keys its rows on the
+    workflow id. Archiving one leaves the other on the rail, pointing at logs,
+    a diff and a ledger that are all gone.
+
+    The id already in the file stays: `mark_archived` re-reads and merges, and a
+    write that replaced the list would take every other run the owner had hidden
+    off with it."""
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    (rm.runs / ".archived.json").write_text('["run-older-ff00aa"]')
+    feed = Workflows([("run-doomed-aa11aa", CLOSED), ("run-other-zz99zz", CLOSED),
+                      ("run-doomed-bb22bb", CLOSED)])
+
+    assert rm.go("doomed", "--yes", client=feed) == 0
+
+    assert capsys.readouterr().out.splitlines()[-1] == \
+        "removed runs/doomed; archived 2 workflow row(s)"
+    assert json.loads((rm.runs / ".archived.json").read_text()) == [
+        "run-doomed-aa11aa", "run-doomed-bb22bb", "run-older-ff00aa"]
+    assert not (rm.runs / "doomed").exists()
+
+
+@pytest.mark.parametrize("before", [None, '[\n  "run-older-ff00aa"\n]\n'],
+                         ids=["no file", "pretty-printed"])
+def test_rm_deletes_a_logs_only_run_with_nothing_to_archive(rm, capsys, before):
+    """A run driven by `lg round`, or one whose workflow history has aged out:
+    the directory is real and Temporal has nothing keyed to it. There is nothing
+    to take off the rail, so the archive file is not written at all — writing it
+    with an empty list would create one on a fresh checkout and reformat the
+    owner's own file for nothing.
+
+    Temporal answering with no matching workflow is not a refusal either. It is
+    the state a logs-only run is always in."""
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    if before is not None:
+        (rm.runs / ".archived.json").write_text(before)
+
+    assert rm.go("doomed", "--yes", client=Workflows([("run-other-zz99zz", CLOSED)])) == 0
+
+    assert capsys.readouterr().out.splitlines()[-1] == \
+        "removed runs/doomed; archived 0 workflow row(s)"
+    assert not (rm.runs / "doomed").exists()
+    archive = rm.runs / ".archived.json"
+    assert (archive.read_text() if archive.exists() else None) == before, \
+        "the archive file was rewritten with nothing to record"
+
+
+def test_an_uncleanable_worktree_still_lets_the_directory_go(rm, world, capsys):
+    """AC-24. The repository moved, or .env has not been written yet. The
+    registration cannot be taken out from here whatever happens, and leaving the
+    run directory on disk as well helps nobody: the owner is told which worktree
+    and why, and the thing they asked for is done."""
+    lost = rm.runs / "doomed" / "worktrees" / "aa11"
+    lost.mkdir(parents=True)
+    (lost / ".git").write_text("gitdir: /projects/gone/.git/worktrees/aa11\n")
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    _, why = ui.resolve_repo(container_path("doomed", "aa11"), rm.runs, world.projects)
+    assert why, "the fixture's lost worktree resolves after all"
+
+    assert rm.go("doomed", "--yes", client=Workflows([("run-doomed-aa11aa", CLOSED)])) == 0
+
+    out, err = capsys.readouterr()
+    assert err == f"aa11: {why}\n"
+    assert out.splitlines()[-1] == "removed runs/doomed; archived 1 workflow row(s)"
+    assert not (rm.runs / "doomed").exists()
+
+
+def test_rm_never_touches_a_branch(rm, world, recorded, capsys):
+    """AC-23. `discard` deletes the run's branch because the owner refused the
+    work. This is the other act — tidying up after one — and by then the branch
+    is all that is left of it. A merged run's branch is history."""
+    repo = world.repository()
+    world.container(repo, "doomed", "tok1")
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+
+    assert rm.go("doomed", "--yes", client=Workflows([("run-doomed-aa11aa", CLOSED)])) == 0
+
+    assert branch_of("doomed", "tok1") in world.git(
+        repo, "branch", "--format=%(refname:short)").split(), "the run's branch was deleted"
+    assert [argv for argv in recorded if "branch" in argv] == []
+
+
+def test_rm_leaves_a_neighbouring_runs_worktree_alone(rm, world, capsys):
+    """AC-29, end to end. Tidying a finished run off the rail while its
+    replacement works the same project is the ordinary use of this command, and
+    from the host both registrations look stale, because both were made inside
+    the container. A prune here takes the live run with the dead one and its next
+    git command dies with `fatal: not a git repository`."""
+    repo = world.repository()
+    world.container(repo, "doomed", "tok1")
+    world.container(repo, "live", "tok2")
+    for slug in ("doomed", "live"):
+        (rm.runs / slug / "logs").mkdir(parents=True)
+
+    assert rm.go("doomed", "--yes", client=Workflows([("run-doomed-aa11aa", CLOSED)])) == 0
+
+    assert container_path("live", "tok2") in world.listed(repo), \
+        "the live run's registration went with the removed one"
+    assert (repo / ".git" / "worktrees" / "tok2").is_dir()
+    assert (rm.runs / "live" / "worktrees" / "tok2").is_dir()
+    assert container_path("doomed", "tok1") not in world.listed(repo)
+
+
+def test_an_unreadable_archive_file_is_a_line_and_still_a_zero(rm, capsys):
+    """The directory and the worktrees are already gone by the time the write
+    happens, and no exit code puts them back. Telling the owner the rows are
+    still on the rail, and which file to move aside, beats a traceback over work
+    that is done — and beats a non-zero exit that says the whole command failed.
+    """
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    (rm.runs / ".archived.json").write_text("{}")
+
+    assert rm.go("doomed", "--yes", client=Workflows([("run-doomed-aa11aa", CLOSED)])) == 0
+
+    out, err = capsys.readouterr()
+    assert err == ("runs/.archived.json is not a readable list; "
+                   "move it aside and archive by hand\n")
+    assert out.splitlines()[-1] == "removed runs/doomed; archived 0 workflow row(s)"
+    assert not (rm.runs / "doomed").exists()
+    assert (rm.runs / ".archived.json").read_text() == "{}", "the unreadable file was overwritten"
+
+
+# ---------- what the docs teach ----------
+
+def test_the_readme_and_agents_md_document_lg_rm():
+    """AC-33. A destructive command nobody wrote down is one the owner meets for
+    the first time by running it. The README says what goes and what stops it;
+    AGENTS.md's layout line names it beside the other subcommands, because that
+    is where the next agent to change `lg` looks for what `lg` does."""
+    root = Path(ui.__file__).resolve().parent
+    readme = (root / "README.md").read_text()
+    listed = [ln for ln in readme.splitlines() if ln.startswith("lg rm ")]
+    assert listed, "README's lg command list never shows lg rm"
+    assert any("--yes" in ln for ln in listed), "README never shows the --yes flag"
+    for missing, said in [("what it de-registers", "worktree"),
+                          ("what stops it", "refuses"),
+                          ("that Temporal being down stops it", "cannot reach Temporal"),
+                          ("what the prompt wants", "type the run's name back")]:
+        assert said in readme, f"README does not say {missing}"
+
+    # The whole bullet, not its first line: where the sentence wraps is not
+    # something a doc test should have an opinion about.
+    lines = (root / "AGENTS.md").read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("- `lg` —"))
+    rest = lines[start + 1:]
+    end = next((i for i, ln in enumerate(rest) if ln.startswith("- ")), len(rest))
+    bullet = "\n".join(lines[start:start + 1 + end])
+    assert "lg rm" in bullet, f"AGENTS.md's lg entry does not name lg rm:\n{bullet}"

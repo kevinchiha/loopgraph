@@ -963,6 +963,178 @@ def clean_worktrees(slug: str, runs_dir: str, projects_dir: str | None) -> list[
     return report
 
 
+async def _run_workflows(slug: str) -> tuple[Client, list]:
+    """The client, and every LoopGraphRun workflow of run directory `slug`.
+
+    Connect and listing in one coroutine so a single deadline covers both, the
+    way `_open_runs` does it for `lg update`: the listing sends no request until
+    it is iterated, so a connect that succeeded proves nothing about the server
+    behind it.
+
+    A run's ids are `run-<slug>-` plus a token holding no `-` — the shape
+    cmd_start builds and resolve_run_arg inverts. Every one of them, not the
+    newest: two workflows can share a run directory, and the dashboard keys its
+    rows on the workflow id, so archiving one and not the other leaves a row on
+    the rail pointing at logs and a diff that are gone. The no-dash rule is what
+    keeps `foo` off every run whose own slug starts with `foo-`.
+    """
+    client = await _client()
+    prefix = f"run-{slug}-"
+    found = [wf async for wf in client.list_workflows('WorkflowType = "LoopGraphRun"')
+             if wf.id.startswith(prefix) and wf.id[len(prefix):]
+             and "-" not in wf.id[len(prefix):]]
+    return client, found
+
+
+async def cmd_rm(args: argparse.Namespace) -> int:
+    """Delete one run directory: refuse, confirm, de-register, delete, archive.
+
+    The order is the design. `runs/<slug>` holds the owner's work and sometimes a
+    client's — the executor's transcripts, the supervisor's reasoning, the gates,
+    the worktrees — it is gitignored because it is theirs, and there is no undo.
+    So everything that can say no says it before anything is removed: the name,
+    then the directory, then Temporal, then the operator.
+
+    The worktrees go before the directory, because clean_worktrees finds them by
+    reading `runs/<slug>/worktrees/` and after the rmtree there is nothing left
+    to read. The archive write goes last, because a row taken off the rail by a
+    delete that then failed is a run the owner can no longer see and has not
+    lost. Neither half is optional: a directory deleted with its rows left on the
+    rail leaves the dashboard listing a run whose every pane is gone.
+    """
+    from pathlib import Path
+    import ui
+
+    # ROOT, .env and the archive path are all read here rather than at import,
+    # the way _dotenv and cmd_version read them, so a test can put the whole
+    # command under a tmp_path. This one has to be movable: it deletes.
+    runs_dir = Path(ROOT) / "runs"
+    slug = run_slug(args.run_dir)
+
+    # AC-28, and the first thing the command does. run_slug validates nothing,
+    # whatever its docstring suggests: it splits on `/`, drops the empties and
+    # returns the last part, so `.`, `..` and `` all come through it unchanged.
+    # Every later stop then lets them past — all three directories exist, so the
+    # missing-directory check passes; `run-.-` matches no workflow, and a run
+    # with no workflow is not a refusal; and the prompt asks the operator to
+    # retype the same `.` they just typed, or to press Enter for the empty one.
+    # So without this, `lg rm .` and `lg rm ./` delete every run directory,
+    # `lg rm ..` takes the checkout with it, and `lg rm --yes "$SLUG"` with SLUG
+    # unset empties runs/ and exits 0. It sits above the directory check, the
+    # Temporal check and the prompt, and --yes does not reach it.
+    if (ui.bad_param(slug)
+            # The three forms this takes and no others: `x`, `runs/x`, `runs/x/`
+            # (Path drops the trailing slash and a leading `./` for us).
+            # Normalising `a/b` or `/elsewhere/runs/b` down to `b` would delete a
+            # run the operator never named.
+            or Path(args.run_dir) not in (Path(slug), Path("runs") / slug)
+            # And the directory that names has to be a child of runs/ once every
+            # symlink in it is followed, which is what resolve() does: a
+            # `runs/evil` pointing at the home directory passes both checks above.
+            or (runs_dir / slug).resolve().parent != runs_dir.resolve()):
+        print(f"not a run name: {args.run_dir}", file=sys.stderr)
+        return 1
+
+    run = runs_dir / slug
+    if not run.is_dir():
+        # Archiving a row whose directory was never there is the dashboard's job.
+        # Here it is a typo far more often than anything else, and saying so is
+        # not worth a round trip to Temporal.
+        print(f"no run directory runs/{slug}", file=sys.stderr)
+        return 1
+
+    try:
+        client, workflows = await asyncio.wait_for(_run_workflows(slug), TEMPORAL_TIMEOUT)
+    except Exception:
+        # Every way this fails reads the same to the owner and has the same fix.
+        # A run mid-round has a worktree an executor is writing into, and a stack
+        # that cannot be asked cannot rule that out — guessing is the one thing a
+        # command with no undo may not do (AC-21).
+        print(f"cannot reach Temporal at {ADDRESS}; "
+              "lg rm cannot prove the run is not mid-round", file=sys.stderr)
+        return 1
+
+    # Open is the close time and never the ledger's `status`. An activity that
+    # escapes `run` leaves the workflow closed with its ledger frozen at the
+    # failure — reading `running`, sometimes still holding an `awaiting` — for
+    # ever, and those dead runs are exactly what this command is for. Temporal
+    # answering with no matching workflow at all is not a refusal either: that is
+    # the state a logs-only run, one driven by `lg round`, is always in.
+    still_open = [wf for wf in workflows if wf.close_time is None]
+    for wf in still_open:
+        try:
+            waiting = bool((await client.get_workflow_handle(wf.id).query("ledger"))
+                           .get("awaiting"))
+        except Exception:
+            # A query replays the whole history against the workflow code
+            # registered now, so one written by older code fails outright. The
+            # workflow is open either way, and that is all this line has to be
+            # right about.
+            waiting = False
+        if waiting:
+            print(f"refuse: {wf.id} is waiting on you — answer it: "
+                  f"lg approve {wf.id} <answer>", file=sys.stderr)
+        else:
+            print(f"refuse: {wf.id} is still running", file=sys.stderr)
+    if still_open:
+        return 1
+
+    wf_ids = [wf.id for wf in workflows]
+    try:
+        worktrees = sorted(p for p in (run / "worktrees").iterdir() if p.is_dir())
+    except OSError:  # a run that never reached a round, or one `discard` cleaned
+        worktrees = []
+    print(f"about to delete {run}")
+    for worktree in worktrees:
+        print(f"  worktree {worktree}")
+    for wf_id in wf_ids:
+        print(f"  archive {wf_id}")
+
+    if not args.yes:
+        # The slug back, not `y`: `y` is what a person types without reading, and
+        # this is the last thing standing between the argument and an rmtree.
+        try:
+            typed = input(f"type {slug} to delete, or anything else to stop: ")
+        except Exception:
+            # A read that gets no line at all is not the slug. `input()` raises
+            # EOFError from a pipe or `< /dev/null`, RuntimeError when fd 0 was
+            # closed before the process started (`lost sys.stdin`), ValueError
+            # when it closes under us. main() has no top-level handler, and a
+            # traceback is not an answer to a plain question — every other
+            # refusal in `lg` is one line and a 1.
+            typed = ""
+        if typed != slug:
+            print("stopped; nothing was touched", file=sys.stderr)
+            return 1
+
+    # Report lines do not stop what follows (AC-24): a registration that cannot
+    # be taken out from this machine cannot be taken out at all, and leaving the
+    # directory behind as well helps nobody.
+    for line in clean_worktrees(slug, str(runs_dir), _dotenv().get("LOOPGRAPH_PROJECTS_DIR")):
+        print(line, file=sys.stderr)
+    shutil.rmtree(run)
+
+    archived = 0
+    # Nothing to record means nothing is written: an empty write would create the
+    # file on a fresh checkout and reformat the owner's own for no reason.
+    if wf_ids:
+        try:
+            # Through mark_archived and never by opening the file here. It
+            # re-reads immediately before it writes, under its own lock, because
+            # the dashboard can be writing the same file on two threads while
+            # this runs in a process of its own.
+            ui.mark_archived(runs_dir, wf_ids, True)
+            archived = len(wf_ids)
+        except ui.ArchiveUnreadable:
+            # The directory and the worktrees are already gone and no exit code
+            # puts them back. Telling the owner the rows are still on the rail
+            # beats pretending the command failed.
+            print("runs/.archived.json is not a readable list; "
+                  "move it aside and archive by hand", file=sys.stderr)
+    print(f"removed runs/{slug}; archived {archived} workflow row(s)")
+    return 0
+
+
 async def cmd_ui(args: argparse.Namespace) -> int:
     import ui
     ui.serve(args.port)
@@ -1016,6 +1188,10 @@ def main() -> int:
     up = sub.add_parser("update",
                         help="move a clean main to the newest release and restart the stack")
     up.set_defaults(fn=cmd_update)
+    rm = sub.add_parser("rm", help="delete a run directory and archive its rows")
+    rm.add_argument("run_dir", help="the run to delete: my-run, runs/my-run or runs/my-run/")
+    rm.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    rm.set_defaults(fn=cmd_rm)
     u = sub.add_parser("ui", help="web dashboard → http://localhost:8400")
     u.add_argument("--port", type=int, default=8400)
     u.set_defaults(fn=cmd_ui)

@@ -77,6 +77,15 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   the same project keeps its worktree and goes on running, and no branch is deleted
   anywhere — the work is still there to look at. A worktree whose repository has
   moved off this machine is named in a line saying so, and stops nothing else.
+- `lg rm <run>` is the command that does it. It deletes the run directory — the logs,
+  both agents' transcripts, the gates, the throwaway worktrees — and takes that run's
+  rows off the dashboard's rail at the same time, so a finished run goes in one move
+  instead of being hidden now and cleared up later. It refuses while any workflow of
+  that run is still open, saying which one and whether it is running or waiting on
+  you, and it refuses while Temporal is down, because then it cannot tell. Otherwise
+  it prints what is about to go and asks you to type the run's name back before it
+  touches anything; `--yes` skips that question and nothing else. It will not delete
+  anything outside `runs/`, whatever you point it at. There is no undo.
 
 ## 0.2.0 - 2026-09-07
 

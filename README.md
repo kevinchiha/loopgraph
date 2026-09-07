@@ -404,11 +404,26 @@ lg start runs/example-hello /projects/loopgraph-example
 lg status runs/<slug>                                   # what the run is doing
 lg status <workflow-id> ledger                          # every step it took, raw
 lg approve <workflow-id> A
+lg rm runs/<slug>                                       # delete a finished run
+lg rm runs/<slug> --yes                                 # the same, without the prompt
 ```
 
 `lg start` exits non-zero only when the engine could not finish: `stopped`,
 `merge-failed` or `discard-failed`. Choosing B or C is your decision, not a
 failure, so it exits 0. That matters if you script it.
+
+`lg rm` is the only command that deletes anything. It removes the run directory —
+the logs, both agents' transcripts, the gates, the throwaway worktrees — and takes
+each of that run's worktrees out of the repository it was working on. Then it
+marks the run's workflows archived, so their rows leave the dashboard's rail too.
+Branches are left alone: a merged run's branch is the work. Nothing is removed
+from Temporal, so the history is still there in its UI.
+
+It refuses while any workflow of that run is still open, and says which one and
+whether it is running or waiting on you. It refuses when it cannot reach Temporal
+at all, because then it cannot prove the run is not mid-round. Otherwise it
+prints what it is about to delete and asks you to type the run's name back;
+`--yes` skips that prompt and nothing else. There is no undo.
 
 The skill itself is `skills/loopgraph/SKILL.md`. It is worth reading even if you
 never use it: it is the shortest description of how to drive this thing properly.
