@@ -342,6 +342,25 @@ function duration(ms) {
   return s >= 3600 ? `${Math.floor(s / 3600)}h ${two(Math.floor(s / 60) % 60)}m`
                    : `${Math.floor(s / 60)}m ${two(s % 60)}s`;
 }
+// A moment as the reader would say it while it is young — minutes under the hour,
+// hours under the day — and the date itself once it is neither. A run started this
+// morning read `05/09/2026, 09:14:22` before this, which is the same work to read
+// as a calendar and tells you nothing you came for.
+//
+// Floored, unlike duration above, which is rounded: this says the last whole unit
+// that has gone by and never one that has not, so a 90-minute-old run is `1h ago`
+// rather than `2h ago`, and one started 20 seconds ago is `0m ago`.
+//
+// A day and over keeps the absolute format it has always had. `31h ago` is a
+// number to do arithmetic on; the day it started is the thing worth knowing about
+// a run that old.
+function ago(start, now) {
+  const m = Math.floor((now - start) / 60000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return start.toLocaleString();
+}
 function buildRunRow(entry) {
   const div = document.createElement('div');
   div.className = 'run';
@@ -357,7 +376,22 @@ function buildRunRow(entry) {
   // The closure keeps the reply this row was first built from, and that is safe
   // because neither field it reads ever moves: the id is what the row is found by
   // from here on, and the server works the directory out from the id.
-  div.onclick = () => { sel = {id: entry.id, dir: entry.dir}; patchSelected(); buildBoard(sel.id); poll(); };
+  //
+  // The hash goes down here and nowhere else, so the address bar and the board
+  // are set by one act: reload, or paste the URL to someone else, and runs()
+  // opens this row again. Encoded, because the id is a workflow id or a run
+  // directory name and a directory name is whatever the owner typed — a raw
+  // space or `%` in a hash is a malformed URL, and what comes back out of it on
+  // the next load has to be the name again, character for character.
+  //
+  // Nothing listens for a hash change, on purpose: the hash is read on load and
+  // that is all. Back and forward moving the URL without moving the selection is
+  // the accepted cost of there being one path that sets `sel`.
+  div.onclick = () => {
+    sel = {id: entry.id, dir: entry.dir};
+    location.hash = encodeURIComponent(entry.id);
+    patchSelected(); buildBoard(sel.id); poll();
+  };
   return div;
 }
 function patchRunRow(row, entry) {
@@ -378,9 +412,20 @@ function patchRunRow(row, entry) {
   // all rather than a wrong one. The two live in separate elements because only
   // one of them moves — the duration of a running run counts up on every poll,
   // and a reader with the row's directory selected must not lose it to that.
+  // One clock for the row, so how long ago it started and how long it has run are
+  // the same instant read twice rather than two Dates a line apart.
+  const now = new Date();
   const start = entry.start_time ? new Date(entry.start_time) : null;
-  const end = entry.close_time ? new Date(entry.close_time) : new Date();
-  setText(when.firstElementChild, start ? start.toLocaleString() : '');
+  const end = entry.close_time ? new Date(entry.close_time) : now;
+  setText(when.firstElementChild, start ? ago(start, now) : '');
+  // The absolute timestamp rides along in both of ago's forms: `2h ago` is the
+  // reading a glance wants and the one thing it cannot say is which two hours.
+  //
+  // Assigned straight, where every word in this row goes through setText. A title
+  // is an attribute and not a text node: writing it makes no node for a reader's
+  // selection to be lost with, which is the whole of what setText is guarding, so
+  // there is nothing here for it to save.
+  when.firstElementChild.title = start ? start.toLocaleString() : '';
   setText(when.lastElementChild, start ? ' · ' + duration(end - start) : '');
 }
 // The highlight moves here rather than by refetching /api/runs, which is what it
@@ -1100,13 +1145,42 @@ async function runs() {
     // holding on some browser and leave the icon rewritten every 4 seconds.
     const icon = n ? FAV_WAIT : FAV_IDLE;
     if (fav.getAttribute('href') !== icon) fav.setAttribute('href', icon);
-    // Nothing chosen yet: take the first row the way the reader would. Through
-    // the row's own handler, so there is one path that sets `sel`, builds the
-    // board and starts its poll — a second copy of it here would be a poll
-    // function calling buildBoard, which is the redraw AC-14 forbids, and a
-    // board that was never built has no sections for a patch to fill.
-    const first = document.getElementById('runs').firstElementChild;
-    if (!sel && first) first.click();
+    // The hash the reader arrived with, decoded, or nothing.
+    //
+    // A try of its own, holding this one line. decodeURIComponent throws on `#%`
+    // — a hash anyone can type and any link can arrive mangled — and everything
+    // here is already inside one try whose catch says `server error`. Left to it,
+    // a junk hash skips the only line below that ever selects a run and blames
+    // the server for a server that answered, every 4 seconds, for as long as the
+    // hash stays. A hash that does not decode reads as no hash instead.
+    let want = '';
+    try { want = decodeURIComponent(location.hash.slice(1)); } catch(e) { want = ''; }
+    // Nothing chosen yet: open the run the hash names, and failing that the first
+    // row the reader can see. Through the row's own handler, so there is one path
+    // that sets `sel`, builds the board and starts its poll — a second copy of it
+    // here would be a poll function calling buildBoard, which is the redraw AC-14
+    // forbids, and a board that was never built has no sections for a patch to
+    // fill.
+    //
+    // Found in the list rather than by selector, for patchRuns' reason: an id is
+    // a workflow id or a directory name, and a directory name is not ours to
+    // paste into CSS. The hash's row is taken archived or not, so a link to an
+    // archived run still opens it. The fallback skips the archived, because
+    // archiving the newest finished run is the ordinary case: row zero is then a
+    // row nobody can see, and the page would open on the one run the reader
+    // deliberately took off the rail with `.sel` on a hidden row. A row the
+    // server never marked is not archived, so `!== '1'` is the right reading
+    // before anything writes that stamp as well as after.
+    //
+    // The row is worked out here and not inside the `if`, because the guard's
+    // shape is pinned by test: an `if` with no call in its condition, and a bare
+    // name in front of `.click()`. What it is for is the `!sel` — without it the
+    // click fires on every poll, the board is built again and the reader's
+    // selection and every log pane they had open go with it.
+    const shown = [...document.getElementById('runs').children];
+    const target = shown.find(r => r.dataset.id === want)
+                || shown.find(r => r.dataset.archived !== '1');
+    if (!sel && target) target.click();
     setText(hdr, d.temporal ? 'engine dashboard' : 'temporal unreachable — logs only');
     // Read off the reply the rows came from, so the release and the runs on
     // screen are never one poll apart. A checkout with no tag still gets a word:

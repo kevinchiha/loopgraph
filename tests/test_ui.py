@@ -903,6 +903,26 @@ def test_the_injected_pattern_survives_javascript():
 #     `engine dashboard` still untouched next to it. `lg update` is the command
 #     the reader is meant to type, so it is the one word here that has to survive
 #     being read at a glance.
+#
+# 13. Click a run in the rail, then look at the address bar and reload.
+#     See: the run's id after the `#`, and the same run selected after the reload,
+#     with its board built. Paste that URL into a second tab and it opens there
+#     too. Then replace the hash with `#%` — a hash that cannot be decoded — and
+#     reload, and do it again with `#no-such-run`.
+#     See, both times: the top run selected as if there were no hash at all, the
+#     header still reading `engine dashboard`, and no `server error`. Watch it for
+#     another 10 seconds: `server error` appearing on the third poll is the decode
+#     throwing inside the poll's own try, which is the failure this is here for.
+#     Nothing in the page listens for a hash change, so pressing Back moves the
+#     URL and leaves the selection where it is. That is the accepted cost, not a
+#     bug to report.
+#
+# 14. Read the times in the rail on a run started today and one started last week.
+#     See: `14m ago` or `3h ago` on the young one, and the full date on the old
+#     one, in the same dim 11px as before with the duration still beside it. Hover
+#     either and the full local timestamp comes up as a tooltip.
+#     A run started seconds ago reads `0m ago`, which is right — it is the last
+#     whole minute that has passed, not a rounding mistake.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
@@ -1448,6 +1468,231 @@ def test_the_run_list_is_patched_and_never_rebuilt():
     runs_fn = function_source(ui.page_html(), "runs")
     assert "patchRuns(" in runs_fn, "the poll does not go through the patch"
     assert "buildRunRow" not in runs_fn, "the poll builds rows itself"
+
+
+# ---------- the hash, and how young a time is ----------
+
+
+def block_at(src, i):
+    """The `{ … }` starting at the first brace at or after `i`, and where it ends.
+
+    The brace counting `closures` does, out here where a test about one particular
+    block can share it. Enough for a page with no unbalanced brace inside a string.
+    """
+    opening = src.index("{", i)
+    depth = 0
+    for j in range(opening, len(src)):
+        depth += (src[j] == "{") - (src[j] == "}")
+        if depth == 0:
+            return src[opening:j + 1], j + 1
+    raise AssertionError("a block in the page is never closed")
+
+
+def try_blocks(src):
+    """Every `try { … } catch … { … }` in `src`, as (body, handler).
+
+    A `try` reads as one word; which throw lands in which catch does not, and
+    nesting is the whole question here — the poll's own try is around everything,
+    so `decodeURIComponent` is inside it either way and finding the word `try`
+    above the decode proves nothing. The braces are counted instead, so a test can
+    ask what else is inside the block that catches a failure.
+    """
+    out = []
+    for m in re.finditer(r"\btry\s*\{", src):
+        body, after = block_at(src, m.start())
+        assert re.match(r"\s*catch\s*(?:\([^)]*\))?\s*\{", src[after:]), \
+            "a `try` in the page has no catch of its own"
+        out.append((body, block_at(src, after)[0]))
+    return out
+
+
+def test_a_click_writes_the_row_id_to_the_hash():
+    """AC-13. Clicking a run puts its id in the URL, so reloading the page or
+    pasting the URL to someone else lands on the same run.
+
+    Written by the one handler that also sets `sel`, so the address bar and the
+    board cannot come apart, and off the same entry: the id is the workflow id, or
+    the directory name on a run known only from its log files.
+
+    Encoded, because that directory name is whatever the owner typed. A raw space
+    or `%` in a hash is a malformed URL, and what comes back out of it on the next
+    load has to be the name again, character for character.
+    """
+    build = function_source(ui.page_html(), "buildRunRow")
+    write = re.search(r"location\.hash = encodeURIComponent\((\w+)\.id\)", build)
+    assert write, "a click writes no hash, or writes an id that was never encoded"
+    picked = re.search(r"sel = \{id: (\w+)\.id", build)
+    assert picked and picked.group(1) == write.group(1), \
+        "the hash is written off something other than the entry the click selects"
+
+
+def test_the_load_selection_prefers_the_hash_and_keeps_the_guard():
+    """AC-13's other half. On load the page opens the run the hash names, archived
+    or not — a deep link to an archived run keeps working — and when the hash names
+    no run in the list, or there is no hash, the first row the reader can see.
+
+    Not `firstElementChild`. Archiving the newest finished run is the ordinary
+    case and what `lg rm` produces, and row zero is then a `display:none` row: the
+    page would open every time on the one run the reader deliberately took off the
+    rail, with `.sel` on something nobody can see. The stamp arrives with the
+    archived toggle; until then no row carries it and this reads as today's first
+    row, which is also the right reading afterwards — a row the server never marked
+    is not an archived run.
+
+    The row is worked out into a local before the guard because the guard's shape
+    is pinned and narrowly: test_the_first_run_is_clicked_only_when_nothing_is_
+    chosen_yet matches `if (<no closing paren>) <bare name>.click();`, so the
+    lookup cannot be written inline in either half of it. What that guard is for is
+    the `!sel`: without it the click fires on every 4-second poll and takes the
+    reader's board down with it.
+    """
+    src = function_source(ui.page_html(), "runs")
+    assert src.count(".click()") == 1, \
+        "a run is selected in more than one place, so `sel` is set down more than one path"
+    guard = re.search(r"if\s*\(([^)]*)\)\s*(\w+)\.click\(\);", src)
+    assert guard, "the row is clicked with no `if` in front of it, or not through a bare local"
+    cond, held = guard.groups()
+    assert re.search(r"!\s*sel\b", cond), "nothing stops the click firing again on every poll"
+    assert re.search(rf"\b{held}\b", cond), \
+        "the guard never asks whether there is a row to click at all"
+
+    chosen = re.search(rf"const {held} = ([^;]+);", src)
+    assert chosen, f"`{held}` is clicked without being worked out into a local first"
+    halves = [h.strip() for h in " ".join(chosen.group(1).split()).split("||")]
+    assert len(halves) == 2, \
+        f"the row is not `the one the hash names, or else the first one showing`: {halves}"
+
+    listed = re.search(r"const (\w+) = \[\.\.\.document\.getElementById\('runs'\)\.children\]", src)
+    assert listed, "the rows are not taken off the rail"
+    rail = listed.group(1)
+
+    # Found in the list and not by selector, for patchRuns' reason: an id is a
+    # workflow id or a directory name, and a directory name is not ours to paste
+    # into CSS.
+    by_hash = re.fullmatch(rf"{rail}\.find\((\w+) => \1\.dataset\.id === (\w+)\)", halves[0])
+    assert by_hash, f"the first choice is not the row whose id the hash names: `{halves[0]}`"
+    assert re.search(rf"{by_hash.group(2)} = decodeURIComponent\(location\.hash", src), \
+        "the rows are matched against something other than the decoded hash"
+
+    fallback = re.fullmatch(rf"{rail}\.find\((\w+) => \1\.dataset\.archived !== '1'\)", halves[1])
+    assert fallback, \
+        f"the fallback is not the first row that carries no archived stamp: `{halves[1]}`"
+    assert "firstElementChild" not in src, \
+        "the fallback is the rail's first row, archived or not"
+
+
+def test_a_junk_hash_reads_as_no_hash():
+    """AC-13's failure case, which costs the whole page if it is left to the outer
+    catch.
+
+    `runs()` is one try around the fetch, patchRuns, the selection and the header
+    writes, with a single catch that writes `server error`. decodeURIComponent
+    throws on `#%` — a hash anyone can type and any link can arrive mangled — so an
+    unguarded decode skips the only line that ever selects a run, blames the server
+    for it, and does it again every 4 seconds for as long as the hash stays. The
+    reader gets `server error` on a server that answered every request.
+
+    So the decode has a try of its own, holding nothing else, and a hash that does
+    not decode reads as no hash.
+    """
+    src = function_source(ui.page_html(), "runs")
+    assert "decodeURIComponent(" in src, "the hash is read without being decoded"
+    caught = [(body, handler) for body, handler in try_blocks(src) if "decodeURIComponent(" in body]
+    assert caught, "the decode sits inside no try at all"
+    narrow = [(body, handler) for body, handler in caught
+              if "fetch(" not in body and "patchRuns(" not in body and ".click()" not in body]
+    assert narrow, \
+        "the decode is caught no nearer than the poll's own try, so a junk hash costs the poll"
+    for body, handler in narrow:
+        assert "server error" not in handler, \
+            "a hash that does not decode makes the page blame the server"
+    held = re.search(r"(\w+) = decodeURIComponent\(", narrow[0][0])
+    assert held, "the decoded hash is not held anywhere"
+    assert re.search(rf"let {held.group(1)} = '';", src), \
+        "the decoded hash does not start out empty, so a throw leaves it holding nothing readable"
+
+
+AGO_BRANCH = re.compile(r"if \(\s*(\w+)\s*(<=?)\s*(\d+)\s*\)\s*return `\$\{(\w+)\}(\w+) ago`;")
+
+
+def ago_branches(src):
+    """Per unit word, the (tested name, operator, bound, printed name) of its line."""
+    return {m.group(5): (m.group(1), m.group(2), int(m.group(3)), m.group(4))
+            for m in AGO_BRANCH.finditer(src)}
+
+
+def test_ago_reads_minutes_hours_then_absolute():
+    """AC-14. Under an hour a run's start time reads in minutes, under a day in
+    hours, and older than that it keeps the absolute date it has always shown.
+
+    Pinned off the source, because nothing in this repository can execute
+    JavaScript: `35m ago` and `2h ago` are AC-14's illustrations of what the reader
+    sees, the numbers in them are computed, and neither string exists anywhere to
+    grep for. What is checked instead is what builds them — which value each line
+    prints, what that value was floored from, and where each branch stops. Those
+    are the three places this goes wrong quietly. `<=` at 60 makes an hour-old run
+    read `60m ago`; the two names swapped makes a 90-minute run read `90h ago`; the
+    difference taken the other way round makes every run on the rail read `-1m
+    ago`; and an unfloored one reads `2.5166h ago`.
+    """
+    src = function_source(ui.page_html(), "ago")
+    params = re.match(r"function ago\((\w+), (\w+)\)", src.strip())
+    assert params, "ago no longer takes a start and a now"
+    start, now = params.groups()
+
+    def floored(name):
+        m = re.search(rf"const {name} = Math\.floor\(([^;]+)\);", src)
+        assert m, f"`{name}` is not floored, so it reads with a decimal point in it"
+        return " ".join(m.group(1).split())
+
+    branches = ago_branches(src)
+    assert set(branches) == {"m", "h"}, \
+        f"the relative forms are not `<n>m ago` and `<n>h ago`: {sorted(branches)}"
+
+    tested, op, bound, printed = branches["m"]
+    assert printed == tested, "the minutes line prints a value other than the one it tested"
+    assert (op, bound) == ("<", 60), \
+        f"the minutes branch runs to `{op} {bound}`, so an hour old does not read in hours"
+    mins = floored(tested)
+    assert re.search(rf"\b{now}\s*-\s*{start}\b", mins), \
+        "the minutes are not how long it is since the start"
+    assert "60000" in mins or ("1000" in mins and "60" in mins), "the minutes are not minutes"
+
+    tested_h, op_h, bound_h, printed_h = branches["h"]
+    assert printed_h == tested_h, "the hours line prints a value other than the one it tested"
+    assert (op_h, bound_h) == ("<", 24), \
+        f"the hours branch runs to `{op_h} {bound_h}`, so a day old never reaches its date"
+    hours = floored(tested_h)
+    assert re.search(rf"\b{tested}\s*/\s*60\b", hours) or "3600000" in hours, \
+        "the hours are not the minutes over 60"
+
+    assert src.strip().rstrip("}").strip().endswith(f"return {start}.toLocaleString();"), \
+        "a run older than a day does not fall through to the date it has always shown"
+
+
+def test_a_shown_time_carries_its_absolute_form_in_title():
+    """AC-14's last line. `2h ago` is the reading a glance wants and the one thing
+    it cannot tell you is which 2 hours, so the full timestamp rides along in the
+    `title` — on both forms, since hovering a date to be told the date is no worse
+    than hovering it for nothing.
+
+    Off the start, never off the clock: a title built from `now` would say the same
+    thing on every row on the rail and be wrong about all of them.
+
+    A title is not text, so setText does not cover it and it is written straight.
+    That is allowed here where `.textContent =` is not: assigning it makes no text
+    node, takes no selection down with it, and the string is the same one four
+    seconds later anyway.
+    """
+    row = function_source(ui.page_html(), "patchRunRow")
+    shown = re.search(r"setText\((\w+)\.firstElementChild, (\w+) \? ago\(\2, (\w+)\) : ''\)", row)
+    assert shown, "the start time is not written as a relative `ago` off the run's own start"
+    when, start, now = shown.groups()
+    assert re.search(rf"const {now} = new Date\(\)", row), \
+        "`ago` is told a now that is not the clock"
+    assert re.search(rf"{when}\.firstElementChild\.title = {start} \? {start}\.toLocaleString\(\) : ''",
+                     row), \
+        "the shown time carries no absolute form, or one built from something other than the start"
 
 
 # ---------- the tab: title and favicon ----------

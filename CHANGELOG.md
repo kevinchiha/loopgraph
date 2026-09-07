@@ -38,6 +38,12 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 - Opening one of a round's two log panes gives it the room the closed one is not
   using — about 930px of a 1440px window instead of 516. Open both and they go back
   to sharing the row.
+- A run has an address. Clicking one puts its id in the URL, so reloading the page
+  comes back to the run you were reading instead of the top of the rail, and the URL
+  is something you can bookmark or send to someone else. A hash naming a run that is
+  not there, or one that is not a valid URL at all, opens the top run as before.
+- Times in the rail read as `14m ago` and `3h ago` for the first day, and go back to
+  the date after that. Hover one for the full timestamp, whichever way it is showing.
 
 ## 0.2.0 - 2026-09-07
 
