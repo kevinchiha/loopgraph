@@ -42,6 +42,12 @@ you ask, because it decides where they put future projects.
 Tell them why it matters, in one line: a single run can spend three executor
 rounds plus an audit pass, so per-token billing adds up faster than they expect.
 
+Ask which models their proxy actually serves, and take the answer as it comes.
+Anything CLIProxyAPI can put behind an Anthropic-shaped endpoint will drive the
+engine, so a ChatGPT or Gemini subscription is a fine answer and not a reason to
+send them shopping for a Claude one. Note it if they have no Claude models at
+all, because section 3 has one setting for that case.
+
 **A Telegram bot.** This one is required, and the install will stop without it.
 Say why rather than just demanding it: runs stop and ask questions, and the engine
 refuses to start without a way to reach them, because a run nobody is told about
@@ -78,6 +84,14 @@ PATH. Give them the exact line for their shell rc, and use the full path meanwhi
 **A projects directory that doesn't cover what they care about.** If they later
 ask for a run against a repo outside the mounted tree, it cannot work. Say so and
 stop. Do not improvise a mount.
+
+**A run failing on a model id nobody chose.** The CLI keeps a second, cheaper
+model for chores that are not the work itself, and with nothing configured it
+falls back to a Haiku id, which a proxy holding no Claude accounts cannot answer.
+Add `ANTHROPIC_DEFAULT_HAIKU_MODEL` to `.env`, pointing at any cheap model their
+proxy does serve, and restart the worker. Headless runs ask for `ANTHROPIC_MODEL`
+and nothing else, so most installs never see this. Do not set it pre-emptively
+and do not stall an install over it.
 
 **The worker not coming up.** Read `<docker> compose logs worker`. The most common
 cause is missing Telegram credentials, which stops the worker at startup on

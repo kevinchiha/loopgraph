@@ -6,6 +6,10 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- Documented `ANTHROPIC_DEFAULT_HAIKU_MODEL` for people whose proxy serves no
+  Claude models. Nothing in the engine changed; headless runs only ever ask for
+  `ANTHROPIC_MODEL`, so this is the escape hatch if one ever asks for more.
+
 ## 0.2.0 - 2026-09-07
 
 - Sweep runs: a `run.yaml` with detectors makes the engine remove what they report,
