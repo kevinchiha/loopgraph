@@ -2489,7 +2489,13 @@ def test_the_board_builds_a_strip_before_the_state():
     # that must not turn red — what patchStrip depends on is which children there
     # are and what order THEY are in.
     def classed(attrs):
-        found = re.search(r'class="([\w-]+)"', attrs)
+        # Anchored on the space in front of the attribute, not on where in the tag
+        # it sits: unanchored it finds `class="archbtn"` inside
+        # `data-archived-class="archbtn"` and reports a class the tag does not have.
+        # Nobody writes that by accident, but the button it describes has no class
+        # at all — so both querySelector('.archbtn') calls answer null, buildBoard
+        # throws on the first selection and the board never appears again.
+        found = re.search(r'(?:^|\s)class="([\w-]+)"', attrs)
         return found.group(1) if found else ""
 
     children = [(tag, classed(attrs))
