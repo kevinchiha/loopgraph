@@ -72,6 +72,11 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   come back this time. The second now says `ledger did not answer this poll; the run
   is still there` and keeps its status, instead of denying the run named right above
   it.
+- Taking a run away now unhooks its worktrees from your project repositories one at a
+  time, each named by the exact path its repository wrote down. A second run working
+  the same project keeps its worktree and goes on running, and no branch is deleted
+  anywhere — the work is still there to look at. A worktree whose repository has
+  moved off this machine is named in a line saying so, and stops nothing else.
 
 ## 0.2.0 - 2026-09-07
 

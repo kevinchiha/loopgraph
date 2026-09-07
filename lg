@@ -44,6 +44,11 @@ FETCH_TIMEOUT = 60.0
 STACK_TIMEOUT = 1800.0
 # Each captured compose read: the `ps` and one log poll.
 POLL_TIMEOUT = 60.0
+# Each git command `lg rm` runs against a target repository. Both only touch that
+# repository's own records — no network, no checkout — so a minute is already
+# generous; it is here so a repository on a filesystem that stopped answering
+# reaches the report as a failed line instead of holding the command open.
+WORKTREE_TIMEOUT = 60.0
 # The wait between log polls, named so a test can make it a no-op. Sixty tries
 # two seconds apart is the two minutes a restarted stack gets to say it is up.
 _sleep = asyncio.sleep
@@ -826,6 +831,127 @@ async def cmd_update(args: argparse.Namespace) -> int:
         return 2
 
     return await _restart_stack(root, docker, action, tag)
+
+
+def _registered_worktrees(listing: str) -> list[str]:
+    """Every path a repository has registered, as `git worktree list` printed it.
+
+    One `worktree <path>` line per registration, and `<path>` is the string git
+    itself recorded — not a path on this machine. A run the engine made
+    registered its container path, `/app/runs/<slug>/worktrees/<token>`, because
+    `git worktree add` ran inside the container.
+    """
+    return [line[len("worktree "):] for line in listing.splitlines()
+            if line.startswith("worktree ")]
+
+
+def clean_worktrees(slug: str, runs_dir: str, projects_dir: str | None) -> list[str]:
+    """De-register each worktree under runs/<slug>/worktrees/ from its repository.
+
+    Returns one line per worktree it could NOT de-register; empty list means all
+    clean. It deletes nothing itself: the run directory is the caller's to remove.
+
+    Every registration is named one at a time, by the path the repository
+    recorded for it, and NOTHING here prunes. Measured on git 2.39.5 against a
+    repository holding two runs' worktrees, both registered under container paths
+    the way the engine writes them:
+
+      - `worktree remove --force <host path>` exits 128, `is not a working tree`.
+        Git matches on the path it recorded and no host path equals it, so the
+        host path is never the argument.
+      - `worktree prune` exits 0 having removed EVERY loopgraph registration in
+        that repository, the run that is live right now included, leaving no
+        .git/worktrees directory at all. `-c gc.worktreePruneExpire=never` changed
+        nothing — a bare prune never consults that setting — and afterwards the
+        live run's next git command dies with `fatal: not a git repository`, which
+        `worktree repair` cannot undo from the host. Tidying a finished run off
+        the rail while its replacement works the same project is the ordinary use
+        of `lg rm`, so this is the everyday case, not an exotic race.
+      - `worktree remove --force <the recorded container path>` exits 0, takes
+        that one registration out, and leaves the other run's records and both
+        branches alone. That is the mechanism.
+      - The same command a second time exits 128. That is why the repository is
+        asked what it has registered first: without that, every `lg rm` over an
+        already-de-registered worktree would file a failure line for work that is
+        done.
+
+    `activities/checkpoint.py`'s `discard` keeps its own remove-then-prune and its
+    branch delete. It runs inside the container, where every recorded path exists
+    and nothing looks stale, and the owner refusing a run is a different act from
+    tidying up after one. Neither rule travels to the other.
+    """
+    # Both imported here rather than at the top of the file, the way cmd_ui
+    # imports ui and cmd_prompt imports Path: `lg` is one process per command,
+    # and a module-top import would charge every `lg status` the dashboard's.
+    from pathlib import Path
+    import ui
+
+    runs = Path(runs_dir)
+    worktrees = runs / slug / "worktrees"
+    try:
+        names = sorted(entry.name for entry in worktrees.iterdir() if entry.is_dir())
+    except OSError:
+        # No worktrees directory: a run that never reached an executor round, or
+        # one a `discard` already cleaned out. Nothing to de-register and nothing
+        # to report — this is the state the caller is trying to reach.
+        return []
+
+    report: list[str] = []
+    # The listing is per repository, not per worktree: a run with several
+    # worktrees in one repository asks it once, and a repository that will not
+    # answer is asked once and reported against each of its worktrees. The value
+    # is (what it has registered, why it could not be asked) — one of the two is
+    # always empty.
+    listings: dict[Path, tuple[list[str], str]] = {}
+
+    for name in names:
+        # The container path is what the resolver takes, and reusing it buys the
+        # pointer-file parsing, the /projects/ prefix swap and every failure line
+        # ui.resolve_repo already gets right.
+        in_container = f"{ui.CONTAINER_RUNS}{slug}/worktrees/{name}"
+        repo, why = ui.resolve_repo(in_container, runs, projects_dir)
+        if repo is None:
+            # The repository moved, .env is missing, the pointer file is gone.
+            # Nothing can be de-registered from a repository this machine cannot
+            # find, and the next worktree may well be in one it can.
+            report.append(why)
+            continue
+
+        if repo not in listings:
+            listed = _run(["git", "worktree", "list", "--porcelain"], str(repo),
+                          timeout=WORKTREE_TIMEOUT)
+            if listed.returncode == 0:
+                listings[repo] = (_registered_worktrees(listed.stdout), "")
+            else:
+                listings[repo] = ([], _said(listed.stderr) or f"exit {listed.returncode}")
+        registered, refused = listings[repo]
+        if refused:
+            report.append(f"{name}: could not list the worktrees of {repo}: {refused}")
+            continue
+
+        # Two exact candidates and no suffix match: the container path a run made
+        # inside the container registered, and the host directory a worktree made
+        # on this machine would have. Matching on a suffix would let one run's
+        # token claim a registration that merely ends the same way.
+        candidates = (in_container, str(worktrees / name))
+        recorded = next((path for path in registered if path in candidates), None)
+        if recorded is None:
+            # The repository has no registration for it, so it is already out of
+            # that repository. No command runs and nothing is reported: a line
+            # crying failure over work that is done is the same lie the other way.
+            continue
+
+        # Named by the path git listed, never by the path this machine sees.
+        # Removing it also deletes the directory at that path if there is one: on
+        # the host `/app/runs/...` is not there, so the worktree directory
+        # survives for the caller to delete, and in the host-registered case git
+        # deletes the same directory the caller would have. Neither is a failure.
+        removed = _run(["git", "worktree", "remove", "--force", recorded], str(repo),
+                       timeout=WORKTREE_TIMEOUT)
+        if removed.returncode != 0:
+            reason = _said(removed.stderr) or f"exit {removed.returncode}"
+            report.append(f"{name}: {reason}")
+    return report
 
 
 async def cmd_ui(args: argparse.Namespace) -> int:
