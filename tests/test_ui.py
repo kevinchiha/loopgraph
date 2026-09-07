@@ -2429,6 +2429,56 @@ def card_word_elements(html):
     return src, kids.group(2), spans.group(1)
 
 
+def concat_value(expr, holes):
+    """The string a `'a' + b` expression builds, given a value for every name in it.
+
+    String literals joined with `+`, which is the whole of what this page
+    concatenates onto a class. A piece this cannot read is a failure rather than a
+    guess: a rewrite in some other shape stops the test that asked instead of
+    quietly passing it.
+    """
+    out = ""
+    for piece in expr.split("+"):
+        piece = piece.strip()
+        if len(piece) > 1 and piece[0] == piece[-1] == "'":
+            out += piece[1:-1]
+        else:
+            assert piece in holes, \
+                f"`{piece}` is neither a string literal nor a value this test can supply"
+            out += holes[piece]
+    return out
+
+
+def tone_values(src, tone):
+    """What `tone` holds for a verdict the map answers for, and for one it does not.
+
+    Both branches are worked out rather than matched, because the one character
+    that matters here can correctly live in either half of the concatenation:
+    `'verdict' + ' good'` and `'verdict ' + 'good'` are the same two classes. A
+    test that matched the source would pin whichever half the page picked; a test
+    that matched neither lets the space go missing altogether, and that is the
+    expensive one. `class="verdictgood"` matches no rule in this stylesheet, so a
+    recognised verdict loses the colour, the monospace and the margin and renders
+    as body text, while an unrecognised one — the single case AC-11 says should
+    read neutral — keeps all three. AC-11 inverted, one character, suite green.
+    """
+    m = re.search(rf"const {tone} = [^;]*?\?([^;]+):([^;]+);", src)
+    assert m, f"`{tone}` is not `the map's answer, or nothing`, so its two cases cannot be read"
+    hole = "<the map's answer>"
+    truthy = re.sub(r"VERDICT_CLASS\[\w+\]", hole, m.group(1))
+    return concat_value(truthy, {hole: "good"}), concat_value(m.group(2), {})
+
+
+def class_assigned(src, element, tone, value):
+    """The class string `element` is handed when `tone` holds `value`.
+
+    What the browser receives, built from the source rather than looked for in it.
+    """
+    m = re.search(rf"{element}\.className = ([^;]+);", src)
+    assert m, f"{element} is never given a class of its own"
+    return concat_value(m.group(1), {tone: value})
+
+
 def test_the_verdict_colour_map_lives_outside_roundVerdict():
     """AC-11. The word is coloured by what it means, out of a lookup table rather
     than a branch inside roundVerdict.
@@ -2470,10 +2520,17 @@ def test_the_verdict_colour_map_lives_outside_roundVerdict():
     word = re.search(r"const (\w+) = roundVerdict\(", src)
     assert word and held.group(2) == word.group(1), \
         "the map is keyed on something other than the word the card is about to print"
-    assert re.search(rf"{line}\.className = 'verdict' \+ {held.group(1)};", src), \
-        "the open card's verdict line is not given the class the map handed back"
-    assert re.search(rf"{span}\.className = 's-verdict' \+ {held.group(1)};", src), \
-        "the closed card's summary word is not given the class the map handed back"
+    # The class string each element is handed, worked out and not matched. Both
+    # copies of the word have to come out as the base class AND the map's answer,
+    # two classes with a space between them — which is what makes the stylesheet's
+    # `.round .verdict.good` match at all.
+    mapped, _ = tone_values(src, held.group(1))
+    for el, base in ((line, "verdict"), (span, "s-verdict")):
+        got = class_assigned(src, el, held.group(1), mapped)
+        assert got.split() == [base, "good"], \
+            (f'a round the map answers for leaves {el} with class="{got}", not `{base}` and '
+             f"the map's own class as two. A run-together `{base}good` matches no rule in the "
+             "stylesheet, so the word the page recognises is the one that loses its colour")
 
 
 def test_an_unknown_verdict_keeps_its_text_and_the_neutral_colour():
@@ -2495,12 +2552,16 @@ def test_an_unknown_verdict_keeps_its_text_and_the_neutral_colour():
     """
     html = ui.page_html()
     src, line, span = card_word_elements(html)
-    held = re.search(r"const (\w+) = ([^;]*VERDICT_CLASS\[\w+\][^;]*);", src)
+    held = re.search(r"const (\w+) = [^;]*VERDICT_CLASS\[\w+\]", src)
     assert held, "patchRoundCard never asks the map what colour the word carries"
-    expr = " ".join(held.group(2).split())
-    assert expr.endswith(": ''") or expr.endswith("|| ''"), \
-        (f"`{expr}` hands back something other than nothing at all for a word it has never "
-         "met, so an unmapped verdict takes a class the stylesheet never defined")
+    # The class string an unmapped word leaves behind: the base class on its own,
+    # so the element keeps the styling written for a word with no meaning attached.
+    _, unmapped = tone_values(src, held.group(1))
+    for el, base in ((line, "verdict"), (span, "s-verdict")):
+        got = class_assigned(src, el, held.group(1), unmapped)
+        assert got.split() == [base], \
+            (f'a verdict this page has never met leaves {el} with class="{got}" rather than '
+             f"`{base}` on its own, so it is dressed as one of the words the page does know")
     word = re.search(r"const (\w+) = roundVerdict\(", src)
     assert word, "the card no longer asks roundVerdict what the round decided"
     for el in (line, span):
