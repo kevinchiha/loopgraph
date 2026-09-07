@@ -1112,7 +1112,18 @@ async def cmd_rm(args: argparse.Namespace) -> int:
     # directory behind as well helps nobody.
     for line in clean_worktrees(slug, str(runs_dir), _dotenv().get("LOOPGRAPH_PROJECTS_DIR")):
         print(line, file=sys.stderr)
-    shutil.rmtree(run)
+    try:
+        shutil.rmtree(run)
+    except OSError as e:
+        # A read-only runs/, a file another process is holding, a filesystem that
+        # stopped answering. rmtree deletes what it can and raises, so what is
+        # left is a part of the run, and the rows stay on the rail deliberately:
+        # a row nobody can see over logs still sitting on disk is worse than a
+        # run that is simply still there. Never `ignore_errors=True` — that turns
+        # this into `removed runs/<slug>` printed over a directory that is not
+        # gone, which is the one thing this command may not say.
+        print(f"could not delete runs/{slug}: {_first_line(e)}", file=sys.stderr)
+        return 1
 
     archived = 0
     # Nothing to record means nothing is written: an empty write would create the

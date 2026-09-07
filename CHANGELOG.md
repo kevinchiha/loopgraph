@@ -85,7 +85,10 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   you, and it refuses while Temporal is down, because then it cannot tell. Otherwise
   it prints what is about to go and asks you to type the run's name back before it
   touches anything; `--yes` skips that question and nothing else. It will not delete
-  anything outside `runs/`, whatever you point it at. There is no undo.
+  anything outside `runs/`, whatever you point it at. And if the directory will not
+  delete — a read-only disk, a file something else has open — it says so and leaves
+  the run on the dashboard, instead of reporting a removal that did not happen.
+  There is no undo.
 
 ## 0.2.0 - 2026-09-07
 

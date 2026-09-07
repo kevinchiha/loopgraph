@@ -512,6 +512,14 @@ def test_a_remove_that_fails_is_one_line_and_the_next_worktree_still_runs(lg, wo
 
 CLOSED = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
 
+# The visibility query every run of the engine is listed by, and the one string
+# that must reach Temporal. A query naming any other workflow type matches
+# nothing on a real server, so `lg rm` would find no workflow for a run that has
+# one — and a run with no workflow is deliberately not a refusal, so an open run
+# would be deleted, its worktrees de-registered and `archived 0` reported over
+# the top of it. tests/test_lg_status.py pins the same string for `lg status`.
+LOOPGRAPH_RUNS = 'WorkflowType = "LoopGraphRun"'
+
 
 class Workflows:
     """A Temporal holding LoopGraphRun rows, and what each answers to `ledger`.
@@ -520,6 +528,11 @@ class Workflows:
     that makes a workflow open — never the ledger, whose `status` reads `running`
     for ever on a run whose engine died. `ledgers` maps an id to the ledger it
     answers with, or to the exception the query raises.
+
+    The listing honours its query the way a server does: ask for a workflow type
+    nothing here is, and nothing comes back. Recording the query is not enough on
+    its own — every assertion about a refusal would still pass while the command
+    quietly saw an empty machine.
     """
 
     def __init__(self, rows=(), ledgers=None, stall=0):
@@ -539,7 +552,7 @@ class Workflows:
             # real one goes: nothing is sent until the listing is iterated.
             if feed.stall:
                 await asyncio.sleep(feed.stall)
-            for wf_id, close_time in feed.rows:
+            for wf_id, close_time in (feed.rows if query == LOOPGRAPH_RUNS else []):
                 yield SimpleNamespace(id=wf_id, close_time=close_time)
         return rows()
 
@@ -836,18 +849,31 @@ def test_yes_skips_the_prompt_and_nothing_else(rm, capsys):
     assert not (rm.runs / "doomed").exists()
 
 
-def test_a_closed_stdin_stops_instead_of_raising(rm, world, capsys):
-    """AC-22. Run from a script or a pipe without --yes, `input()` raises
-    EOFError. `main()` has no top-level handler, so that reaches the terminal as
-    a traceback — which is not an answer to a plain question, and every other
-    refusal in `lg` is one line and a 1. A read that gets no line at all is not
-    the slug, so it stops exactly the way a wrong answer stops."""
+@pytest.mark.parametrize("raised", [
+    EOFError(),
+    RuntimeError("input(): lost sys.stdin"),
+    ValueError("I/O operation on closed file"),
+], ids=["a pipe", "fd 0 closed", "stdin closed under us"])
+def test_a_closed_stdin_stops_instead_of_raising(rm, world, capsys, raised):
+    """AC-22, and all three ways a prompt can fail to be read at all. `main()`
+    has no top-level handler, so any of them reaches the terminal as a traceback
+    — which is not an answer to a plain question, and every other refusal in `lg`
+    is one line and a 1.
+
+    The three are not interchangeable and only one of them is EOFError. A pipe or
+    `< /dev/null` gives EOFError, which is the case everyone writes the test for.
+    `lg rm doomed 0<&-` — the shell closing the descriptor, which is what AC-22
+    means by stdin closed — leaves `sys.stdin` as None and `input()` raises
+    RuntimeError instead; measured against the real command. A stdin closed under
+    a running process raises ValueError. Catching EOFError alone passes the first
+    of these and gives a traceback on the other two.
+    """
     repo = world.repository()
     world.container(repo, "doomed", "tok1")
     (rm.runs / "doomed" / "logs").mkdir(parents=True)
 
     code = rm.go("doomed", client=Workflows([("run-doomed-aa11aa", CLOSED)]),
-                 typed=[EOFError()])
+                 typed=[raised])
 
     assert code == 1
     assert capsys.readouterr().err == "stopped; nothing was touched\n"
@@ -904,9 +930,16 @@ def test_a_removal_de_registers_then_deletes_then_archives(rm, world, capsys, mo
         return real(runs, ids, archived)
 
     monkeypatch.setattr(ui, "mark_archived", watched)
+    feed = Workflows([("run-doomed-aa11aa", CLOSED)])
 
-    assert rm.go("runs/doomed/", "--yes", client=Workflows([("run-doomed-aa11aa", CLOSED)])) == 0
+    assert rm.go("runs/doomed/", "--yes", client=feed) == 0
 
+    # The one string that reaches Temporal, pinned here the way
+    # tests/test_lg_status.py pins it for `lg status`. Nothing else in this file
+    # would notice it change: a query naming a workflow type nothing is matches
+    # nothing, and a run with no workflow is deliberately not a refusal — so a
+    # typo here deletes an open run and reports `archived 0 workflow row(s)`.
+    assert feed.listed == [LOOPGRAPH_RUNS]
     out, err = capsys.readouterr()
     assert out.splitlines()[-1] == "removed runs/doomed; archived 1 workflow row(s)"
     assert err == ""
@@ -1019,6 +1052,37 @@ def test_rm_leaves_a_neighbouring_runs_worktree_alone(rm, world, capsys):
     assert (repo / ".git" / "worktrees" / "tok2").is_dir()
     assert (rm.runs / "live" / "worktrees" / "tok2").is_dir()
     assert container_path("doomed", "tok1") not in world.listed(repo)
+
+
+def test_a_directory_that_will_not_delete_is_never_reported_as_removed(rm, capsys):
+    """The floor under the rmtree. `runs/` is made read-only, so rmtree empties
+    the run and then cannot unlink the directory itself — a real partial delete,
+    not an injected one, and exactly what a read-only mount or a stuck filesystem
+    leaves behind.
+
+    Two things must not happen then. It must not say `removed runs/doomed`, and
+    it must not archive: a row off the rail over logs still on disk is a run the
+    owner can neither see nor find. `shutil.rmtree(run, ignore_errors=True)` —
+    the obvious thing to reach for when this goes flaky — makes both happen at
+    once and exits 0 while it does.
+    """
+    (rm.runs / "doomed" / "logs").mkdir(parents=True)
+    (rm.runs / "doomed" / "logs" / "i1-r1-exec.log").write_text("a transcript\n")
+    feed = Workflows([("run-doomed-aa11aa", CLOSED)])
+    os.chmod(rm.runs, 0o555)
+    try:
+        code = rm.go("doomed", "--yes", client=feed)
+    finally:
+        os.chmod(rm.runs, 0o755)
+
+    out, err = capsys.readouterr()
+    assert (rm.runs / "doomed").exists(), \
+        "the run directory went after all, so this proves nothing"
+    assert code == 1
+    assert err.splitlines()[-1].startswith("could not delete runs/doomed: "), err
+    assert "removed runs/doomed" not in out, "it claimed a directory that is still there"
+    assert not (rm.runs / ".archived.json").exists(), \
+        "the row left the rail while its directory was still on disk"
 
 
 def test_an_unreadable_archive_file_is_a_line_and_still_a_zero(rm, capsys):
