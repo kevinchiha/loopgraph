@@ -188,19 +188,24 @@ def test_groups_cover_every_counted_line_and_sum_to_the_count(tmp_path):
 
 
 def test_a_group_past_the_cap_keeps_its_count():
-    """Twenty-one full groups: the sample stops at the first group that does not
-    fit and stays stopped, so which groups carry lines depends on their names and
-    never on their sizes. The counts are exact either way."""
-    lines = [f"g{i:02d}/f{j}.py" for i in range(21) for j in range(LINES_SHOWN)]
-    lines.append("zz/one.py")
+    """Twenty groups of 59 fill 1,180 of the 1,200 sample lines, so the 30-line
+    group next by name does not fit and the 5-line group behind it would have.
+    The sample stops at the first group that does not fit and stays stopped, so
+    which groups carry lines depends on their names and never on their sizes. The
+    counts are exact either way."""
+    lines = [f"g{i:02d}/f{j}.py" for i in range(20) for j in range(59)]
+    lines += [f"x30/f{j}.py" for j in range(30)]
+    lines += [f"y05/f{j}.py" for j in range(5)]
+    assert 20 * 59 + 30 > GROUP_LINES_CAP > 20 * 59 + 5, "the small group had room to slip in"
     groups = group_candidates(lines, None)
 
-    assert [g["name"] for g in groups] == [f"g{i:02d}/" for i in range(21)] + ["zz/"]
-    assert [g["count"] for g in groups] == [LINES_SHOWN] * 21 + [1]
-    assert all(len(g["lines"]) == LINES_SHOWN for g in groups[:20])
-    assert sum(len(g["lines"]) for g in groups) == GROUP_LINES_CAP
-    assert groups[20]["lines"] == []
-    assert groups[21]["lines"] == [], "a one-line group slipped in behind a group that did not fit"
+    assert [g["name"] for g in groups] == [f"g{i:02d}/" for i in range(20)] + ["x30/", "y05/"]
+    assert [g["count"] for g in groups] == [59] * 20 + [30, 5]
+    assert all(len(g["lines"]) == 59 for g in groups[:20])
+    assert groups[0]["lines"] == [f"g00/f{j}.py" for j in range(59)]
+    assert sum(len(g["lines"]) for g in groups) == 20 * 59
+    assert groups[20]["lines"] == [], "the 30-line group did not fit"
+    assert groups[21]["lines"] == [], "a smaller group slipped in behind the one that did not fit"
 
 
 def test_a_failed_or_silent_detector_has_no_groups(tmp_path):
@@ -237,11 +242,14 @@ def test_discover_hands_the_configured_prefixes_to_every_detector(run_dir, repo)
     `groups` would otherwise shrink the run's scope while the count still held it."""
     (run_dir / "run.yaml").write_text(yaml.safe_dump(
         {"sweep": {"yield_floor": 0, "groups": ["app/"],
-                   "detectors": [_detector(r"printf 'app/a.py\nlib/b.py\n'")]}}))
+                   "detectors": [_detector(r"printf 'app/a.py\nlib/b.py\n'"),
+                                 _detector(r"printf 'app/c.py\ndocs/d.md\n'", name="e")]}}))
     r = _pass(run_dir, repo)
-    groups = r["detectors"][0]["groups"]
-    assert [(g["name"], g["count"]) for g in groups] == [("(other)", 1), ("app/", 1)]
-    assert groups[1]["lines"] == ["app/a.py"]
+    first, second = (d["groups"] for d in r["detectors"])
+    assert [(g["name"], g["count"]) for g in first] == [("(other)", 1), ("app/", 1)]
+    assert first[1]["lines"] == ["app/a.py"]
+    assert [(g["name"], g["count"]) for g in second] == [("(other)", 1), ("app/", 1)]
+    assert second[1]["lines"] == ["app/c.py"], "the second detector was grouped by top-level dir"
 
 
 def test_discover_heartbeats_before_the_first_detector(run_dir, repo):

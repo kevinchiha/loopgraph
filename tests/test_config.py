@@ -54,8 +54,7 @@ BAD_SWEEP = [
 
 GROUPS_MESSAGE = "run.yaml: sweep.groups must be a list of path prefixes"
 
-# Every wrong shape gets that one message: a groups key that quietly read as "no
-# groups" would quietly change which corner of the repo each item works.
+# Every wrong shape gets that one message; _sweep's comment says why.
 BAD_SWEEP_GROUPS = [
     SWEEP + "  groups: []\n",
     SWEEP + "  groups: app/\n",

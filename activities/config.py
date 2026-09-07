@@ -125,8 +125,8 @@ def _sweep(block) -> dict | None:
     max_items = _integer(block.get("max_items", DEFAULT_MAX_ITEMS), "sweep.max_items", 1)
     groups = block.get("groups")
     # Absent means "group by top-level directory"; a wrong one is refused rather
-    # than dropped, because a groups that quietly became None would quietly
-    # change which corner of the repo each item works. The entries are strings,
+    # than dropped, because a `groups` that quietly became None would quietly
+    # change which corner of the repo each item works on. The entries are strings,
     # not anything str() would take: `groups: [yes]` is `[True]`.
     if groups is not None and (not isinstance(groups, list) or not groups
                                or not all(isinstance(g, str) and g for g in groups)):

@@ -35,7 +35,7 @@ from activities.gate import _drain, _kill_group
 
 STDOUT_CAP = 1_048_576   # bytes of detector stdout kept, from the front
 STDERR_TAIL = 2000       # characters of detector stderr kept, from the end
-LINES_SHOWN = 60         # candidates quoted back in the item; the ledger keeps fewer (trim_pass)
+LINES_SHOWN = 60         # sample lines per group, and the detector's own head; trim_pass keeps fewer
 GROUP_LINES_CAP = 1200   # sample lines kept per detector across all of its groups
 
 # The path is the front of a candidate line, so it ends at the first `:` or space:
@@ -58,9 +58,9 @@ def count_candidates(data: bytes) -> tuple[int, list[str], list[str]]:
 def group_key(line: str, prefixes: list[str] | None) -> str:
     """The name of the group a candidate line belongs to.
 
-    Leading whitespace goes first, or a detector that indents its output files
-    every line under `(root)`. One leading `./` is removed, so a detector that
-    prints `./src/a.py` groups with one that prints `src/a.py`.
+    Leading whitespace goes first, or a detector that indents its output would
+    put every line under `(root)`. One leading `./` is removed, so a detector
+    that prints `./src/a.py` groups with one that prints `src/a.py`.
 
     Without `prefixes` the group is the first path segment, not a fixed depth of
     two: depth two splits `app/core.py` from `app/text.py` on a small repo and
