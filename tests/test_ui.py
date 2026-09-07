@@ -1240,7 +1240,7 @@ def test_every_section_exists_after_the_board_is_built():
 
 
 def test_the_round_cards_leave_the_board_for_their_own_section():
-    """The board is six sections now, and the log cards are one of them. Left
+    """The board is seven sections now, and the log cards are one of them. Left
     appending to #board they would land on top of the state sections."""
     src = function_source(ui.page_html(), "patchRounds")
     assert "getElementById('rounds')" in src, "the log cards still go straight onto the board"
