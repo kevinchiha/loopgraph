@@ -167,6 +167,20 @@ PAGE = """<!doctype html>
      accepted, so it is not dim like the labels around it. */
   .round .verdict { font:700 12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
                     color:var(--accent); margin-bottom:9px; }
+  /* What the word means, in the three colours the rail's pills already use:
+     accepted, still out or going round again, escalated. Both copies of the word
+     take it — the open card's line and the closed card's summary — so one round
+     never reads two colours.
+     Each colour names `.round .verdict` in front of it, and that is not
+     decoration. The rule above is two classes deep, a bare `.good` is one, and
+     specificity beats source order — there are no cascade layers here and no
+     !important outside the [hidden] rule. So a plain `.good { color:… }` would
+     win on the summary span, which has nothing over it, and lose on the card,
+     which has that rule: one round in two colours. The accent above stays where
+     it is — it is what a word this map has never heard of falls back to. */
+  .round .verdict.good, .s-verdict.good { color:#3fb950; }
+  .round .verdict.warn, .s-verdict.warn { color:#d29922; }
+  .round .verdict.bad,  .s-verdict.bad  { color:#f85149; }
   .round .field { margin-bottom:9px; }
   .round .field b { display:block; margin-bottom:2px; color:var(--dim);
                     font:700 10.5px/1.6 ui-monospace,monospace; letter-spacing:.9px;
@@ -192,6 +206,17 @@ PAGE = """<!doctype html>
   .panels { display:flex; gap:14px; align-items:flex-start; }
   .panel { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:10px;
            overflow:hidden; }
+  /* Two panes split the row 50/50 whatever is in them, so the log the reader had
+     opened got 516px of a 1046px row at 1440px, beside a closed one showing
+     nothing but its own label. Now a closed pane stops flexing while its
+     neighbour is open and shrinks to that label, which puts the open one at 914px
+     — 930px when it is the wider label that closed. Both closed or both open is
+     the 50/50 as before, because then nothing here matches.
+     `.panel.log` on both ends and never a bare `.panel`: the diff pane is a
+     `.panel` too, it sits alone in #diff with no sibling to take room from, and a
+     shrink rule written for a two-pane row has no business reaching it.
+     No JavaScript moved for this. A closed pane still asks for nothing. */
+  .panels:has(> .panel.log[open]) > .panel.log:not([open]) { flex:0 0 auto; }
   .panel > summary { padding:8px 14px; cursor:pointer; user-select:none;
                      font:700 11px/1.4 ui-monospace,monospace; letter-spacing:1px; text-transform:uppercase; }
   .panel[open] > summary { border-bottom:1px solid var(--line); }
@@ -283,6 +308,20 @@ const pill = s => ({green:'green',running:'yellow',waiting:'blue',stopped:'red',
 // tests/test_ui.py charges everything after a declaration to that declaration.
 const FAV_IDLE = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6.5' fill='%237d8590'/></svg>";
 const FAV_WAIT = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6.5' fill='%2358a6ff'/></svg>";
+// The class a verdict word wears, and through the stylesheet the colour: green
+// for accepted, yellow for the supervisor still being out or the round going
+// again, red for escalated.
+//
+// Out here and not inside roundVerdict, which prints whatever word the ledger
+// holds and enumerates none. A word missing from this map is not an error and
+// gets no branch of its own: it loses its colour and keeps every letter of its
+// text. `redo` is in it because a live ledger records one; anything the engine
+// grows later reads neutral until someone puts it here.
+//
+// Up here with sel, pill and the icons, above the first `function`, for the
+// reason FAV_IDLE gives: regions() in tests/test_ui.py charges everything after
+// a declaration to that declaration, and this mapping is not roundVerdict's.
+const VERDICT_CLASS = {accept:'good', 'audit running':'warn', redo:'warn', escalated:'bad'};
 const esc = t => t.replaceAll('&','&amp;').replaceAll('<','&lt;');
 // Assigning textContent builds a NEW text node even when the string is the one
 // already there, and the reader's selection lives in the old one. Every text a
@@ -745,6 +784,12 @@ function patchRoundCard(card, row, live) {
   // with it — innerHTML with the name filed off.
   const [head, summaryWord, summaryFiles] = summary.children;
   const word = roundVerdict(entry);
+  // What the word means, held as the class to append so both copies of it are
+  // written the same way. A word the map has never heard of appends
+  // nothing, which leaves each element its base class and the neutral accent
+  // `.round .verdict` sets — no branch here drops the word itself, and none can:
+  // the text is written below whatever this reads.
+  const tone = VERDICT_CLASS[word] ? ' ' + VERDICT_CLASS[word] : '';
   // Both halves of a round's life, and they are two states rather than one. The
   // first is the card with no row behind it. The second is the row written and
   // the audit still out, which lasts up to 30 minutes — a card that knew only
@@ -768,6 +813,7 @@ function patchRoundCard(card, row, live) {
   // with no word at all: the executor inside the round, no ledger row, and
   // nothing else on the line saying so.
   setText(head, `item ${item} · round ${round}` + (running && !word ? ' · in progress' : ''));
+  summaryWord.className = 's-verdict' + tone;
   setText(summaryWord, word);
   // How much the round touched, for a reader scanning a board of closed cards.
   // The list itself is on the card below and is half of what opening one is for.
@@ -775,6 +821,7 @@ function patchRoundCard(card, row, live) {
   // measurement of work that has not happened, not a round that changed nothing.
   const touched = (entry.files || []).length;
   setText(summaryFiles, touched ? (touched === 1 ? '1 file' : `${touched} files`) : '');
+  verdict.className = 'verdict' + tone;
   verdict.hidden = !word;
   setText(verdict, word);
   // A row per reason rather than one string with newlines in it. One string was

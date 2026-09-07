@@ -30,6 +30,14 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   twelve lines to read down instead of a page to scroll to the end of. The newest
   round is the one that opens; the rest you open and close yourself, and no poll
   ever changes what you left.
+- The verdict word is coloured by what it means: green for `accept`, yellow while the
+  supervisor is still out and on a `redo`, red on `escalated`. Both places the word
+  appears take the same colour, so you can read a column of folded round cards and
+  see which rounds went wrong without reading a word. A verdict the dashboard has
+  never met keeps its plain colour and every letter of its text.
+- Opening one of a round's two log panes gives it the room the closed one is not
+  using — about 930px of a 1440px window instead of 516. Open both and they go back
+  to sharing the row.
 
 ## 0.2.0 - 2026-09-07
 

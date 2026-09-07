@@ -2271,9 +2271,14 @@ def test_a_round_card_is_a_details_with_a_summary():
     markup = re.search(r"innerHTML = '([^']*)'", build)
     assert markup and markup.group(1).startswith("<summary>"), \
         "the summary is not the card's first child, so a closed card shows nothing at all"
-    for cls in ("s-head", "s-verdict", "s-files"):
-        assert f'<span class="{cls}"></span>' in build, \
-            f"the summary carries no {cls} span for the poll to write into"
+    # In this order, and the order is not decoration. patchRoundCard reads the
+    # three spans by position and the stylesheet colours the verdict by class, so
+    # swapping two names in this one string leaves every other check in this file
+    # green, renders identically today, and paints the file count with the
+    # verdict's meaning — `4 files` in green, `accept` in neither.
+    assert [m.group(1) for m in re.finditer(r'<span class="(s-[\w-]+)"></span>', build)] \
+        == ["s-head", "s-verdict", "s-files"], \
+        "the summary's spans are not the head, then the verdict word, then the file count"
     assert "<h2>" not in build, \
         "the card still builds the heading the summary replaced, so the line is drawn twice"
     assert ".round > h2" not in html, \
@@ -2407,6 +2412,109 @@ def test_the_summary_says_in_progress_or_a_verdict_never_both():
          "still running AND having no verdict word to show instead")
 
 
+def card_word_elements(html):
+    """(patchRoundCard's source, the verdict line, the summary's word span).
+
+    Both elements read out the way the function reads them, by position, so the
+    tests below name whatever the page named. The second read is anchored to the
+    first — the summary the spans come off is the card's own first child — so a
+    destructuring that moved would fail here rather than quietly match some other
+    line that also ends in `.children`.
+    """
+    src = function_source(html, "patchRoundCard")
+    kids = re.search(r"const \[(\w+), (\w+),[^\]]*\] = \w+\.children;", src)
+    assert kids, "the card's children are no longer read out in order"
+    spans = re.search(rf"const \[\w+, (\w+), \w+\] = {kids.group(1)}\.children;", src)
+    assert spans, f"the summary's three spans are not read off {kids.group(1)}"
+    return src, kids.group(2), spans.group(1)
+
+
+def test_the_verdict_colour_map_lives_outside_roundVerdict():
+    """AC-11. The word is coloured by what it means, out of a lookup table rather
+    than a branch inside roundVerdict.
+
+    roundVerdict prints whatever the ledger holds and enumerates nothing — that is
+    pinned by test_the_page_says_what_lg_says_where_a_round_has_no_verdict, and
+    `redo` is the word it was pinned for. A colour map written inside it is
+    exactly the enumeration that test forbids, in the one place it cannot see:
+    regions() charges every line after a `function` declaration to that
+    declaration, and this map's keys are bare identifiers, so a grep for quoted
+    words walks straight past `redo:'warn'`. So the position is asserted here, and
+    the position is the only thing that asserts it.
+
+    Both copies of the word read the map. The open card's verdict line and the
+    closed card's summary span are one round said twice, and a page that coloured
+    one of them would contradict itself in colour — the failure the whole phase is
+    about, in the one channel a reader trusts without reading.
+    """
+    html = ui.page_html()
+    script = script_of(html)
+    decl = re.search(r"const VERDICT_CLASS = \{([^{}]*)\};", script)
+    assert decl, "the page carries no verdict colour map"
+    first = DECLARED.search(script)
+    assert first, "the script declares no functions at all"
+    assert decl.start() < first.start(), \
+        (f"VERDICT_CLASS sits below `function {first.group(1)}(`, so regions() reads it as "
+         "living inside a function and nothing here can tell it from a map inside roundVerdict")
+    assert "VERDICT_CLASS" not in function_source(html, "roundVerdict"), \
+        "roundVerdict reads the colour map, so it enumerates the words it was written not to"
+    pairs = {quoted or bare: cls for quoted, bare, cls
+             in re.findall(r"(?:'([^']+)'|([\w$]+))\s*:\s*'([\w-]+)'", decl.group(1))}
+    assert pairs == {"accept": "good", "audit running": "warn",
+                     "redo": "warn", "escalated": "bad"}, \
+        f"the map reads {pairs}, which is not the meaning AC-11 gives each word"
+
+    src, line, span = card_word_elements(html)
+    held = re.search(r"const (\w+) = [^;]*VERDICT_CLASS\[(\w+)\]", src)
+    assert held, "patchRoundCard never asks the map what colour the word carries"
+    word = re.search(r"const (\w+) = roundVerdict\(", src)
+    assert word and held.group(2) == word.group(1), \
+        "the map is keyed on something other than the word the card is about to print"
+    assert re.search(rf"{line}\.className = 'verdict' \+ {held.group(1)};", src), \
+        "the open card's verdict line is not given the class the map handed back"
+    assert re.search(rf"{span}\.className = 's-verdict' \+ {held.group(1)};", src), \
+        "the closed card's summary word is not given the class the map handed back"
+
+
+def test_an_unknown_verdict_keeps_its_text_and_the_neutral_colour():
+    """AC-11's last clause. The engine writes whatever word the audit model
+    returned, and the four in the map are the four anyone has seen — a fifth is a
+    word the page has never met, not a fault to swallow.
+
+    So the fallback is nothing at all appended, which leaves the base class alone
+    and the neutral accent `.round .verdict` already sets. That colour is the
+    fallback by name: deleting it and letting the three new rules carry the whole
+    job would leave an unmapped verdict in the body text colour, on the one line of
+    the card that is not meant to read like a field.
+
+    Two failures this closes. A word that renders blank because nothing matched —
+    so the text is written outside the lookup, never under a branch of it. And a
+    span still wearing the previous round's colour, which is what `classList.add`
+    buys: the class is assigned whole on every poll, so a round that loses its
+    verdict loses the colour with it.
+    """
+    html = ui.page_html()
+    src, line, span = card_word_elements(html)
+    held = re.search(r"const (\w+) = ([^;]*VERDICT_CLASS\[\w+\][^;]*);", src)
+    assert held, "patchRoundCard never asks the map what colour the word carries"
+    expr = " ".join(held.group(2).split())
+    assert expr.endswith(": ''") or expr.endswith("|| ''"), \
+        (f"`{expr}` hands back something other than nothing at all for a word it has never "
+         "met, so an unmapped verdict takes a class the stylesheet never defined")
+    word = re.search(r"const (\w+) = roundVerdict\(", src)
+    assert word, "the card no longer asks roundVerdict what the round decided"
+    for el in (line, span):
+        assert re.search(rf"setText\({el}, {word.group(1)}\);", src), \
+            f"{el} is written with something other than the word roundVerdict handed back"
+    assert not re.search(rf"if \([^)]*\b({held.group(1)}|VERDICT_CLASS)\b", src), \
+        "the word is printed under a check of its own colour, so an unmapped verdict can be dropped"
+    assert "classList" not in src, \
+        ("a class is added or removed rather than assigned whole, so a round whose word "
+         "changes keeps the colour of the one before it")
+    assert "color:var(--accent)" in declarations(html, ".round .verdict").replace(" ", ""), \
+        "the verdict line's neutral colour is gone, so an unmapped word has nothing to fall back to"
+
+
 def css_rules(html):
     """(selector, declarations) for every rule in the page's stylesheet.
 
@@ -2427,6 +2535,52 @@ def declarations(html, selector):
     it, whether it stands alone or sits in a comma-separated list."""
     return " ".join(body for sel, body in css_rules(html)
                     if selector in [p.strip() for p in sel.split(",")])
+
+
+def compounds(selector):
+    """One selector split into its pieces, on the combinators OUTSIDE any brackets.
+
+    `:has(> .panel.log[open])` carries a combinator of its own, and splitting on
+    the string would tear the argument in half and hand back a piece that matches
+    nothing anybody wrote. The last piece is the subject — the element the rule
+    actually paints — which is the half of a selector these tests keep asking about.
+    """
+    out, depth, cur = [], 0, ""
+    for ch in selector.strip():
+        depth += (ch == "(") - (ch == ")")
+        if not depth and (ch.isspace() or ch in ">+~"):
+            if cur:
+                out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur:
+        out.append(cur)
+    return out
+
+
+def specificity(selector):
+    """(ids, classes, types) for one selector, the way the cascade weighs it.
+
+    Specificity beats source order, and that is the whole reason the verdict
+    colours are written the way they are: `.round .verdict` is two classes deep,
+    so a bare `.good` never reaches the word however far down the sheet it sits.
+    Nothing in this file parsed CSS before a `display` beat `[hidden]` on the page
+    and nothing here caught it, so the weighing is done rather than assumed.
+
+    Narrow on purpose. A functional pseudo-class takes the specificity of its own
+    argument and needs the real algorithm, so one is refused rather than
+    mis-counted — no colour rule on this page has any.
+    """
+    selector = selector.strip()
+    assert not re.search(r":[\w-]+\(", selector), \
+        f"`{selector}` carries a functional pseudo-class, which this counter cannot weigh"
+    ids = selector.count("#")
+    classes = (selector.count(".") + selector.count("[")
+               + len(re.findall(r"(?<!:):[\w-]+", selector)))
+    types = (len(re.findall(r"(?:^|[\s>+~])[a-zA-Z][\w-]*", selector))
+             + selector.count("::"))
+    return ids, classes, types
 
 
 def reason_row_declarations(html):
@@ -2707,6 +2861,122 @@ def test_board_prose_is_capped_at_80ch():
     for wide in (".round", ".panels", ".panel"):
         assert "max-width" not in declarations(html, wide), \
             f"{wide} carries a max-width, which every log and diff pane inside it inherits"
+
+
+def test_the_verdict_colour_outranks_the_neutral_rule():
+    """AC-11's last sentence: one round, one colour, in both places it is printed.
+
+    The two words sit under different rules and only one of them has a competitor.
+    `.round .verdict` sets the neutral accent and is two classes deep; the summary
+    span has nothing over it at all. So a bare `.good { color:… }` — the obvious
+    way to write this — colours the closed card's word and loses on the open
+    card's, because specificity beats source order and there are no cascade layers
+    or !important on this page outside the `[hidden]` rule. The result is one
+    round reading green on one line and accent blue on the next, which is the page
+    contradicting itself in the channel a reader believes fastest.
+
+    Nothing else here can see it. Every source check passes on the bare form, and
+    a browser reading text back sees the words unchanged either way — the colour
+    is the whole of the difference. So the weight is counted rather than eyeballed.
+
+    The three colours are the rail's own pills read back out of the stylesheet,
+    not three hexes typed again: green means accepted everywhere on this page or
+    it means nothing.
+    """
+    html = ui.page_html()
+    rules = css_rules(html)
+    neutral = [i for i, (sel, body) in enumerate(rules)
+               if ".round .verdict" in [p.strip() for p in sel.split(",")]
+               and "color:" in body.replace(" ", "")]
+    assert neutral, "nothing sets the verdict line's neutral colour, so there is nothing to outrank"
+    floor = specificity(".round .verdict")
+    for tone, pill in (("good", ".green"), ("warn", ".yellow"), ("bad", ".red")):
+        want = re.search(r"color:\s*(#[0-9a-fA-F]+)", declarations(html, pill))
+        assert want, f"the rail's {pill} pill has no colour of its own for the verdict to match"
+        on_line = on_summary = None
+        for i, (sel, body) in enumerate(rules):
+            got = re.search(r"color:\s*(#[0-9a-fA-F]+)", body)
+            if not got or got.group(1).lower() != want.group(1).lower():
+                continue
+            for piece in [p.strip() for p in sel.split(",")]:
+                subject = compounds(piece)[-1]
+                if f".{tone}" not in subject:
+                    continue
+                if ".s-verdict" in subject:
+                    on_summary = piece
+                elif ".verdict" in subject:
+                    weight = specificity(piece)
+                    if weight > floor or (weight == floor and i > max(neutral)):
+                        on_line = piece
+        assert on_line, \
+            (f"no rule paints the open card's verdict line {want.group(1)} and outranks "
+             f"`.round .verdict` {floor}, so the word stays accent blue there while the summary "
+             f"turns {tone} — one round in two colours")
+        assert on_summary, \
+            (f"no rule names `.s-verdict` and paints it {want.group(1)}, so the closed card's "
+             f"word carries the meaning of `{tone}` only for as long as nothing else on the "
+             "page claims that class name")
+
+
+def test_an_open_pane_takes_the_closed_panes_width():
+    """AC-12. A row of two panes split it 50/50 whatever was in them, so opening
+    one log gave the reader half a row — 516px of 1046 on a 1440px viewport —
+    beside a closed pane showing nothing but its own label. One rule, no
+    JavaScript: while a sibling log pane is open a closed one stops flexing and
+    shrinks to that label, which took the open one to 914px when this went in.
+
+    Scoped to `.panel.log` at both ends. The diff pane is a `.panel` too, holds no
+    log name and sits alone in #diff — buildLogPane's own comment records what
+    happened the last time a selector written for a log pane reached it, which was
+    `/api/log?name=undefined` every 2 seconds for as long as it was open. Checked
+    on this rule's selector and not on the stylesheet as a whole: six shipped rules
+    begin `.panel.diff` on purpose.
+
+    The second half is what the rule alone does not buy. A `max-width` anywhere
+    inside a panel caps the text at a width the pane no longer has, and the reader
+    gets a wider box holding the same narrow column — the widening undone, with
+    every check in this file green. AC-7's cap is real prose and stops outside the
+    panes; this is the guard that keeps it there whatever gets added later.
+
+    The measurement itself — at least 900px on a 1440px viewport — belongs to a
+    browser and to the checklist. Nothing in this file has ever laid out a page,
+    so every number in this docstring was read off one and none of it is asserted
+    below.
+    """
+    html = ui.page_html()
+    found = [(sel, body) for sel, body in css_rules(html) if ":has(" in sel and ".log" in sel]
+    assert len(found) == 1, \
+        f"expected one rule making room for an open log pane, found {len(found)}"
+    sel, body = found[0]
+    assert re.search(r"flex:\s*0\s+0\s+auto", body), \
+        f"`{sel}` sets {body.strip()!r} rather than stopping the closed pane from flexing"
+    pieces = compounds(sel)
+    subject = pieces[-1]
+    assert ".log" in subject and ":not([open])" in subject, \
+        f"the rule paints `{subject}` rather than a log pane that is closed"
+    assert any(p.startswith(".panels") for p in pieces[:-1]), \
+        f"`{sel}` is not scoped to a row of panes, so a lone pane shrinks to its label"
+    arg = re.search(r":has\(([^()]*)\)", sel)
+    assert arg, "the rule asks nothing about what the row already has open"
+    assert ".log" in arg.group(1) and "[open]" in arg.group(1), \
+        (f"the closed pane shrinks on `{arg.group(1).strip()}` rather than on a log pane "
+         "beside it being open, so both-closed is no longer the 50/50 it was")
+    # The one rule that must never reach the diff pane, read compound by compound:
+    # every part of it that names a panel names a log pane too, argument included.
+    for piece in pieces + compounds(arg.group(1)):
+        if re.search(r"\.panel\b", piece):
+            assert ".log" in piece, \
+                f"`{piece}` matches every panel, and the diff pane is one of them"
+    assert "flex:1" in declarations(html, ".panel").replace(" ", ""), \
+        "the panes no longer share the row, so two open ones are not the 50/50 they were"
+
+    for rule_sel, rule_body in css_rules(html):
+        if "max-width" not in rule_body:
+            continue
+        for piece in [p.strip() for p in rule_sel.split(",")]:
+            assert not re.search(r"\.panels?\b", piece), \
+                (f"`{piece}` caps a width inside a log pane, so the room this rule makes "
+                 "reaches the box and never the text in it")
 
 
 # ---------- the diff pane ----------
