@@ -86,6 +86,15 @@ def test_kind_is_the_last_parameter_of_audit_and_the_prompt():
     assert list(inspect.signature(assemble_audit_prompt).parameters)[-1] == "kind"
 
 
+def test_the_audit_activity_hands_the_kind_to_the_prompt():
+    """AC-36. Nothing else notices if that argument is dropped: `kind` defaults to
+    "brief" at both ends, so every sweep and convergence item would be audited as
+    a brief item with the whole suite still green."""
+    src = " ".join(inspect.getsource(audit).split())
+    assert ("assemble_audit_prompt(brief, constraints, round_result, diff, "
+            "read_answers(run_dir), work_item, item_no, item_total, kind)") in src
+
+
 def _section(prompt: str, heading: str) -> list[str]:
     """The lines of one `## ` section of a contract, heading included."""
     lines = prompt.splitlines()

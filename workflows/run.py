@@ -290,6 +290,38 @@ def sweep_end_reason(passes: list[dict], sweep: dict, elapsed: float, items_run:
     return None
 
 
+def pick_detector(entries: list[dict], last_used: int | None) -> int | None:
+    """Which detector the next sweep item comes from, or None if none reported.
+
+    Round-robin from the one after the detector the last item used, wrapping,
+    skipping any that reported nothing this pass. A detector's list is often the
+    same corner of the repo every pass, and always taking the first would pin the
+    run there while the others go unworked. A detector on 0 has nothing to hand
+    over, so taking it would build an item with an empty sample.
+    """
+    start = 0 if last_used is None else last_used + 1
+    order = [(start + step) % len(entries) for step in range(len(entries))]
+    return next((i for i in order if entries[i]["count"]), None)
+
+
+def merge_extras(extras: list[str], candidates: list[str], cap: int = EXTRAS_CAP) -> list[str]:
+    """What the next sweep item carries: the extras it was handed, plus whatever
+    this item found by hand that is not on the list already.
+
+    A candidate that is already there keeps the position it first had. Appending
+    it again would let a thing every executor notices walk the older ones off the
+    front, and nobody would ever work them. The list is trimmed from the front to
+    `cap` because it rides in the item text, which lands in the executor's prompt
+    and in the auditor's scope block: an unbounded one pushes the detector's own
+    candidates out of both.
+    """
+    merged = list(extras)
+    for candidate in candidates:
+        if candidate not in merged:
+            merged.append(candidate)
+    return merged[-cap:]
+
+
 @workflow.defn
 class LoopGraphRun:
     """The full run: round → audit → verdict branch. The ledger is workflow state.
@@ -498,7 +530,7 @@ class LoopGraphRun:
         extras: list[str] = []        # candidates earlier items found by hand
         items_run = 0
         parked_streak = 0             # parked in a row; STALL_LIMIT ends the run
-        used = -1                     # index of the detector the last item came from
+        used: int | None = None       # index of the detector the last item came from
         pass_no = 0
 
         while True:
@@ -530,15 +562,10 @@ class LoopGraphRun:
             if reason:
                 break
 
-            # Round-robin from the detector after the one the last item used,
-            # skipping any that reported nothing this pass. A detector's list is
-            # often the same corner of the repo every pass, and always taking the
-            # first would pin the run there while the others go unworked. A pass
-            # with nothing to hand over has already ended the run above, so there
-            # is always one left to find.
+            # A pass with nothing to hand over has already ended the run above,
+            # so there is always a detector left for `pick_detector` to find.
             entries = found["detectors"]
-            order = [(used + 1 + step) % len(entries) for step in range(len(entries))]
-            used = next(i for i in order if entries[i]["count"])
+            used = pick_detector(entries, used)
             item = build_sweep_item(entries[used], pass_no, extras)
             entry = {"n": items_run + 1, "item": item, "status": "running",
                      "kind": "sweep"}
@@ -567,10 +594,7 @@ class LoopGraphRun:
             # A parked item read the code too, so its candidates count. They are
             # text for the next item and nothing else: counting them would hand
             # the executor the number the run ends on.
-            for candidate in outcome["result"]["candidates"]:
-                if candidate not in extras:
-                    extras.append(candidate)
-            extras = extras[-EXTRAS_CAP:]
+            extras = merge_extras(extras, outcome["result"]["candidates"])
 
             # Anything the owner sent while that item ran is steering for the
             # next one. It is already in workflow state: the dispatcher signalled

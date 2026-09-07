@@ -29,6 +29,8 @@ import pytest
 from temporalio.exceptions import ActivityError, ApplicationError, TimeoutType
 from temporalio.exceptions import TimeoutError as TemporalTimeoutError
 
+from workflow_fake import DEFAULT_CONFIG
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -87,10 +89,10 @@ class _FakeWorkflow:
         if name in self._fails:
             raise self._fails[name]
         if name == "load_run_config":
-            # AC-1's defaults: what a run with no run.yaml gets. The catch-all
-            # below answers `{"sent": True}`, which is not a config.
-            return {"convergence": {"enabled": True, "every_items": 5, "net_lines": 400},
-                    "sweep": None}
+            # AC-1's defaults, from the one place that has them: a second copy
+            # here would go on answering the old shape after a default changed.
+            # The catch-all below answers `{"sent": True}`, which is not a config.
+            return DEFAULT_CONFIG
         if name == "run_baseline":
             return "base1234"
         if name == "load_work_items":

@@ -1235,7 +1235,7 @@ def test_every_section_exists_after_the_board_is_built():
     selection and makes every section, hidden or not, so a patch never has to
     create one — and a poll therefore never builds part of the page."""
     build = function_source(ui.page_html(), "buildBoard")
-    for section in ("state", "why", "awaiting", "items", "rounds", "diff"):
+    for section in ("state", "why", "awaiting", "sweep", "items", "rounds", "diff"):
         assert f'id="{section}"' in build, f"#{section} is not built with the board"
 
 

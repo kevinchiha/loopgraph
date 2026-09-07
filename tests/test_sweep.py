@@ -22,7 +22,8 @@ from activities.config import parse_run_config
 from activities.execute_round import clean_candidates
 from workflow_fake import (ACCEPT, COMMITTED, DEFAULT_CONFIG, GREEN_ROUND, START,
                            ScriptedWorkflow, drive)
-from workflows.run import build_sweep_item, sweep_end_reason, trim_pass
+from workflows.run import (EXTRAS_CAP, build_sweep_item, merge_extras, pick_detector,
+                           sweep_end_reason, trim_pass)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -256,7 +257,7 @@ def test_a_failed_pass_reporting_nothing_names_the_detectors():
 
 class _DiscoverDiesOnPass(ScriptedWorkflow):
     """A fake whose `discover` dies on the nth pass. `fails` kills an activity on
-    its first call, and what this test needs is a pass that dies with an accepted
+    every call, and what this test needs is a pass that dies with an accepted
     item already behind it."""
 
     def __init__(self, pass_no: int, **kw) -> None:
@@ -407,6 +408,17 @@ def test_a_zero_second_deadline_is_still_a_deadline():
 
 # ---------- which detector each item comes from ----------
 
+def test_pick_detector_wraps_and_skips_empty():
+    """AC-15. The driven test below proves the loop still calls this; these are
+    the answers it calls it for. The all-zero case cannot be driven at all: a
+    pass where every detector reported nothing ends the run before the pick."""
+    entries = [_det(name="a", count=0), _det(name="b", count=3), _det(name="c", count=2)]
+    assert pick_detector(entries, 2) == 1, "past the end, back to the front, skipping a"
+    assert pick_detector(entries, 1) == 2
+    assert pick_detector(entries, None) == 1, "the first item starts at the front"
+    assert pick_detector([dict(d, count=0) for d in entries], 1) is None
+
+
 def test_round_robin_skips_empty_detectors_and_continues_from_the_last():
     """AC-15. One detector's list is often the same corner of the repo every
     pass, and taking it every time pins the run there while the others go
@@ -422,6 +434,17 @@ def test_round_robin_skips_empty_detectors_and_continues_from_the_last():
 
 
 # ---------- what the executor found by hand ----------
+
+def test_merge_extras_keeps_order_and_trims_from_the_front():
+    """AC-24. A candidate two items both reported keeps the place it first had.
+    Re-appending it would let a thing every executor notices walk the older ones
+    off the front, and the owner would never see the ones nobody worked."""
+    assert merge_extras(["x", "y"], ["y", "z"]) == ["x", "y", "z"]
+    assert merge_extras([], []) == []
+    carried = merge_extras([], [f"c{i}" for i in range(25)])
+    assert len(carried) == EXTRAS_CAP == 20
+    assert carried[0] == "c5" and carried[-1] == "c24", "the oldest five are dropped"
+
 
 def test_extras_ride_on_the_next_item_and_never_move_the_count():
     """AC-24. The executor may add work and never moves the number the run ends

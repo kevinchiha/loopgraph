@@ -19,13 +19,18 @@ keeps the branch. So assert on `cards`, on `ledger["reason"]` and on
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from activities.config import DEFAULT_CONVERGENCE
+
 # AC-1's defaults: what `load_run_config` returns for a run with no run.yaml.
-DEFAULT_CONFIG = {"convergence": {"enabled": True, "every_items": 5, "net_lines": 400},
-                  "sweep": None}
+# Imported rather than written out again, because a fake holding its own copy of
+# the numbers goes on answering the old shape after a default changes, and every
+# driven test then proves the run works against a config no run can be given.
+DEFAULT_CONFIG = {"convergence": dict(DEFAULT_CONVERGENCE), "sweep": None}
 
 GREEN_ROUND = {
     "status": "green", "attempts": 1, "claims": ["did the thing"],
@@ -94,7 +99,10 @@ class ScriptedWorkflow:
         if name in self._fails:
             raise self._fails[name]
         if name == "load_run_config":
-            return dict(self._config)
+            # Deep, because `run` keeps the answer as `self._config` and the
+            # convergence knobs live one level down: a shallow copy hands every
+            # test the same nested dict.
+            return copy.deepcopy(self._config)
         if name == "run_baseline":
             return "base1234"
         if name == "load_work_items":

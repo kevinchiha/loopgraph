@@ -8,11 +8,14 @@ answers the merge card with `B`.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from temporalio.exceptions import ActivityError, ApplicationError
 
-from workflow_fake import (COMMITTED, DEFAULT_CONFIG, GREEN_ROUND, ScriptedWorkflow,
-                           drive, drive_item)
+from activities.config import DEFAULT_CONVERGENCE, load_run_config
+from workflow_fake import (ACCEPT, COMMITTED, DEFAULT_CONFIG, GREEN_ROUND,
+                           ScriptedWorkflow, drive, drive_item)
 from workflows.run import build_convergence_item
 
 BAD_YAML = "run.yaml: unknown key 'yeild_floor' under sweep"
@@ -58,6 +61,18 @@ def test_the_convergence_text_is_exact():
 
 
 # ---------- run.yaml is read before anything else happens ----------
+
+def test_the_fake_answers_the_real_defaults():
+    """AC-1. Every driven test here and in test_sweep.py takes its config from
+    the fake, so a fake carrying its own copy of the numbers would keep the whole
+    suite green while the engine's own defaults said something else."""
+    fake = ScriptedWorkflow()
+    first = asyncio.run(fake.execute_activity(load_run_config, args=["runs/x"]))
+    second = asyncio.run(fake.execute_activity(load_run_config, args=["runs/x"]))
+    assert first == {"convergence": DEFAULT_CONVERGENCE, "sweep": None}
+    assert first["convergence"] is not second["convergence"], \
+        "one nested dict handed to two runs is one test's knob turning up in the next"
+
 
 def test_config_is_the_first_activity_and_runs_once():
     """AC-3. Reading the config after the baseline would mean a misspelt knob is
@@ -222,6 +237,9 @@ EMPTY_REFUSAL = {"committed": False, "reason": "empty write set"}
 CAP_REFUSAL = {"committed": False, "reason": "net lines +37 exceed the cap of 0",
                "added": 40, "deleted": 3, "net": 37}
 
+STOP = {"verdict": "stop", "reasons": ["nothing here was safe to take out"],
+        "directive": {}}
+
 
 def test_five_accepted_items_run_six():
     """AC-8 and AC-9. Five accepted items trip `every_items`, and the item the
@@ -235,6 +253,21 @@ def test_five_accepted_items_run_six():
     assert [e["n"] for e in ledger["items"]] == [1, 2, 3, 4, 5, 6]
     assert ledger["items"][5]["item"] == build_convergence_item(
         ["a.py", "b.py", "c.py", "d.py", "e.py"])
+
+
+def test_a_path_two_items_touched_is_listed_once():
+    """AC-9. `touched` is every path the accepted items wrote, and two items that
+    both edited one file put it in twice. The list is the whole of what the
+    executor is told to look at, so a repeated path reads as two things to check
+    and pushes the others down the item."""
+    fake = ScriptedWorkflow(config=_config(every_items=2), items=["one", "two"],
+                            checkpoints=[_cp(["shared.py", "b.py"]),
+                                         _cp(["shared.py", "a.py"])])
+    ledger = drive(fake)
+    conv = ledger["items"][2]
+    assert conv["kind"] == "convergence"
+    assert conv["item"].count("shared.py") == 1
+    assert conv["item"] == build_convergence_item(["a.py", "b.py", "shared.py"])
 
 
 def test_net_lines_trigger_between_items():
@@ -365,6 +398,23 @@ def test_the_location_line_counts_the_injected_item():
     assert _kinds(ledger) == ["brief", "brief", "convergence", "brief"]
     parked = next(c for c in fake.cards if c[0] == "parked")
     assert parked[3].startswith("item 4 of 4 parked")
+
+
+def test_a_halt_right_after_an_injection_names_the_convergence_item():
+    """AC-9. The stopped note speaks from where the run really is, and once the
+    engine has injected an item of its own that is item 6 of 6. Counting the
+    brief's five would point the owner at the last item they wrote, which the
+    auditor accepted."""
+    fake = ScriptedWorkflow(items=["one", "two", "three", "four", "five"],
+                            verdicts=[ACCEPT] * 5 + [STOP])
+    ledger = drive(fake)
+    assert _kinds(ledger) == ["brief"] * 5 + ["convergence"]
+    assert ledger["status"] == "stopped"
+    assert ledger["reason"].startswith("supervisor said stop:")
+    conv = ledger["items"][5]
+    assert (conv["status"], conv["reason"]) == ("parked", ledger["reason"])
+    assert [c[0] for c in fake.cards] == ["run stopped"], "a halt sends no merge card"
+    assert fake.cards[0][3].startswith("item 6 of 6\n\nwhy: supervisor said stop")
 
 
 def test_a_convergence_item_can_be_the_last_item():
