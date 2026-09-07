@@ -245,19 +245,26 @@ def test_trim_pass_keeps_group_names_and_counts_but_no_lines():
     ledger is carried whole on every dashboard poll. The names and the counts
     are what the per-pass breakdown reads, so they stay; the lines go. A pass
     recorded before this phase has no `groups` and grows none here: the key
-    would print nothing and change the shape of every pass already recorded."""
-    trimmed = trim_pass(_pass(_grouped({"lib/": 2, "app/": 5}),
-                              _det(name="ts-prune", count=1)), 2)
+    would print nothing and change the shape of every pass already recorded.
+
+    The groups arrive out of name order, which `_grouped` would not do, so a
+    trim that re-sorted them would show up here. The trim keeps the order it was
+    handed; sorting is `discover`'s job and it has already been done."""
+    unsorted = dict(_det(count=7), groups=[
+        {"name": "lib/", "count": 2, "lines": ["lib/io.py:4: unused import 'json'"]},
+        {"name": "app/", "count": 5, "lines": ["app/cli.py:12: unused function 'greet'"]}])
+    trimmed = trim_pass(_pass(unsorted, _det(name="ts-prune", count=1)), 2)
     kept, old = trimmed["detectors"]
-    assert kept["groups"] == [{"name": "app/", "count": 5}, {"name": "lib/", "count": 2}]
+    assert kept["groups"] == [{"name": "lib/", "count": 2}, {"name": "app/", "count": 5}]
     assert set(kept) == {"name", "cmd", "exit_code", "count", "note", "lines", "groups"}
     assert set(old) == {"name", "cmd", "exit_code", "count", "note", "lines"}
 
 
 def test_the_ledger_keeps_a_trimmed_pass_and_the_item_the_whole_sample():
-    """AC-23. The trim is the ledger's alone. The executor is handed every line
-    the detector printed, because the sample is the work; the ledger is carried
-    on every status query and has to stay small."""
+    """AC-23. The trim is the ledger's alone. This pass carries no `groups`, so
+    the item falls back to the whole detector as one `(all)` group and is handed
+    every line it printed, because the sample is the work; the ledger is carried
+    on every status query and keeps ten. The grouped path is the test below."""
     loud = dict(_det(count=93), lines=SIXTY, stderr_tail="x" * 2000)
     fake = ScriptedWorkflow(config=_sweep(max_items=1), passes=[_pass(loud)])
     ledger = drive(fake)
@@ -266,6 +273,23 @@ def test_the_ledger_keeps_a_trimmed_pass_and_the_item_the_whole_sample():
     assert "stderr_tail" not in kept, "the detector was green"
     assert [line for line in ledger["items"][0]["item"].splitlines()
             if line in SIXTY] == SIXTY
+
+
+def test_a_grouped_item_quotes_its_group_alone_and_the_ledger_quotes_none():
+    """AC-7 and AC-23. An item is one group's work, so it holds that group's
+    sample and not a line of the other's; the other is named and counted, which
+    is all the picture the executor needs. The ledger goes the other way and
+    keeps every group's name and count and no lines at all."""
+    grouped = _grouped({"app/": 3, "lib/": 2})
+    app, lib = grouped["groups"]
+    fake = ScriptedWorkflow(config=_sweep(max_items=1), passes=[_pass(grouped)])
+    ledger = drive(fake)
+    lines = ledger["items"][0]["item"].splitlines()
+    assert [line for line in lines if line in app["lines"]] == app["lines"]
+    assert not [line for line in lines if line in lib["lines"]], "another item's work"
+    assert "lib/: 2 candidates" in lines, "named, not sampled"
+    kept = ledger["sweep"]["passes"][0]["detectors"][0]
+    assert kept["groups"] == [{"name": "app/", "count": 3}, {"name": "lib/", "count": 2}]
 
 
 # ---------- what ends a sweep ----------

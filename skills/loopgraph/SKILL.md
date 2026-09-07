@@ -241,11 +241,12 @@ the tail of what it wrote to stderr so you can see why. A misspelt key anywhere
 in the file stops the run before it starts, with the key named in the reason.
 
 `groups` is optional. Each entry is a path prefix compared verbatim against the
-path at the start of every candidate line, so it should end in `/`: `app/`
-matches `app/core.py` and nothing outside that directory, while `app` also
-matches `apple.py`. A candidate no prefix matches goes to a group called
-`(other)`. Leave the key out and candidates are grouped by their top-level
-directory, with files at the repo root in `(root)`.
+path at the start of every candidate line, which has any leading `./` taken off
+first, so write the prefix without one and end it in `/`: `app/` matches
+`app/core.py` and nothing outside that directory, while `app` also matches
+`apple.py` and `./app/` matches nothing. A candidate no prefix matches goes to a
+group called `(other)`. Leave the key out and candidates are grouped by their
+top-level directory, with files at the repo root in `(root)`.
 
 Each sweep item takes one group of the chosen detector's candidates, and the next
 item takes the next group by name, wrapping round; one pointer carries across

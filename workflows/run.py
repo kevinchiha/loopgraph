@@ -264,12 +264,12 @@ def trim_pass(found: dict, pass_no: int) -> dict:
     60 candidate lines and a 2000-character stderr tail per detector.
 
     Ten lines is enough for the owner to see what a pass was looking at, and the
-    executor still gets all 60: this returns a copy and leaves `found` alone,
-    which is what the item text is built from. The stderr tail is kept only where
-    the note says there is something to read, which is the same test `lg status`
-    and the dashboard use to decide whether to name the detector at all. `cmd`
-    stays whatever the note says: it is one short string, and an owner reading a
-    failed pass wants to see which command it was.
+    executor still gets the chosen group's whole sample: this returns a copy and
+    leaves `found` alone, which is what the item text is built from. The stderr
+    tail is kept only where the note says there is something to read, which is
+    the same test `lg status` and the dashboard use to decide whether to name the
+    detector at all. `cmd` stays whatever the note says: it is one short string,
+    and an owner reading a failed pass wants to see which command it was.
 
     A group keeps its name and its count and never its sample: the sample is the
     detector's own lines split up again, and the names and counts are all the
@@ -364,7 +364,8 @@ def pick_group(groups: list[dict], last: str | None) -> int | None:
 def detector_groups(entry: dict) -> list[dict]:
     """A detector entry's groups, with a pass that predates them read as one group.
 
-    Every read of a detector's groups in the workflow goes through here. A run
+    Every read that builds an item goes through here; `trim_pass` checks for the
+    key itself, on purpose, so an old pass trims to the key set it had. A run
     that started before groups existed has no `groups` in its history, and
     Temporal replays that history through today's code: raising would fail the
     workflow task and leave the run stuck with nothing to do about it. Reading
@@ -624,8 +625,9 @@ class LoopGraphRun:
             except Exception as e:  # noqa: BLE001 - the sweep ends, the run reports
                 reason = f"discover failed: {audit_failure_reason(e)}"
                 break
-            # `found` stays a local: the item text below quotes all 60 of a
-            # detector's lines, and the ledger keeps ten of them.
+            # `found` stays a local: the item text below quotes one group's whole
+            # sample and names the other groups, and the ledger keeps ten lines
+            # per detector.
             self._ledger["sweep"]["passes"].append(trim_pass(found, pass_no))
             elapsed = (workflow.now() - start).total_seconds()
             reason = sweep_end_reason(self._ledger["sweep"]["passes"], sweep, elapsed,

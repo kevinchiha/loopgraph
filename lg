@@ -124,7 +124,7 @@ SWEEP_LINES = {
 }
 
 
-def _group_breakdown(entries: list[dict]) -> str:
+def _group_breakdown(entries: list[dict] | None) -> str:
     """A pass's candidates by path group: `<name> <count>`, joined by `, `.
 
     Summed across the pass's detectors, because two tools reporting the same
