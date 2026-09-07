@@ -1563,7 +1563,17 @@ def test_the_title_and_favicon_are_written_only_on_change():
         "the icon is assigned before anything compares it"
     assert not re.search(r"\.href\s*=", src), \
         "the .href property is the browser's copy of the URL, not the string that was written"
-    assert "FAV_WAIT" in src and "FAV_IDLE" in src, "the poll writes an icon it did not declare"
+
+    # Which icon goes with which count, and not merely that both names appear.
+    # Swapped, the page is the exact inverse of AC-4 — a blue dot when nothing
+    # needs the reader and a dim one when a run does — and every rule above it
+    # here still holds, because both consts are still read and still written
+    # through the guard. Only the order says which is which.
+    icon = re.search(r"const \w+ = (\w+) \? FAV_WAIT : FAV_IDLE;", src)
+    assert icon, "the icon a waiting run gets is not FAV_WAIT, or the two are the wrong way round"
+    counted = re.search(r"const (\w+) = \w+\.filter\(", src)
+    assert counted and icon.group(1) == counted.group(1), \
+        "the icon is chosen off something other than the count of waiting runs"
 
 
 def test_archived_rows_do_not_count_toward_the_title():
@@ -1590,8 +1600,14 @@ def test_archived_rows_do_not_count_toward_the_title():
     held, rows, row, expr = count.groups()
     assert rows == served.group(1), \
         "the count comes from something other than the reply the rows came from"
-    assert f"{row}.state === 'waiting'" in expr, "the count is not of the runs that are waiting"
-    assert f"!{row}.archived" in expr, "an archived run still counts toward the tab"
+    # The whole expression, not two substrings of it, because the operator joining
+    # them is the half that decides what the tab says and the half a substring
+    # cannot see. Swap the `&&` for `||` and both substrings are still there,
+    # every row passes — no reply carries `archived`, so `!r.archived` is true on
+    # all of them — and the tab reads `(4) loopgraph` with nothing waiting at all.
+    # Task 8 comes back to this exact line, which is why it is pinned whole.
+    assert " ".join(expr.split()) == f"{row}.state === 'waiting' && !{row}.archived", \
+        f"the count is not `state === 'waiting'` AND not archived; it reads `{expr.strip()}`"
 
     title = re.search(rf"{held} \? `\(\$\{{{held}\}}\) loopgraph` : 'loopgraph'", src)
     assert title, \
