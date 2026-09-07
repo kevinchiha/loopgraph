@@ -77,6 +77,10 @@ PAGE = """<!doctype html>
   .green { background:rgba(63,185,80,.15); color:#3fb950; }
   .red { background:rgba(248,81,73,.15); color:#f85149; }
   .yellow { background:rgba(210,153,34,.15); color:#d29922; }
+  /* A run blocked on its owner, and the one pill on the rail that is asking for
+     something. It takes the accent blue the awaiting card and the selected row
+     already wear, so the colour means the same thing everywhere on the page. */
+  .blue { background:rgba(88,166,255,.15); color:#58a6ff; }
   .gray { background:rgba(125,133,144,.15); color:#8b949e; }
   #board { flex:1; overflow-y:auto; padding:16px 20px; min-width:0; }
   .empty { color:var(--dim); text-align:center; padding:40px 0; font-size:13px; }
@@ -221,8 +225,13 @@ let sel = null;
 const LOG_RE = new RegExp(__LOG_RE__);
 // The role in the filename, and the word the reader sees for it.
 const ROLES = [['executor', 'executor'], ['audit', 'supervisor']];
-const pill = s => ({green:'green',running:'yellow',stopped:'red',failed:'red','merge-ready':'green',
-  merged:'green',held:'gray',discarded:'gray',unknown:'gray'}[s]||'gray');
+// The class per state word. `waiting` is not one the engine writes: no ledger
+// carries it and grepping the workflows for it finds nothing. It is what
+// run_entry and patchState say for a run whose ledger holds an `awaiting` and
+// whose workflow is still open, and it has a colour of its own because a run
+// asking the owner for something must not read like a run getting on with it.
+const pill = s => ({green:'green',running:'yellow',waiting:'blue',stopped:'red',failed:'red',
+  'merge-ready':'green',merged:'green',held:'gray',discarded:'gray',unknown:'gray'}[s]||'gray');
 const esc = t => t.replaceAll('&','&amp;').replaceAll('<','&lt;');
 // Assigning textContent builds a NEW text node even when the string is the one
 // already there, and the reader's selection lives in the old one. Every text a
@@ -381,7 +390,10 @@ function buildPassRow(pass) {
   return row;
 }
 // status and reason, or the one line saying why there is no state at all.
-function patchState(d) {
+// `live` is the run's own start and close times, off the rail row's data-live
+// stamp, and it is handed in rather than read here so the whole board answers
+// one reading of it.
+function patchState(d, live) {
   const ledger = d && d.ledger;
   const box = document.getElementById('state');
   const why = document.getElementById('why');
@@ -392,8 +404,15 @@ function patchState(d) {
   document.getElementById('diff').hidden = !ledger;
   if (ledger) {
     const [word, reason] = box.children;
-    word.className = 'pill ' + pill(ledger.status);
-    setText(word, ledger.status || 'unknown');
+    // The rail's rule, on the rail's two facts, so the two pills cannot say
+    // different words about one run. A ledger holding a question is a run
+    // waiting on its owner; a workflow that has closed is asking nobody
+    // anything, whatever it left written down. `live` and never the status:
+    // an engine failure closes a workflow with its ledger still reading
+    // `running` and its question still in it.
+    const state = ledger.awaiting && live ? 'waiting' : (ledger.status || 'unknown');
+    word.className = 'pill ' + pill(state);
+    setText(word, state);
     setText(reason, ledger.reason || '');
     return;
   }
@@ -405,9 +424,18 @@ function patchState(d) {
 }
 // What the run is asking. It goes the moment the workflow pops `awaiting`, which
 // it does as soon as the owner answers, so the next poll is the whole of AC-6.
-function patchAwaiting(ledger) {
+//
+// And it goes when the run closes, on the same rule the pills follow: run.py's
+// blanket handler records `stopped` and hands back the ledger it was holding,
+// question and all, so a run whose engine died closes with its card still
+// written down. Left to the ledger alone the block would ask the owner to answer
+// a run that ended — three lines under a pill saying it had stopped.
+//
+// `live` is folded into the value rather than tested beside it, so the block is
+// still shown or hidden by one `hidden = !a`.
+function patchAwaiting(ledger, live) {
   const box = document.getElementById('awaiting');
-  const a = ledger && ledger.awaiting;
+  const a = live && ledger && ledger.awaiting;
   box.hidden = !a;
   if (!a) return;
   const [head, q, opts, answer, nocard] = box.children;
@@ -551,9 +579,13 @@ function patchItemRow(row, entry) {
 // One reply, three sections. patchRounds is not called from here: the log names
 // come from the other request and have to be handed down with the run they were
 // fetched for, which only poll() holds.
-function patchBoard(d) {
-  patchState(d);
-  patchAwaiting(d && d.ledger);
+//
+// `live` goes to the two sections that say what the run wants from its owner.
+// The sweep and the work items are the record of what it did, which a run that
+// has closed still has.
+function patchBoard(d, live) {
+  patchState(d, live);
+  patchAwaiting(d && d.ledger, live);
   patchSweep(d && d.ledger);
   patchItems(d && d.ledger);
 }
@@ -891,9 +923,14 @@ async function poll() {
     // them, because a round with no verdict means one thing on a workflow that
     // is running and nothing at all on one that closed yesterday.
     if (run === sel) {
-      patchBoard(state);
+      // Read once for the whole board. Two readings a line apart are two
+      // answers, and a run can close between them — the pill would then come
+      // from one and the round cards from the other, which is the page
+      // contradicting itself over the one fact both are reading.
+      const live = runIsLive(run.id);
+      patchBoard(state, live);
       patchRounds(run.dir, (state && state.ledger && state.ledger.rounds) || [],
-                  logs.logs || [], runIsLive(run.id));
+                  logs.logs || [], live);
     }
   } catch(e) { /* the board keeps what it has until the next poll */ }
   patchOpenPanes();
@@ -962,6 +999,13 @@ def run_entry(wf_id: str, status: str, start_time: datetime | None,
     The times come straight off WorkflowExecution and go out as ISO 8601. A
     running workflow has no close time, and a row built from log files alone has
     neither, so the page shows no time rather than a wrong one.
+
+    `state` is `waiting` on the one run the owner has to do something about, and
+    that is read off `awaiting` against the close time rather than off the
+    ledger's own status. The status says `running` for the whole of a run's life,
+    card up or not, so it cannot tell the two apart; and it says `stopped` on a
+    workflow whose engine died holding a card, so the ledger alone would leave
+    that run asking for ever.
     """
     entry = {"id": wf_id,
              "dir": wf_id[4:wf_id.rfind("-")] if wf_id.startswith("run-") else wf_id,
@@ -974,6 +1018,14 @@ def run_entry(wf_id: str, status: str, start_time: datetime | None,
         verdict = rounds[-1].get("verdict", "") if rounds else ""
         entry["state"] = ledger.get("status", entry["state"])
         entry["detail"] = f"r{len(rounds)} {verdict}".strip()
+        # Open, so the question is still live and there is something to answer.
+        # workflows/run.py's blanket handler records `stopped` and returns the
+        # ledger it was holding, `awaiting` and all, so a closed workflow keeps
+        # its card in the record — and nothing on this page may claim a run that
+        # has finished is asking for something.
+        if ledger.get("awaiting") and close_time is None:
+            entry["state"] = "waiting"
+            entry["detail"] = f"r{len(rounds)} · waiting on you"
     return entry
 
 

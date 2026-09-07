@@ -447,6 +447,11 @@ LEDGER = {"status": "merge-ready", "rounds": [{"verdict": "PASS"}]}
 KNOWN = "run-2026-01-01-demo-aaaaaa"
 START = datetime(2026, 9, 5, 15, 45, 29, tzinfo=timezone.utc)
 CLOSE = datetime(2026, 9, 5, 16, 0, 0, tzinfo=timezone.utc)
+# The card a run holds while it waits, in the shape `workflows/run.py` writes
+# under `awaiting` — and the shape it leaves behind in a ledger when the run dies
+# with the card still up.
+AWAITING = {"kind": "decision", "question": "which port?", "options": {"A": "8400"},
+            "telegram": False, "answer_with": f"lg approve {KNOWN} <A>"}
 
 
 class FakeFeed:
@@ -495,6 +500,50 @@ def test_run_entry_formats_times_and_keeps_dir():
     # Two workflows of one run directory: two rows, two ids, one dir, one set of logs.
     assert done["dir"] == live["dir"] == "2026-01-01-demo"
     assert done["id"] != live["id"]
+
+
+@pytest.mark.parametrize("recorded", ["running", "held"])
+def test_a_waiting_open_workflow_reads_waiting_in_run_entry(recorded):
+    """AC-1. A run holding a card is the one row on the rail the owner has to do
+    something about, and it read `running` — the same word as the twenty minutes
+    it spends letting an executor work, which is what it is doing almost all of
+    the time. One word for both is a rail that says nothing.
+
+    The ledger's own status is not the signal and cannot be made into one: it
+    reads `running` for the whole of a run's life, card up or not. `awaiting` is
+    what the workflow writes when it asks and pops when it is answered, so that
+    is what the row is read off.
+    """
+    ledger = {"status": recorded, "rounds": [{"verdict": "REDO"}], "awaiting": AWAITING}
+    row = ui.run_entry(KNOWN, "running", START, None, ledger)
+    assert row["state"] == "waiting", "the ledger's own word won over the card it is holding"
+    assert row["detail"] == "r1 · waiting on you"
+
+    # An answered card is a key the workflow has popped, and an empty one would
+    # be a card asking nothing. Neither is a run waiting on anybody, and the row
+    # they get is the row every other run gets.
+    for nothing in ({}, None):
+        quiet = ui.run_entry(KNOWN, "running", START, None, dict(ledger, awaiting=nothing))
+        assert quiet["state"] == recorded
+        assert quiet["detail"] == "r1 REDO"
+
+
+def test_a_closed_workflow_with_a_stale_awaiting_is_not_waiting():
+    """The other half of AC-1, and the common case rather than the odd one.
+
+    `workflows/run.py`'s blanket handler records `status="stopped"` and hands
+    back the ledger it was holding, `awaiting` and all, so a run whose engine
+    died closes with its question still written down. Read off the ledger alone
+    the rail would call that run waiting for ever, and the owner would go and
+    answer something that ended hours ago.
+
+    The workflow's close time is what settles it, and it is already on the wire
+    for AC-3: a start with no close is a run still going.
+    """
+    ledger = {"status": "stopped", "rounds": [{"verdict": "REDO"}], "awaiting": AWAITING}
+    row = ui.run_entry(KNOWN, "completed", START, CLOSE, ledger)
+    assert row["state"] == "stopped", "a run that has finished is not asking for anything"
+    assert row["detail"] == "r1 REDO", "the detail is the one every other closed run gets"
 
 
 def test_run_endpoint_without_temporal_is_null_and_200(server):
@@ -742,6 +791,19 @@ def test_the_injected_pattern_survives_javascript():
 #     stopped.
 #     A page that contradicts itself here is worse than one that says nothing: the
 #     reader cannot tell which half to believe.
+#     Nothing in items 1 to 3 makes a run that is WAITING, and this item only
+#     compares whatever words are already on screen, so serve a pair by hand the
+#     way item 10 does: `ui.make_server(8410, Path('runs'), temporal_addr=None,
+#     feed=FakeFeed(rows=[...], ledgers={id: {..., "awaiting": {...}}}))`, with one
+#     row carrying a `start_time` and no `close_time` — that pair is what
+#     patchRunRow turns into `data-live`, which the board's waiting branch reads —
+#     and a second row carrying both times and the same stale `awaiting`.
+#     See, on the open run: `waiting` in blue in the rail row and `waiting` in blue
+#     on the board, with the awaiting block under them.
+#     See, on the closed one: the status it recorded — `stopped` on a run the
+#     engine died in — and no awaiting block at all. No question, no options, no
+#     `lg approve` command. A run that has ended asking to be answered is this
+#     item's failure, not item 9's.
 #
 #  5. Scroll to the foot of the board, past the round cards. The diff pane is
 #     there, closed. Open it.
@@ -1615,6 +1677,124 @@ def test_the_awaiting_block_goes_when_the_workflow_pops_it():
     src = function_source(ui.page_html(), "patchAwaiting")
     assert re.search(r"\.hidden\s*=\s*!\w+;", src), \
         "the block's visibility does not follow the ledger's awaiting"
+
+
+def test_the_waiting_pill_has_its_own_class():
+    """AC-2. A word is only a signal if it looks like one: `waiting` in the same
+    yellow as `running` is the rail saying what it said before, on a page whose
+    job is picking one row out of fifteen.
+
+    `waiting` is not a status the engine writes anywhere — grep the workflows and
+    it is not there. It is the word run_entry and patchState compute from
+    `awaiting` and the run's own times, so nothing else on the page maps to its
+    colour either.
+
+    What this cannot see is the colour itself. Checklist item 4 is where the pill
+    is looked at.
+    """
+    html = ui.page_html()
+    table = re.search(r"const pill = \w+ => \(\{(.*?)\}\[", script_of(html), re.S)
+    assert table, "the pill map is no longer one object literal, so this cannot read it"
+    classes = dict(re.findall(r"'?([\w-]+)'?\s*:\s*'([\w-]+)'", table.group(1)))
+    assert classes.get("running") == "yellow", "the map this is written against has moved"
+    assert classes.get("waiting") == "blue", "a waiting run wears no class of its own"
+    assert [s for s, c in classes.items() if c == "blue"] == ["waiting"], \
+        "another state wears the waiting colour, so the rail tells them apart by nothing"
+    rule = re.search(r"\.blue \{([^}]*)\}", html)
+    assert rule, "the waiting pill has a class and no style, so it reads as plain text"
+    assert "background" in rule.group(1) and "color" in rule.group(1), \
+        "a pill with only half a colour is not a pill"
+
+
+def test_the_board_pill_says_waiting_only_on_a_live_run():
+    """AC-2's second pill. The rail reads `waiting` off run_entry; the board has
+    to reach the same word from the same two facts, or checklist item 4 finds the
+    page contradicting itself — a row reading `waiting` above a board reading
+    `stopped` is worse than either alone, because the reader cannot tell which
+    half to believe.
+
+    Liveness comes off the row's `data-live` stamp and never off the ledger's
+    status, for the reason
+    test_only_a_run_that_is_still_open_claims_a_round_is_in_progress records: an
+    engine failure leaves a closed workflow's ledger reading `running`, so the
+    ledger is exactly the thing that cannot answer this question.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchState")
+    args = re.match(r"function patchState\(\w+, (\w+)\)", src)
+    assert args, "patchState is not told whether the run is still open"
+    guard = re.search(r"const (\w+) = ([^;]*) \? 'waiting' : ([^;]+);", src)
+    assert guard, "the board pill never says `waiting`"
+    assert re.search(r"\w+\.awaiting\b", guard.group(2)), \
+        "the waiting word is not read off the question the ledger is holding"
+    assert re.search(rf"\b{args.group(1)}\b", guard.group(2)), \
+        "the waiting word is not gated on whether the run is still open"
+    assert "status" in guard.group(3), "a run that is not waiting says something other than its status"
+    assert "|| 'unknown'" in guard.group(3), "a ledger carrying no status leaves the pill empty"
+    word = guard.group(1)
+    assert re.search(rf"pill\({word}\)", src) and re.search(rf"setText\(\w+, {word}\)", src), \
+        "the pill's colour and the pill's word are read off two different values"
+
+    board = function_source(html, "patchBoard")
+    passed = re.match(r"function patchBoard\(\w+, (\w+)\)", board)
+    assert passed, "patchBoard is not told whether the run is still open"
+    assert re.search(rf"patchState\(\w+, {passed.group(1)}\)", board), \
+        "patchBoard patches the state pill without the liveness it was handed"
+
+
+def test_the_poll_hands_liveness_to_the_board():
+    """One reading of the row's stamp, handed to everything on the board that
+    answers to it.
+
+    Two reads a line apart are two answers, and a run can close between them: the
+    board would then carry a pill from one reading and a round card from the
+    other, which is the contradiction checklist item 4 looks for.
+    """
+    src = function_source(ui.page_html(), "poll")
+    held = re.search(r"const (\w+) = runIsLive\(\w+\.id\);", src)
+    assert held, "the poll asks whether the run is open without holding the answer"
+    live = held.group(1)
+    assert src.count("runIsLive(") == 1, \
+        "the pills and the round cards read the stamp separately, so they can disagree"
+    assert re.search(rf"patchBoard\(\w+, {live}\)", src), \
+        "the board is patched without knowing whether its run is still open"
+    assert re.search(rf"patchRounds\([^;]*\b{live}\)", src), \
+        "the round cards are patched with something other than the poll's own reading"
+
+
+def test_a_dead_run_stops_asking_to_be_answered():
+    """AC-1's second sentence, and the reason it is in the spec at all.
+
+    `workflows/run.py`'s blanket handler records `status="stopped"` and returns
+    the ledger with `awaiting` still in it, so a run whose engine died closes with
+    its card written down. The pills stop saying `waiting` — and the block three
+    lines under them would go on showing the question, the options and an
+    `lg approve …` command for a run that ended. That is the page telling the
+    owner to answer something nothing is listening to.
+
+    So the card follows the pills. The liveness is folded into the value the hide
+    already tests rather than tested beside it, which keeps the single
+    `hidden = !<name>` line test_the_awaiting_block_goes_when_the_workflow_pops_it
+    is written against.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchAwaiting")
+    args = re.match(r"function patchAwaiting\(\w+, (\w+)\)", src)
+    assert args, "patchAwaiting is not told whether the run is still open"
+    hide = re.search(r"\.hidden = !(\w+);", src)
+    assert hide, "the block's visibility no longer follows one value"
+    shown = re.search(rf"const {hide.group(1)} = ([^;]+);", src)
+    assert shown, "the value the hide tests is not built in one place"
+    assert re.search(rf"\b{args.group(1)}\b", shown.group(1)), \
+        "the block is shown on a run that has closed, question and command and all"
+    assert f"if (!{hide.group(1)}) return;" in src, \
+        "the heading, the question, the options and the command are written anyway"
+
+    board = function_source(html, "patchBoard")
+    passed = re.match(r"function patchBoard\(\w+, (\w+)\)", board)
+    assert passed, "patchBoard is not told whether the run is still open"
+    assert re.search(rf"patchAwaiting\([^)]*\b{passed.group(1)}\)", board), \
+        "patchBoard patches the awaiting card without the liveness it was handed"
 
 
 def test_a_null_ledger_hides_the_state_sections_and_keeps_the_logs():

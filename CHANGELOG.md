@@ -6,6 +6,14 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- The dashboard says `waiting` on a run that is blocked on you, in the left rail and
+  on the board, where it used to say `running`. `running` is also what it says while
+  an executor works, which is most of a run's life, so the one run you had to answer
+  looked like every other one.
+- A run that has finished never says `waiting`, and its question, its options and its
+  `lg approve` command come off the board with it. A run whose engine died keeps its
+  last card in the record, and the page was still asking you to answer it.
+
 ## 0.2.0 - 2026-09-07
 
 - Sweep runs: a `run.yaml` with detectors makes the engine remove what they report,
