@@ -141,9 +141,28 @@ PAGE = """<!doctype html>
   .item .detail { grid-column:2 / 5; color:var(--dim); word-break:break-word;
                   font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; }
   .item .detail:empty { display:none; }
-  .round { margin-bottom:22px; }
-  #sweep > h2, #items > h2, .round > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px;
-                                          color:var(--dim); text-transform:uppercase; margin-bottom:8px; }
+  /* A card with edges, and the same three the awaiting card and the log panes
+     already wear: a run of twelve rounds ran down the board with nothing but the
+     gap between them saying where one ended, and a card collapsed to one line has
+     not even that. The padding is the awaiting card's — a border is only a
+     boundary if the text stops short of it. */
+  .round { margin-bottom:22px; background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:13px 16px; }
+  #sweep > h2, #items > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px;
+                             color:var(--dim); text-transform:uppercase; margin-bottom:8px; }
+  /* The summary is the whole of a closed card, so it wears what the card's
+     heading wore. The gap under it belongs to the fields below it and is only
+     there when they are. The triangle is the browser's own, the same one every
+     log pane shows, so a card looks like the thing it is. */
+  .round > summary { cursor:pointer; user-select:none; font-size:11px; font-weight:700;
+                     letter-spacing:1.2px; color:var(--dim); text-transform:uppercase; }
+  .round[open] > summary { margin-bottom:8px; }
+  /* The separator between the summary's pieces, put in by the stylesheet and not
+     written into the text. A round with no verdict yet and no files leaves those
+     two spans empty, and an empty span gets no dot in front of it; written into
+     the text the poll would have to add and remove the dots itself, on the one
+     line this whole change exists to keep short. */
+  .round > summary > span:not(:empty) ~ span:not(:empty)::before { content:' · '; }
   /* The verdict is the one word on the card that says whether anything was
      accepted, so it is not dim like the labels around it. */
   .round .verdict { font:700 12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -655,16 +674,32 @@ function roundVerdict(entry) {
   if (entry.status === 'green') return 'audit running';
   return '';
 }
-function buildRoundCard(key) {
-  const card = document.createElement('div');
+// A <details>, so the card collapses to its summary and the browser keeps the
+// state — the log panes are written the same way, and a collapse flag of the
+// page's own is one more thing to get out of step with what is on screen.
+//
+// `open` is decided by the caller and set here, on a node that is not on screen
+// yet, and it is never written again. patchRounds hands in whether this is the
+// newest round on the board at the moment the card is made; a poll that asked
+// again would shut the card the reader opened two seconds ago, which is the
+// failure the comments above about selections and open panes are all about. So a
+// live run watched through twelve rounds ends with twelve open cards. That is
+// what never taking one away costs.
+function buildRoundCard(key, open) {
+  const card = document.createElement('details');
   card.className = 'round';
   card.dataset.key = key;
+  card.open = open;
   // Empty on purpose, exactly as a run row is: every word comes from
   // patchRoundCard, so there is one code path for the text instead of two that
   // have to agree, and nothing a supervisor wrote can reach the page as markup.
+  // The summary is three spans rather than one, because its three pieces are
+  // three readings off the round and each is written by a setText of its own.
   // The reasons are a box rather than a span: one row per reason, put there by
   // patchReasons. Every other field is still one span holding one string.
-  card.innerHTML = '<h2></h2><div class="verdict"></div>'
+  card.innerHTML = '<summary><span class="s-head"></span>'
+                 + '<span class="s-verdict"></span><span class="s-files"></span></summary>'
+                 + '<div class="verdict"></div>'
                  + '<div class="field"><b>reasons</b><div class="rows"></div></div>'
                  + '<div class="field"><b>files</b><span></span></div>'
                  + '<div class="field"><b>directive</b><span></span></div>'
@@ -702,13 +737,18 @@ function patchRoundCard(card, row, live) {
   // has a log file growing and no row at all. An empty entry reads every field
   // below as absent, which is exactly what they are.
   const entry = row.entry || {};
-  const [head, verdict, reasons, files, directive, asked, replied] = card.children;
+  const [summary, verdict, reasons, files, directive, asked, replied] = card.children;
+  // The summary is the whole of the card while it is closed, and its three
+  // pieces are written one at a time so a poll that changes the verdict leaves
+  // the other two nodes alone. Never the <summary> element itself: setText
+  // assigns textContent, and textContent here would take all three spans down
+  // with it — innerHTML with the name filed off.
+  const [head, summaryWord, summaryFiles] = summary.children;
   const word = roundVerdict(entry);
   // Both halves of a round's life, and they are two states rather than one. The
   // first is the card with no row behind it. The second is the row written and
   // the audit still out, which lasts up to 30 minutes — a card that knew only
   // the first would go quiet for half an hour on a round that is still running.
-  // The suffix goes when the verdict arrives.
   //
   // And neither half means anything on a run that has closed. Both are read off
   // a ledger the page could not get, so on the logs-only view every round of a
@@ -719,7 +759,22 @@ function patchRoundCard(card, row, live) {
   // whose ledger cannot be read.
   const running = live && (!row.entry || word === 'audit running');
   const [item, round] = card.dataset.key.split('-');
-  setText(head, `item ${item} · round ${round}` + (running ? ' · in progress' : ''));
+  // Two ways of saying one thing, and the summary picks whichever says more.
+  // `running` is still both halves of a round's life, but the summary now has a
+  // verdict span and through the whole audit window that span already reads
+  // `audit running` — appending the suffix as well would collapse the card to
+  // `item 1 · round 2 · in progress · audit running · 3 files`, the same news
+  // twice on the one line the reader is left with. So the suffix takes the half
+  // with no word at all: the executor inside the round, no ledger row, and
+  // nothing else on the line saying so.
+  setText(head, `item ${item} · round ${round}` + (running && !word ? ' · in progress' : ''));
+  setText(summaryWord, word);
+  // How much the round touched, for a reader scanning a board of closed cards.
+  // The list itself is on the card below and is half of what opening one is for.
+  // Nothing rather than `0 files` where there is no entry yet: that is a
+  // measurement of work that has not happened, not a round that changed nothing.
+  const touched = (entry.files || []).length;
+  setText(summaryFiles, touched ? (touched === 1 ? '1 file' : `${touched} files`) : '');
   verdict.hidden = !word;
   setText(verdict, word);
   // A row per reason rather than one string with newlines in it. One string was
@@ -840,7 +895,11 @@ function patchRounds(dir, rounds, names, live) {
   for (const key of keys) {
     let card = [...box.children].find(c => c.dataset.key === key);
     if (!card) {
-      card = buildRoundCard(key);
+      // Open only if it is the newest round on the board right now — `keys` is
+      // sorted newest-first, so that is keys[0]. Decided once, here, where the
+      // card is made: the cards already on screen are the reader's, and a poll
+      // that worked this out again would close the one they had opened.
+      card = buildRoundCard(key, key === keys[0]);
       // Newest first, and put in place rather than re-sorted: the cards already
       // on the board are in order, so putting each new one in front of the first
       // older card moves nothing the reader is looking at.

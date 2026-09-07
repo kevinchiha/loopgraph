@@ -2250,6 +2250,158 @@ def test_only_a_run_that_is_still_open_claims_a_round_is_in_progress():
         f"the suffix is gated on {guard.group(1)!r} rather than the run's own liveness"
 
 
+def test_a_round_card_is_a_details_with_a_summary():
+    """AC-9. A run of twelve rounds was twelve fully-expanded cards and one very
+    long scroll, with nothing between one card and the next saying where the
+    boundary was.
+
+    <details> carries `open` itself and brings the triangle and the keyboard with
+    it — the log panes are written on it for the same reason, and a collapse
+    state of the page's own is one more thing to get out of step with what is on
+    screen.
+
+    The summary is three spans and not one string. The head, the verdict word and
+    the file count are three separate readings off the round written by three
+    setTexts, so a poll that changes the verdict leaves the other two nodes where
+    they were.
+    """
+    html = ui.page_html()
+    build = function_source(html, "buildRoundCard")
+    assert "createElement('details')" in build, "a round card cannot be collapsed"
+    markup = re.search(r"innerHTML = '([^']*)'", build)
+    assert markup and markup.group(1).startswith("<summary>"), \
+        "the summary is not the card's first child, so a closed card shows nothing at all"
+    for cls in ("s-head", "s-verdict", "s-files"):
+        assert f'<span class="{cls}"></span>' in build, \
+            f"the summary carries no {cls} span for the poll to write into"
+    assert "<h2>" not in build, \
+        "the card still builds the heading the summary replaced, so the line is drawn twice"
+    assert ".round > h2" not in html, \
+        "the stylesheet still dresses a heading no round card has"
+
+
+def test_only_the_newest_card_is_created_open():
+    """AC-9's second half, and what makes a live run watchable.
+
+    The keys are sorted newest-first, so the newest round is keys[0] and every
+    other card arrives closed. The comparison is made where the card is made and
+    nowhere else: a poll that decided it again would shut the card the reader
+    opened two seconds earlier, and taking away what the reader is holding is the
+    failure four comments in ui.py already record bugs for. So `.open` is written
+    once, by the builder, on a node that is not on screen yet, and no patch…
+    function writes it at all.
+
+    A live run watched through twelve rounds therefore ends with twelve open
+    cards. That is the price of never taking one away, and it is the one chosen.
+    """
+    html = ui.page_html()
+    src, regs = regions(html)
+    rounds = function_source(html, "patchRounds")
+    keys = re.search(r"const (\w+) = Object\.keys\(\w+\)\.sort\(newerFirst\);", rounds)
+    assert keys, "the keys are no longer sorted newest-first, so there is no newest to compare to"
+    assert re.search(rf"buildRoundCard\(\w+, \w+ === {keys.group(1)}\[0\]\)", rounds), \
+        "a card is not created open exactly when its key is the newest one on the board"
+    build = function_source(html, "buildRoundCard")
+    assert re.match(r"function buildRoundCard\(\w+, \w+\)", build), \
+        "buildRoundCard is not told whether the card it is making is the newest one"
+    assert re.search(r"\w+\.open = \w+;", build), "the builder never opens the newest card"
+    for name, s, e in regs:
+        if name.startswith("patch"):
+            assert not re.search(r"\.open\s*=[^=]", src[s:e]), \
+                f"{name} runs on every poll and writes .open, shutting a card the reader opened"
+
+
+def test_the_summary_carries_verdict_word_and_file_count():
+    """AC-10. A closed card is one line, so that line answers the two questions a
+    reader scrolling a finished run has: what did this round decide, and how much
+    did it touch.
+
+    The word is roundVerdict's own — the same string the open card's verdict line
+    gets, so one round never reads two ways. The count is spelled out both ways
+    rather than pluralised with an `s`: `1 files` is the kind of thing nobody
+    notices in review and everybody notices on a board where most rounds touched
+    one file.
+
+    Both go into their own span and never onto the <summary>, which holds all
+    three: setText assigns textContent, and textContent on the summary would take
+    the spans down with it — innerHTML with the name filed off.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchRoundCard")
+    kids = re.search(r"const \[(\w+),[^\]]*\] = \w+\.children;", src)
+    assert kids, "the card's children are no longer read out in order"
+    summary = kids.group(1)
+    spans = re.search(rf"const \[(\w+), (\w+), (\w+)\] = {summary}\.children;", src)
+    assert spans, f"the summary's three spans are not read off {summary}"
+    said, counted = spans.group(2), spans.group(3)
+    word = re.search(r"const (\w+) = roundVerdict\(", src)
+    assert word, "the card no longer asks roundVerdict what the round decided"
+    assert re.search(rf"setText\({said}, {word.group(1)}\);", src), \
+        "the summary's verdict span is written with something other than the round's own word"
+    n = re.search(r"const (\w+) = \(\w+\.files \|\| \[\]\)\.length;", src)
+    assert n, "the summary counts something other than the round's own file list"
+    # The whole expression rather than the two words in it, the same way the tab's
+    # count is pinned: `1 file` and `<n> files` both being present says nothing
+    # about which count gets which, and the empty third branch is the one that
+    # keeps `0 files` off a round that has touched nothing yet.
+    assert re.search(rf"setText\({counted}, {n.group(1)} \? "
+                     rf"\({n.group(1)} === 1 \? '1 file' : `\$\{{{n.group(1)}\}} files`\) : ''\);",
+                     src), \
+        "the count does not read `1 file`, then `<n> files`, then nothing at all at zero"
+    assert not re.search(rf"setText\({summary},", src), \
+        f"{summary} is the <summary> itself, and writing text on it destroys its three spans"
+
+
+def test_a_round_with_no_entry_has_a_bare_summary():
+    """The half of a round's life the ledger knows nothing about. `_run_item`
+    appends the entry only after `execute_round` returns, so while the executor
+    works there is a log file growing and no row at all, and that card's summary
+    is the head and nothing else.
+
+    Both of the other pieces are read off the entry, so a missing one leaves them
+    empty rather than zeroed. `0 files` is a measurement of something that has
+    not happened, and a verdict word on a round nobody has judged would be worse.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchRoundCard")
+    empty = re.search(r"const (\w+) = \w+\.entry \|\| \{\};", src)
+    assert empty, "a round with no ledger row is not read as an entry with every field absent"
+    entry = empty.group(1)
+    assert re.search(rf"roundVerdict\({entry}\)", src), \
+        "the summary's word comes from somewhere other than the entry"
+    assert re.search(rf"\({entry}\.files \|\| \[\]\)\.length", src), \
+        "the summary's file count comes from somewhere other than the entry"
+    assert "return '';" in function_source(html, "roundVerdict"), \
+        "an entry with no verdict and no status hands a word back, so the bare summary is not bare"
+    assert "'0 files'" not in html, \
+        "a round the executor is still inside is told how much it has not touched yet"
+
+
+def test_the_summary_says_in_progress_or_a_verdict_never_both():
+    """AC-10's second sentence. `roundVerdict` answers `audit running` for the
+    whole audit window, and the guard that puts ` · in progress` on the head is
+    true for exactly the same half hour — so a card collapsed while the
+    supervisor is out read `item 1 · round 2 · in progress · audit running · 3
+    files`, which is the same news twice on the one line a closed card gets.
+
+    The word wins because it says more. The suffix is for the half with no word
+    at all, the round the executor is still inside. Neither the guard nor any of
+    the words it is built from goes away — only the condition the suffix is
+    appended under gets narrower, and the whole condition is pinned here because
+    either half of it alone is a different page.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchRoundCard")
+    word = re.search(r"const (\w+) = roundVerdict\(", src)
+    running = re.search(r"const (\w+) = \w+ && \(!\w+\.entry", src)
+    assert word and running, "the verdict word and the in-progress guard are not both read"
+    suffix = re.search(r"\(([^()]*) \? ' · in progress' : ''\)", src)
+    assert suffix, "the head no longer appends the suffix under a condition of its own"
+    assert " ".join(suffix.group(1).split()) == f"{running.group(1)} && !{word.group(1)}", \
+        (f"the suffix is appended on `{suffix.group(1).strip()}` rather than on the round "
+         "still running AND having no verdict word to show instead")
+
+
 def css_rules(html):
     """(selector, declarations) for every rule in the page's stylesheet.
 
@@ -2461,6 +2613,34 @@ def test_a_reason_row_keeps_the_field_typography():
             f"a reason row does not carry {piece}, which every other field on the card has"
         assert piece.replace(" ", "") in field.replace(" ", ""), \
             f"the fields that still join lost {piece}, so the card is in two type sizes"
+
+
+def test_a_round_card_has_a_visible_boundary():
+    """AC-8. A card's only separator was 22px of empty space between it and the
+    next one, and collapsing it to a summary line takes even that away: a closed
+    card would be one dim line floating on the board with nothing saying it was a
+    card at all.
+
+    The three declarations are `#awaiting`'s and `.panel`'s rather than three new
+    numbers — the board already has one shape for a box, and a round card is a
+    box — so they are checked against a rule that already carries them. Nothing
+    else in this file can look at this: the suite has never rendered the page.
+    """
+    html = ui.page_html()
+    body = declarations(html, ".round").replace(" ", "")
+    for piece in ("background:var(--panel)", "border:1pxsolidvar(--line)", "border-radius:10px"):
+        assert piece in body, f"a round card carries no {piece}, so it has no edge"
+        assert piece in declarations(html, ".panel").replace(" ", ""), \
+            f"the panels lost {piece}, so the card is copying a shape nothing else on the board has"
+    assert re.search(r"padding:[\d.]+px", body), \
+        "the card has no padding, so its text runs into the border it just grew"
+    heads = declarations(html, "#sweep > h2").replace(" ", "")
+    assert "text-transform:uppercase" in heads, \
+        "the sweep and items headings lost their styling along with the round card's h2"
+    summary = declarations(html, ".round > summary").replace(" ", "")
+    assert "cursor:pointer" in summary, "the summary does not say it can be clicked"
+    assert "text-transform:uppercase" in summary, \
+        "the summary is not dressed as the heading it replaced"
 
 
 def test_board_prose_is_capped_at_80ch():

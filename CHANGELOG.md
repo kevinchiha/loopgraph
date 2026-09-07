@@ -25,6 +25,11 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   width of the window: the reasons, the rest of a round's fields, the question a run
   is asking and the line beside its status. The logs and the diff are untouched and
   still get the whole width.
+- Round cards fold up. Each one is a box with an edge now, and a closed one is a
+  single line — `item 2 · round 3 · accept · 4 files` — so a run of twelve rounds is
+  twelve lines to read down instead of a page to scroll to the end of. The newest
+  round is the one that opens; the rest you open and close yourself, and no poll
+  ever changes what you left.
 
 ## 0.2.0 - 2026-09-07
 
