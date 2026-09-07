@@ -25,7 +25,10 @@ produces bug reports nobody can reproduce.
   the run it belongs to (`activities/route.py`) and signals it. Nothing else may
   call `getUpdates`: Telegram allows one poller per bot, and a second one steals
   replies and triggers 409s.
-- `ui.py` — read-only dashboard on port 8400. Change its `PAGE` string and you
+- `ui.py` — the dashboard on port 8400. Everything it serves reads, with one
+  exception: `POST /api/archive` writes `runs/.archived.json`, the list of runs
+  hidden from the rail. Nothing else takes a method other than GET, and nothing
+  in it writes with git or signals a workflow. Change its `PAGE` string and you
   must run the browser checklist in `tests/test_ui.py` by hand: the suite reads
   that JavaScript as text and cannot see the page.
 - `version.py` — release tags, changelog slicing and the update rules. `lg` and

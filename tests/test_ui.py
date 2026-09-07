@@ -58,6 +58,25 @@ def status_of(url):
     return e.value.code
 
 
+def post(url, body, timeout=5):
+    """A POST, as (status, decoded body), whatever the status is.
+
+    Both halves are the point. AC-16 asks for "a 400 with a body, never a dropped
+    connection", and a handler that raises before it answers gives urllib no
+    status at all: socketserver swallows the exception and closes the socket, so
+    the caller gets a RemoteDisconnected out of here rather than a code to assert
+    on. `body` is bytes as they are, so a test can send something that is not JSON.
+    """
+    data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+        return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
 def test_page_serves(server):
     body = get(server + "/").read().decode()
     assert "loopgraph" in body and "/api/runs" in body
@@ -455,24 +474,36 @@ AWAITING = {"kind": "decision", "question": "which port?", "options": {"A": "840
 
 
 class FakeFeed:
-    """The three members the handler reads, over canned values.
+    """The four members the handler reads, over canned values.
 
     `make_server(feed=...)` takes one of these in place of a real TemporalFeed, so
     the endpoints can be asserted over HTTP with no engine running. It cannot stand
     in for the feed's own tests further down: it replaces `ledger`, which is the
     method those exist to exercise.
+
+    `open_states` maps a workflow id to the answer `workflow_open` gives for it —
+    True, False or None — and an id that is not in the map answers None, the way a
+    real feed answers for an id Temporal has never heard of. `opened` records what
+    was asked, because "nothing asked Temporal at all" is what AC-18 promises about
+    a run going back on the rail and a returned value cannot show it.
     """
 
-    def __init__(self, connected=True, rows=(), ledgers=None):
+    def __init__(self, connected=True, rows=(), ledgers=None, open_states=None):
         self.connected = connected
         self.rows = [dict(r) for r in rows]
         self.ledgers = dict(ledgers or {})
+        self.open_states = dict(open_states or {})
+        self.opened = []
 
     def runs(self):
         return [dict(r) for r in self.rows]
 
     def ledger(self, wf_id):
         return self.ledgers.get(wf_id)
+
+    def workflow_open(self, wf_id):
+        self.opened.append(wf_id)
+        return self.open_states.get(wf_id)
 
 
 @pytest.fixture
@@ -571,10 +602,18 @@ HANGS = object()  # a result() that never comes back, the way a held run's does 
 
 
 class StubHandle:
-    """One workflow's handle. Each call answers with its canned value, or raises it."""
+    """One workflow's handle. Each call answers with its canned value, or raises it.
 
-    def __init__(self, query, result, status=WorkflowExecutionStatus.COMPLETED):
+    `describes` is what describe() does: a status to report, or an Exception to
+    raise. Raising is how Temporal answers for a workflow id it has never heard
+    of, and workflow_open has to tell that apart from a workflow it knows to be
+    closed — one is a 409 and the other is the archive going through.
+    """
+
+    def __init__(self, query, result, status=WorkflowExecutionStatus.COMPLETED,
+                 describes=None):
         self._query, self._result, self._status = query, result, status
+        self._describes = describes
         self.result_awaited = False
         self.queried = []
 
@@ -598,21 +637,37 @@ class StubHandle:
         return await self._answer(self._result)
 
     async def describe(self):
+        if isinstance(self._describes, Exception):
+            raise self._describes
         return SimpleNamespace(status=self._status)
 
 
-def stub_feed(monkeypatch, handles, rows=()):
+def stub_feed(monkeypatch, handles, rows=(), connect_fails=False):
     """A real TemporalFeed — its own loop, its own thread, its real call() — over a
     stub client, because the fallback and the two entry points are the feed's own
-    code and FakeFeed replaces exactly that."""
+    code and FakeFeed replaces exactly that.
+
+    `connect_fails` is Temporal down: the feed catches it, keeps no client, and
+    every method has to answer from that. Nothing else here can make a feed that
+    is not connected, and `workflow_open` answering the wrong thing there is a run
+    the owner cannot archive on the one day they are tidying up — which is the day
+    Temporal is down.
+    """
 
     class Client:
         @staticmethod
         async def connect(address):
+            if connect_fails:
+                raise RuntimeError("temporal is down")
             return Client()
 
         def get_workflow_handle(self, wf_id):
-            return handles.get(wf_id) or StubHandle(KeyError(wf_id), KeyError(wf_id))
+            # An id nobody planted is an id Temporal has never heard of, and a
+            # real client raises on all three calls for one. describe() raising
+            # is what makes workflow_open answer None rather than "closed", and
+            # _ledger swallows it exactly as it swallows the other two.
+            return handles.get(wf_id) or StubHandle(KeyError(wf_id), KeyError(wf_id),
+                                                    describes=KeyError(wf_id))
 
         async def list_workflows(self, query):
             for wf in rows:
@@ -4078,17 +4133,454 @@ def test_diff_rejects_bad_ids(server, bad):
     assert status_of(f"{server}/api/diff?{urlencode({'id': bad})}") == 400
 
 
+# ---------- archiving: the one write the dashboard makes ----------
+
+# The two sentences the page shows the owner when the server refuses (AC-18), and
+# the one it shows when the store itself is the problem (AC-16). Copy, so they are
+# written down once and asserted whole.
+STILL_OPEN = "workflow still open: finish or answer it before archiving"
+CANNOT_SAY = "cannot confirm the workflow is closed; is Temporal up?"
+UNREADABLE = "runs/.archived.json is not a readable list; move it aside and try again"
+
+# The run archiving exists to clear off the rail: an engine that died holding a
+# card. workflows/run.py's blanket handler records the ledger it was holding, so
+# this one reads `running` and holds an `awaiting` for ever, and the only thing
+# that knows the workflow is over is Temporal. A gate that asked the ledger would
+# refuse to archive this run — which is the run the owner is trying to archive.
+STALE = {"status": "running", "rounds": [{"verdict": "REDO"}], "awaiting": AWAITING}
+
+
+def dead_run_feed(open_states):
+    """A feed serving that run, with `workflow_open` answering as the test asks."""
+    return FakeFeed(rows=[ui.run_entry(KNOWN, "failed", START, CLOSE, STALE)],
+                    ledgers={KNOWN: STALE}, open_states=open_states)
+
+
+@pytest.fixture
+def archiving(tmp_path):
+    """Dashboards over one empty runs directory, each with the feed a test asks for.
+
+    `make(feed)` starts one and returns its URL — more than one, because a restart
+    over the same directory is what AC-16 promises survives, and because "no feed
+    at all" is one of the conditions AC-18 refuses. `store` is the file every write
+    lands in, so a test can read the bytes back and see that a refusal changed none
+    of them.
+    """
+    started = []
+
+    def make(feed=None):
+        srv = ui.make_server(0, tmp_path, temporal_addr=None, feed=feed)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        started.append(srv)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    yield SimpleNamespace(make=make, runs=tmp_path, store=tmp_path / ".archived.json")
+    for srv in started:
+        srv.shutdown()
+
+
+def flags_of(url):
+    """/api/runs' archived marks, keyed on the row id. KeyError if a row has none."""
+    return {r["id"]: r["archived"] for r in getjson(url + "/api/runs")["runs"]}
+
+
+def test_archiving_a_closed_run_round_trips(archiving):
+    """AC-16, over the wire, on the run the feature is for. Its ledger says
+    `running` and holds a question nobody can answer any more; Temporal says the
+    workflow is closed. Temporal is what the server asks."""
+    url = archiving.make(dead_run_feed({KNOWN: False}))
+    assert flags_of(url) == {KNOWN: False}, "a run nobody archived is not archived"
+
+    assert post(url + "/api/archive", {"id": KNOWN, "archived": True}) == \
+        (200, {"id": KNOWN, "archived": True})
+    assert flags_of(url) == {KNOWN: True}
+    assert json.loads(archiving.store.read_text()) == [KNOWN]
+    assert list(archiving.runs.iterdir()) == [archiving.store], \
+        "the write left its temporary file behind in the runs directory"
+
+    assert post(url + "/api/archive", {"id": KNOWN, "archived": False}) == \
+        (200, {"id": KNOWN, "archived": False})
+    assert flags_of(url) == {KNOWN: False}
+    assert json.loads(archiving.store.read_text()) == []
+
+
+def test_the_archive_survives_a_restart(archiving):
+    """The flag is a file, not a dictionary in the process: `lg ui` is restarted
+    every time the owner updates, and a rail that forgot what they had hidden
+    would be the whole feature undone by a restart."""
+    feed = dead_run_feed({KNOWN: False})
+    first = archiving.make(feed)
+    # Started before anything is archived. A server that read the store once and
+    # kept it would answer for this one out of a set that has nothing in it, and a
+    # second reader with the page open would go on showing an archived run.
+    watching = archiving.make(feed)
+    assert post(first + "/api/archive", {"id": KNOWN, "archived": True})[0] == 200
+    assert flags_of(watching) == {KNOWN: True}
+
+    assert flags_of(archiving.make(feed)) == {KNOWN: True}, "the flag died with the process"
+
+
+@pytest.mark.parametrize("body", [
+    b"", b"not json at all", b"[]", b'"a string"',
+    {"archived": True},
+    {"id": KNOWN},
+    {"id": "a/b", "archived": True},
+    {"id": "../secrets", "archived": True},
+    {"id": "", "archived": True},
+    {"id": KNOWN, "archived": "yes"},
+    {"id": KNOWN, "archived": 1},
+    {"id": 7, "archived": True},
+    {"id": [KNOWN], "archived": True},
+    {"id": {"id": KNOWN}, "archived": True},
+], ids=["empty", "not json", "a list", "a bare string", "no id", "no archived",
+        "id with a slash", "id with ..", "empty id", "archived is a word",
+        "archived is a number", "id is a number", "id is a list", "id is an object"])
+def test_bad_archive_bodies_are_400_and_change_nothing(archiving, body):
+    """AC-16. Every one of these answers 400 WITH a body — the assertion is on the
+    status, so a handler that raises before it answers fails here rather than
+    passing: socketserver swallows the exception and the client gets a dropped
+    connection, which is not a 400.
+
+    The three non-string ids are the ones that could only fail that way.
+    `bad_param` is `not value or "/" in value or ".." in value`, written for a
+    value off a query string and never handed anything but one: a number makes
+    `"/" in value` raise TypeError, and a list or an object sails through it and
+    raises later on the path join. So the type check comes first and is not
+    decoration.
+    """
+    archiving.store.write_text('["kept-by-hand"]')
+    before = archiving.store.read_bytes()
+    url = archiving.make(dead_run_feed({KNOWN: False}))
+
+    code, answer = post(url + "/api/archive", body)
+    assert code == 400, f"{body!r} was not refused with a 400"
+    assert "error" in answer, "a 400 with no body tells the page nothing to show"
+    assert archiving.store.read_bytes() == before, "a refused request wrote to the store"
+
+
+def test_an_archive_body_over_the_cap_is_refused(archiving):
+    """A body is read by Content-Length, so the cap is what stops one request
+    putting an arbitrary number of megabytes in the dashboard's memory."""
+    archiving.store.write_text('["kept-by-hand"]')
+    url = archiving.make(dead_run_feed({KNOWN: False}))
+    code, answer = post(url + "/api/archive", {"id": KNOWN, "archived": True,
+                                               "pad": "x" * 5000})
+    assert code == 400 and "error" in answer
+    assert json.loads(archiving.store.read_text()) == ["kept-by-hand"]
+
+
+@pytest.mark.parametrize("states,want", [
+    ({KNOWN: True}, STILL_OPEN),
+    ({}, CANNOT_SAY),
+    (None, CANNOT_SAY),
+], ids=["temporal says open", "temporal never heard of it", "no feed at all"])
+def test_an_open_or_unknowable_workflow_is_409(archiving, states, want):
+    """AC-18, on the server rather than in the page: archiving a run that is still
+    working hides it while it goes on writing, and the owner would not see the card
+    it puts up. Refusing what cannot be verified is the spec's decision — a feed
+    that is down cannot tell a finished run from a running one, and guessing wrong
+    costs the owner the run they were watching.
+
+    The ledger here reads `running` and holds an `awaiting` in every case, so a
+    gate keyed on it would refuse all three for the wrong reason and this test
+    would pass while the run it is written about — the dead one above — stayed on
+    the rail for ever.
+    """
+    archiving.store.write_text('["kept-by-hand"]')
+    before = archiving.store.read_bytes()
+    url = archiving.make(dead_run_feed(states) if states is not None else None)
+
+    assert post(url + "/api/archive", {"id": KNOWN, "archived": True}) == \
+        (409, {"error": want})
+    assert archiving.store.read_bytes() == before, "a refused archive wrote the flag anyway"
+
+
+@pytest.mark.parametrize("states", [{KNOWN: True}, {}, None],
+                         ids=["temporal says open", "temporal never heard of it",
+                              "no feed at all"])
+def test_unarchiving_is_never_gated(archiving, states):
+    """AC-18's other half. The refusal is one-directional: putting a run back on
+    the rail hides nothing and needs nothing proved, and a message about finishing
+    the workflow first is nonsense in that direction. The owner is most likely to
+    be tidying up on the day Temporal is down, and that is exactly when a gated
+    un-archive would strand every run they had hidden.
+    """
+    archiving.store.write_text(json.dumps([KNOWN, "kept-by-hand"]))
+    feed = dead_run_feed(states) if states is not None else None
+    url = archiving.make(feed)
+
+    assert post(url + "/api/archive", {"id": KNOWN, "archived": False}) == \
+        (200, {"id": KNOWN, "archived": False})
+    assert json.loads(archiving.store.read_text()) == ["kept-by-hand"], \
+        "the flag was not cleared, or another run's flag went with it"
+    if feed is not None:
+        assert feed.opened == [], "Temporal was asked about a run coming back on the rail"
+
+
+def test_a_logs_only_row_archives_without_temporal(server, tmp_path):
+    """A row known only from its log files is keyed on the run directory, which
+    names no workflow: there is nothing to ask Temporal about and nothing to be
+    open. Its neighbour in this test is the same server refusing a workflow-keyed
+    id, so what makes the difference is the directory and not the missing feed."""
+    assert post(server + "/api/archive", {"id": "2026-01-01-demo", "archived": True}) == \
+        (200, {"id": "2026-01-01-demo", "archived": True})
+    assert flags_of(server) == {"2026-01-01-demo": True}
+
+    assert post(server + "/api/archive", {"id": KNOWN, "archived": True}) == \
+        (409, {"error": CANNOT_SAY})
+    assert ui.read_archived(tmp_path) == {"2026-01-01-demo"}
+
+
+def test_get_archive_is_405_and_other_posts_are_405(server, tmp_path):
+    """AC-19. /api/archive is the one path that takes anything but a GET, and it
+    takes only POST. Everything else the dashboard serves stays read-only, which
+    is what lets it be pointed at a repository the owner is working in."""
+    assert status_of(server + "/api/archive") == 405
+
+    code, answer = post(server + "/api/runs", {"id": "2026-01-01-demo", "archived": True})
+    assert code == 405 and "error" in answer
+    assert not (tmp_path / ".archived.json").exists(), \
+        "a POST to another path was answered by the archive writer"
+
+
+def test_mark_archived_rereads_before_writing(tmp_path):
+    """The lost update, from the half no lock can reach: `lg rm` writes this same
+    file from another process entirely. A writer that applied its change to a set
+    it read a moment ago would put back the ids that arrived in between and lose
+    the ones it never saw."""
+    ui.mark_archived(tmp_path, ["one"], True)
+    store = tmp_path / ".archived.json"
+    store.write_text(json.dumps(["one", "written-by-lg-rm"]))
+
+    ui.mark_archived(tmp_path, ["two"], True)
+    assert json.loads(store.read_text()) == ["one", "two", "written-by-lg-rm"], \
+        "the second write was applied to a stale copy, or the list is not sorted"
+
+
+def test_two_archive_writers_do_not_lose_a_flag(tmp_path, monkeypatch):
+    """make_server returns a ThreadingHTTPServer, so two archive clicks landing
+    together run mark_archived on two threads of one process. Unserialised, both
+    read the same set, both write, the later rename wins and one run stays on the
+    rail with its toggle showing archived.
+
+    The window is microseconds wide in real use, so it is held open here: the
+    first writer is stopped holding what it has just read until the second has had
+    time to reach the same place. With the lock the second cannot get there and
+    blocks; without it, it reads a set with nothing in it and writes one flag over
+    the other. Held after the read and not before it — stopped before it, the
+    first writer would go on to read what the second had already written and both
+    flags would survive with no lock at all.
+    """
+    read = ui._read_archive
+    entered, go, calls = threading.Event(), threading.Event(), []
+
+    def held(path):
+        calls.append(path)
+        first = len(calls) == 1
+        got = read(path)
+        if first:
+            entered.set()
+            go.wait(5)
+        return got
+
+    monkeypatch.setattr(ui, "_read_archive", held)
+    first = threading.Thread(target=ui.mark_archived, args=(tmp_path, ["one"], True))
+    first.start()
+    assert entered.wait(5), "the first writer never reached the read"
+
+    second = threading.Thread(target=ui.mark_archived, args=(tmp_path, ["two"], True))
+    second.start()
+    time.sleep(0.2)  # long enough for an unserialised second writer to read and write
+    go.set()
+    first.join(5)
+    second.join(5)
+
+    assert ui.read_archived(tmp_path) == {"one", "two"}, \
+        "two writers landing together lost a flag between them"
+
+
+def test_the_store_is_written_by_rename(tmp_path):
+    """AC-16's durability, pinned on the source: the failure it prevents is a
+    crash or a power loss between two writes, and nothing here can stage one.
+
+    Four things, in order and all inside the lock. The read, because the set on
+    disk is not the set this process last saw. A temporary file with a name of its
+    own, in the runs directory — the same directory so the rename is atomic on one
+    filesystem, and unique because two writers interleaving on one fixed `.tmp`
+    path can rename each other's half-written bytes, which is the exact tear the
+    rename is here to prevent. The fsync, because a rename over a file whose bytes
+    are still in the page cache is a file that comes back empty after a power cut.
+    And os.replace, which is what makes a reader see the list whole, as it was
+    before or as it is after.
+    """
+    body = inspect.getsource(ui.mark_archived).split('"""')[2]
+    code = [ln for ln in body.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    order = ["with _ARCHIVE_LOCK:", "_read_archive(", "mkstemp(", "os.fsync(",
+             "os.replace("]
+    at = {}
+    for i, line in enumerate(code):
+        for needle in order:
+            if needle in line and needle not in at:
+                at[needle] = i
+    assert set(at) == set(order), \
+        f"mark_archived does not do all of {sorted(set(order) - set(at))}"
+    assert [at[n] for n in order] == sorted(at[n] for n in order), \
+        "the read, the temporary file, the fsync and the rename are out of order"
+
+    def indent(line):
+        return len(line) - len(line.lstrip())
+
+    for needle in order[1:]:
+        assert indent(code[at[needle]]) > indent(code[at[order[0]]]), \
+            f"`{needle}` runs outside the module lock, so two threads can interleave there"
+
+    joined = "\n".join(code)
+    assert "dir=runs_dir" in joined, \
+        "the temporary file is not made in the runs directory, so the rename crosses filesystems"
+    assert not re.search(r"path\.(open|write_text|write_bytes)\(|open\(path", joined), \
+        "the store is written in place, so a reader can see half a list"
+
+
+@pytest.mark.parametrize("junk", [b"\x00\x01 not json {[", b'{"id": true}',
+                                  b'["ok", 7]', b"", b"[1, 2, 3]"],
+                         ids=["garbage", "an object", "a list with a number",
+                              "empty", "numbers"])
+def test_a_corrupt_archive_file_reads_as_empty(server, tmp_path, junk):
+    """Reads forgive. /api/runs calls this on every poll, so a file somebody
+    hand-edited into something that does not parse must cost those rows their
+    flag — not turn every poll into a 500 and blank the rail while the owner works
+    out what happened."""
+    (tmp_path / ".archived.json").write_bytes(junk)
+    assert ui.read_archived(tmp_path) == set()
+
+    r = get(server + "/api/runs")
+    assert r.status == 200
+    assert [row["archived"] for row in json.loads(r.read())["runs"]] == [False]
+
+
+def test_a_corrupt_archive_file_is_never_overwritten(archiving):
+    """And writes refuse. This is the pair to the test above and the reason
+    mark_archived does not read through read_archived: chained that way, a
+    truncated or half-edited file reads as an empty set and the next archive click
+    rewrites it as a one-element list, losing every flag the owner had — the exact
+    loss AC-16 promises cannot happen.
+
+    Both directions refuse, because it is the write that refuses and not the
+    openness gate: the file is the owner's to rescue by hand either way.
+    """
+    broken = b'["run-a", "run-b"] and then the disk filled up'
+    archiving.store.write_bytes(broken)
+    url = archiving.make(dead_run_feed({KNOWN: False}))
+
+    assert post(url + "/api/archive", {"id": KNOWN, "archived": True}) == \
+        (409, {"error": UNREADABLE})
+    assert archiving.store.read_bytes() == broken, "the flags in it are gone for good"
+
+    assert post(url + "/api/archive", {"id": "run-a", "archived": False}) == \
+        (409, {"error": UNREADABLE})
+    assert archiving.store.read_bytes() == broken
+    assert list(archiving.runs.iterdir()) == [archiving.store], \
+        "a refused write left a temporary file behind"
+
+
+def test_workflow_open_reports_three_states(monkeypatch):
+    """The feed's own answer to AC-18's question, over a stub client. Three
+    states, not two: `False` is Temporal saying the workflow is closed and `None`
+    is Temporal not saying anything, and the server turns one into an archive and
+    the other into a refusal.
+
+    Unknown status counts as open, the way _still_running already falls it for
+    `lg` and for the ledger fallback. The two mistakes are not equal — reading a
+    live run as closed hides a run that is still writing to the page.
+    """
+    running = StubHandle(LEDGER, HANGS, status=WorkflowExecutionStatus.RUNNING)
+    quiet = StubHandle(LEDGER, HANGS, status=None)
+    done = StubHandle(LEDGER, LEDGER, status=WorkflowExecutionStatus.COMPLETED)
+    feed = stub_feed(monkeypatch, {"wf-running": running, "wf-no-status": quiet,
+                                   "wf-done": done})
+    assert feed.workflow_open("wf-running") is True
+    assert feed.workflow_open("wf-no-status") is True, \
+        "a workflow Temporal reports with no status was read as finished"
+    assert feed.workflow_open("wf-done") is False
+    assert feed.workflow_open("wf-never-existed") is None, \
+        "an id Temporal has never heard of came back as an answer"
+
+    down = stub_feed(monkeypatch, {"wf-done": done}, connect_fails=True)
+    assert down.connected is False
+    assert down.workflow_open("wf-done") is None, \
+        "a feed with no client answered for a workflow it cannot have asked about"
+
+
+def test_agents_md_no_longer_calls_the_dashboard_read_only():
+    """AC-32. This commit is what makes the old wording false, so it is the commit
+    that corrects it: the next agent to read that line is about to edit ui.py, and
+    a rule that is no longer true about the file being edited is worse than none.
+
+    The rest of the entry is still there. The `PAGE` obligation is the one thing
+    in that list that has caught defects the suite cannot see.
+    """
+    agents = (Path(ui.__file__).resolve().parent / "AGENTS.md").read_text()
+    entry = re.search(r"^- `ui\.py` —.*?(?=\n- |\n\n)", agents, re.S | re.M)
+    assert entry, "AGENTS.md's layout list no longer has a `ui.py` entry"
+    line = " ".join(entry.group(0).split())
+
+    assert "read-only" not in line, f"AGENTS.md still calls ui.py read-only: {line}"
+    assert "POST /api/archive" in line, "the one write the dashboard makes is not named"
+    assert "8400" in line, "the port went with the rewrite"
+    assert "`PAGE`" in line and "browser checklist" in line, \
+        "the obligation to run the checklist by hand went with the rewrite"
+
+
+def handler_method(src, name):
+    """One `do_…` method of the handler, out of ui.py's text.
+
+    The handler is a class inside make_server's closure, so there is no object to
+    hand inspect.getsource and the method is found by its `def` line and ends
+    where the indentation comes back.
+    """
+    lines = src.splitlines()
+    start = next(i for i, ln in enumerate(lines) if re.match(rf"\s*def {name}\(", ln))
+    depth = len(lines[start]) - len(lines[start].lstrip())
+    out = [lines[start]]
+    for ln in lines[start + 1:]:
+        if ln.strip() and len(ln) - len(ln.lstrip()) <= depth:
+            break
+        out.append(ln)
+    return "\n".join(out)
+
+
 def test_the_dashboard_has_no_write_methods():
-    """AC-38, read off the source: one handler method, and every git invocation
+    """AC-27, read off the source: the handler's methods, and every git invocation
     naming its subcommand right next to the program, so this can see them all.
 
-    Both files, because the dashboard process runs git in two of them now: the
-    diff pane here, and the version checker's reads through version.py. A guard
-    that read only this file would leave the checker's git unwatched, and the
-    checker is the half with a remote in it.
+    Narrowed, not dropped. The dashboard spends its read-only guarantee exactly
+    once, on `POST /api/archive`, and everything this test used to forbid it still
+    forbids — a second write path, a PUT or a DELETE, a git command that writes.
+    Whatever else `do_POST` grows, the first thing it does is turn away every path
+    but the one, so a branch added below that guard cannot be reached by a request
+    for anything else.
+
+    Both files, because the dashboard process runs git in two of them: the diff
+    pane here, and the version checker's reads through version.py. A guard that
+    read only this file would leave the checker's git unwatched, and the checker
+    is the half with a remote in it. `lg rm`'s git commands run from `lg`, which
+    this does not scan, and they stay there.
     """
     src = Path(ui.__file__).read_text()
-    assert re.findall(r"def (do_\w+)\(", src) == ["do_GET"]
+    assert re.findall(r"def (do_\w+)\(", src) == ["do_GET", "do_POST"], \
+        "the dashboard answers a method other than GET and POST"
+
+    body = handler_method(src, "do_POST").split('"""')[2]
+    assert body.count("/api/archive") == 1, "do_POST names a path other than /api/archive"
+    statements = [ln.strip() for ln in body.splitlines()
+                  if ln.strip() and not ln.strip().startswith("#")]
+    assert statements[0].startswith("if ") and "!=" in statements[0] \
+        and "/api/archive" in statements[0], \
+        f"do_POST opens with `{statements[0]}` rather than turning every other path away"
+    assert statements[1].startswith("return") and "405" in statements[1], \
+        f"the path guard answers `{statements[1]}` rather than a 405"
+
     for path, expected in [(Path(ui.__file__), {"rev-parse", "diff"}),
                            (Path(ui.version.__file__),
                             {"describe", "rev-parse", "rev-list", "ls-remote"})]:

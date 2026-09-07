@@ -29,6 +29,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -1404,6 +1405,108 @@ def run_dirs(runs_dir: Path) -> list[str]:
                   key=lambda n: (runs_dir / n).stat().st_mtime, reverse=True)
 
 
+# ---------- the archive store ----------
+
+# The ids the owner has taken off the rail, as a JSON array of strings. This one
+# file is the whole of the dashboard's writing, and POST /api/archive is the one
+# request that reaches it.
+ARCHIVE_FILE = ".archived.json"
+
+# The most a POST /api/archive body may measure. The body is read by its declared
+# Content-Length, so without a cap one request can ask the dashboard to hold an
+# arbitrary number of megabytes. Two keys and an id is under a hundred bytes.
+ARCHIVE_BODY_CAP = 4096
+
+# Held for the whole of mark_archived's read-apply-replace. make_server returns a
+# ThreadingHTTPServer, so every request gets a thread of its own and two archive
+# clicks landing together run this on two of them: both would read the same set,
+# both would write, the later rename would win and one run would stay on the rail
+# with its toggle showing archived. The lock closes that half completely. It
+# cannot reach `lg rm`, which is a separate process — re-reading inside it is what
+# narrows that half to microseconds.
+_ARCHIVE_LOCK = threading.Lock()
+
+
+class ArchiveUnreadable(Exception):
+    """The archive file is on disk and is not a JSON array of strings."""
+
+
+def _read_archive(path: Path) -> set[str]:
+    """The store, strictly: a missing file is empty and anything else broken raises.
+
+    This is the read a WRITE goes through, and it is strict so that mark_archived
+    can tell a file that is not there — the first archive on a fresh checkout —
+    from one that is there and cannot be understood. read_archived is this plus
+    forgiveness, and never the other way round: see mark_archived.
+    """
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return set()
+    except OSError as e:  # a directory, no permission, a bad symlink
+        raise ArchiveUnreadable(str(e)) from e
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ArchiveUnreadable(str(e)) from e
+    if not isinstance(data, list) or not all(isinstance(i, str) for i in data):
+        raise ArchiveUnreadable(f"{path.name} is not a list of run ids")
+    return set(data)
+
+
+def read_archived(runs_dir: Path) -> set[str]:
+    """The archived ids, forgiving every way the file can be broken.
+
+    /api/runs calls this on every poll of every reader, so a file somebody
+    hand-edited into something that does not parse has to cost those rows their
+    flag and nothing else. Raising here would turn every poll into a 500 and blank
+    the rail while the owner worked out what had happened.
+    """
+    try:
+        return _read_archive(runs_dir / ARCHIVE_FILE)
+    except ArchiveUnreadable:
+        return set()
+
+
+def mark_archived(runs_dir: Path, ids: list[str], archived: bool) -> None:
+    """Add `ids` to the archive or take them out of it. Whole file, atomically.
+
+    Raises ArchiveUnreadable, having written nothing, when the file is there and
+    does not parse. That is why the read here is the strict one and not
+    read_archived: chained to the forgiving read, a truncated or half-edited file
+    comes back as an empty set and this rewrites it as a one-element list, losing
+    every flag the owner had. Reads forgive; the write refuses, and the file stays
+    for them to rescue by hand.
+
+    The set is re-read here rather than passed in, and inside the lock, because
+    three writers reach this file — this handler on two request threads, and
+    `lg rm` in a process of its own. A caller holding a copy across a write would
+    put back what another writer had just changed.
+
+    Then: a uniquely named temporary file in the same directory, written, flushed,
+    fsynced and renamed over the real one. Same directory so the rename is atomic
+    on one filesystem; fsynced because a rename over bytes still sitting in the
+    page cache is a file that comes back empty after a power cut; and a fresh name
+    per write because two writers interleaving on one fixed `.tmp` path can rename
+    each other's half-written bytes, which is the tear the rename exists to
+    prevent.
+    """
+    path = runs_dir / ARCHIVE_FILE
+    with _ARCHIVE_LOCK:
+        keep = _read_archive(path)
+        keep = (keep | set(ids)) if archived else (keep - set(ids))
+        fd, tmp = tempfile.mkstemp(dir=runs_dir, prefix=".archived-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(sorted(keep)))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+
 def run_entry(wf_id: str, status: str, start_time: datetime | None,
               close_time: datetime | None, ledger: dict | None) -> dict:
     """One row of /api/runs.
@@ -1830,6 +1933,29 @@ class TemporalFeed:
         except Exception:
             return []
 
+    def workflow_open(self, wf_id: str) -> bool | None:
+        """Whether Temporal says this workflow is still open. None: it cannot say.
+
+        Three answers, not two, and the third is the point. `False` is Temporal
+        reporting the workflow closed. `None` is Temporal not reporting anything —
+        no client, the describe failed, or an id it has never heard of — and the
+        caller must not read it as `False`: archiving is what takes a run off the
+        rail, so the one thing that must not happen is a live run being hidden
+        while it goes on working and putting cards up.
+
+        Open is _still_running's rule, so a workflow Temporal reports with no
+        status counts as open, the way `lg` and the ledger fallback already fall
+        it. The ledger is not consulted and cannot be: a failed workflow's ledger
+        reads `running` and holds its `awaiting` for ever, and those dead runs are
+        exactly the ones archiving exists to clear.
+        """
+        if not self._client:
+            return None
+        try:
+            return self.call(_still_running(self._client.get_workflow_handle(wf_id)))
+        except Exception:
+            return None
+
 
 # What the page is told when nothing is checking, and what a checker says before
 # its first read lands. One shape either way, so the header has one path through.
@@ -1925,8 +2051,9 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                 feed=None, checker=None) -> ThreadingHTTPServer:
     """The dashboard's server. `feed` stands in for the Temporal connection.
 
-    The handler reads only `connected`, `runs()` and `ledger()` off it, so a test
-    can pass a fake and assert the endpoints over HTTP with no engine running.
+    The handler reads only `connected`, `runs()`, `ledger()` and `workflow_open()`
+    off it, so a test can pass a fake and assert the endpoints over HTTP with no
+    engine running.
 
     `checker` is a VersionChecker, and there is no default one: a server built
     without it says nothing about releases and runs no git of its own, which is
@@ -1985,6 +2112,14 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                         # and no times: the page shows none rather than a wrong one.
                         wf.append({"id": d, "dir": d, "state": "unknown", "detail": "logs only",
                                    "start_time": None, "close_time": None})
+                # One read of the store per request, stamped onto every row it
+                # names — workflow rows and logs-only rows alike, because the
+                # owner archives both and both are keyed on `id`. A row the store
+                # does not name is not archived. run_entry is left alone: this is
+                # the handler's mark, not Temporal's.
+                flags = read_archived(runs_dir)
+                for row in wf:
+                    row["archived"] = row["id"] in flags
                 self._json({"runs": wf, "temporal": bool(feed and feed.connected),
                             "version": checker.snapshot() if checker else NO_VERSION})
             elif u.path == "/api/run":
@@ -2002,8 +2137,84 @@ def make_server(port: int, runs_dir: Path, temporal_addr: str | None = "localhos
                 # Nothing else in the query is read, on purpose: the branches come
                 # from the ledger, so a branch name in a URL reaches no git command.
                 self._json(diff_payload(wf_id, feed, runs_dir))
+            elif u.path == "/api/archive":
+                # The one path that takes a method other than GET, and it takes
+                # only POST. Its own branch rather than the 404 below, so a reader
+                # who lands on it is told the path exists and the method does not.
+                self._json({"error": "POST to archive a run"}, 405)
             else:
                 self.send_error(404)
+
+        def do_POST(self):
+            """The dashboard's one write: archive a run, or put it back.
+
+            Everything else here reads, and that is what lets `lg ui` be pointed at
+            a repository the owner is working in. This path spends that guarantee
+            once, on one file under runs/ — never on git and never on Temporal.
+
+            A refusal is a status with a body every time. A handler that raises
+            answers nothing at all: socketserver swallows the exception and closes
+            the socket, and the page gets a dropped connection where AC-16 asks for
+            a 400 it can show a reason from.
+            """
+            if urlparse(self.path).path != "/api/archive":
+                return self._json({"error": "the dashboard writes nowhere else"}, 405)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if not 0 < length <= ARCHIVE_BODY_CAP:
+                return self._json({"error": "body must be a small JSON object"}, 400)
+            try:
+                req = json.loads(self.rfile.read(length))
+            except ValueError:
+                req = None
+            if not isinstance(req, dict):
+                return self._json({"error": "body must be a JSON object"}, 400)
+
+            row_id, archived = req.get("id"), req.get("archived")
+            # The str check comes first and is not optional. bad_param is
+            # `not value or "/" in value or ".." in value`, written for a value off
+            # a query string and never handed anything else: a number makes it
+            # raise TypeError, and a list or a dict passes it and raises later on
+            # the path join. Either way this method dies before it answers.
+            if not isinstance(row_id, str) or bad_param(row_id):
+                return self._json({"error": "id must be a run or workflow id"}, 400)
+            if not isinstance(archived, bool):
+                return self._json({"error": "archived must be true or false"}, 400)
+
+            if archived:
+                try:
+                    # A row known only from its log files is keyed on the run
+                    # directory, so it names no workflow and there is nothing to be
+                    # open. run_dirs keys such a row exactly this way.
+                    logs_only = (runs_dir / row_id / "logs").is_dir()
+                except OSError:  # an id longer than the filesystem allows, the
+                    logs_only = False  # same guard /api/log carries
+                if not logs_only:
+                    # Temporal's answer, never the ledger's: a failed workflow's
+                    # ledger reads `running` and holds its `awaiting` for ever, and
+                    # that run leaving the rail is what archiving is for.
+                    is_open = feed.workflow_open(row_id) if feed else None
+                    if is_open:
+                        return self._json(
+                            {"error": "workflow still open: finish or answer it "
+                                      "before archiving"}, 409)
+                    if is_open is None:
+                        return self._json(
+                            {"error": "cannot confirm the workflow is closed; "
+                                      "is Temporal up?"}, 409)
+            # A request carrying `"archived": false` skips that gate whole and
+            # arrives here: putting a run back on the rail hides nothing and needs
+            # nothing proved, and every sentence in the gate is written about the
+            # opposite gesture. Gated, the owner tidying up on the day Temporal is
+            # down could not undo their own click.
+            try:
+                mark_archived(runs_dir, [row_id], archived)
+            except ArchiveUnreadable:
+                return self._json({"error": "runs/.archived.json is not a readable "
+                                            "list; move it aside and try again"}, 409)
+            self._json({"id": row_id, "archived": archived})
 
         def log_message(self, *a):  # quiet
             pass

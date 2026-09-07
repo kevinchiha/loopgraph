@@ -38,6 +38,13 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 - Opening one of a round's two log panes gives it the room the closed one is not
   using — about 930px of a 1440px window instead of 516. Open both and they go back
   to sharing the row.
+- A run can be taken off the dashboard's rail. The list of hidden runs lives in
+  `runs/.archived.json` and survives a restart, and putting a run back is never
+  refused, Temporal down or not, which is when you are most likely to be tidying up.
+  The dashboard will not hide a run that is still working, or one it cannot ask
+  Temporal about: a run that vanished mid-round is a run you stopped watching
+  without meaning to. This is the only thing the dashboard writes; everything else
+  it serves still only reads.
 - A run has an address. Clicking one puts its id in the URL, so reloading the page
   comes back to the run you were reading instead of the top of the rail, and the URL
   is something you can bookmark or send to someone else. A hash naming a run that is
