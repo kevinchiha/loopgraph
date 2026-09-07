@@ -58,6 +58,13 @@ non-deterministic workflow breaks on replay, not when you write it. Anything tha
 touches the outside world goes in an activity. `telegram_configured` exists for
 exactly this reason.
 
+**An activity that raises must never escape `run`.** `_run_item` parks the item
+when the executor round, the audit or the checkpoint dies, `_run_sweep` ends the
+sweep when a detector pass dies, and `run` catches everything else as an
+`engine failure:` and returns the ledger with a stopped note. Temporal answers
+the `ledger` query on a failed workflow from the state at the failure, so a raise
+leaves the run reading `running` forever, with no card to the owner.
+
 **Paths in a run's `gates.yaml` are container paths.** `/app/runs/<slug>` for the
 run directory, `/projects/<name>` for a target repo. Host paths silently fail.
 
@@ -66,6 +73,13 @@ do. Everything machine-specific comes from `.env`, which `install.sh` writes.
 
 **Nothing under `runs/` gets committed** except the named examples in
 `.gitignore`. Real runs hold the user's work, sometimes a client's.
+
+**The yield number comes from `discover` and nowhere else.** A sweep ends when the
+detectors stop reporting, never when the executor says it is done; the
+`candidates` it reports ride along to the next item and move no count. And a
+convergence or sweep item's commit is refused by `checkpoint_write_set` when the
+staged diff is above net zero, tests included. Both are code. The prompts only
+tell the models the checks exist, so they do not duplicate them.
 
 ## Releasing
 

@@ -1,9 +1,11 @@
 import asyncio
+import inspect
+import os
 import subprocess
 
 import pytest
 
-from activities.checkpoint import build_commit_message, checkpoint_write_set
+from activities.checkpoint import build_commit_message, checkpoint_write_set, parse_numstat
 
 GREEN = [{"name": "g", "cmd": "true", "green_exit": 0, "timeout": 10}]
 RED = [{"name": "g", "cmd": "false", "green_exit": 0, "timeout": 10}]
@@ -24,8 +26,9 @@ def worktree(tmp_path):
     return str(tmp_path)
 
 
-def run(wt, files, gates=GREEN):
-    return asyncio.run(checkpoint_write_set(wt, files, gates, build_commit_message(1, "did things", files)))
+def run(wt, files, gates=GREEN, max_net=None):
+    return asyncio.run(checkpoint_write_set(wt, files, gates, build_commit_message(1, "did things", files),
+                                            max_net=max_net))
 
 
 def test_commits_exact_write_set(worktree):
@@ -95,6 +98,190 @@ def test_write_set_all_ignored_refuses(worktree):
         f.write("noise\n")
     r = run(worktree, ["debug.log"])
     assert not r["committed"] and "ignored" in r["reason"]
+
+
+def test_parse_numstat_sums_lines_and_counts_binary_as_zero():
+    text = "2\t1\tsrc/a.py\n-\t-\tlogo.png\n0\t3\tb.py\n"
+    assert parse_numstat(text) == (2, 4)
+
+
+def test_parse_numstat_ignores_lines_that_are_not_records():
+    # _git merges git's stderr into the text it hands back, so a rename-limit
+    # warning arrives between the records. An int() over one would kill the run.
+    text = ("1\t0\ta.py\n"
+            "warning: exhaustive rename detection was skipped due to too many files.\n"
+            "warning: you may want to set your diff.renameLimit variable to at least 6 "
+            "and retry the command.\n"
+            "\n"
+            "3\t2\tb.py\n")
+    assert parse_numstat(text) == (4, 2)
+
+
+def test_a_committed_checkpoint_reports_its_line_counts(worktree):
+    with open(f"{worktree}/base.py", "w") as f:
+        f.write("y = 2\nz = 3\n")
+    r = run(worktree, ["base.py"])
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (2, 1, 1)
+
+
+def test_only_the_staged_diff_is_counted(worktree):
+    with open(f"{worktree}/other.py", "w") as f:
+        f.write("a = 1\nb = 2\n")
+    git(worktree, "add", "other.py")
+    git(worktree, "commit", "-qm", "other")
+    with open(f"{worktree}/other.py", "w") as f:
+        f.write("a = 1\n")
+    # A modified tracked file nobody declared: git diff HEAD would count its five
+    # lines and refuse the item, the staged diff must not see them at all.
+    with open(f"{worktree}/base.py", "a") as f:
+        f.write("p = 1\nq = 2\nr = 3\ns = 4\nt = 5\n")
+    r = run(worktree, ["other.py"], max_net=0)
+    assert r["committed"] and r["net"] == -1
+    assert r["leftovers"] == ["base.py"]
+
+
+def test_the_checkpoint_activity_forwards_max_net(tmp_path, monkeypatch):
+    # A wrapper that takes the argument and drops it leaves every cap dead with a
+    # green suite, so the forwarding is pinned on its own.
+    import activities.checkpoint as cp
+    seen = {}
+
+    async def recorder(wt, files, gates, message, max_net=None):
+        seen["max_net"] = max_net
+        return {"committed": True}
+
+    monkeypatch.setattr(cp, "checkpoint_write_set", recorder)
+    # activity.heartbeat raises outside an activity context and the wrapper calls
+    # it unguarded, so calling the activity bare would die before it forwards.
+    monkeypatch.setattr(cp.activity, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(cp, "load_gates", lambda path: [])
+    asyncio.run(cp.checkpoint(str(tmp_path), str(tmp_path), ["base.py"], 1, "s", 1, max_net=0))
+    assert seen["max_net"] == 0
+
+
+def test_a_retry_reports_the_numbers_the_first_attempt_did(worktree):
+    with open(f"{worktree}/base.py", "w") as f:
+        f.write("y = 2\nz = 3\n")
+    first = run(worktree, ["base.py"])
+    second = run(worktree, ["base.py"])
+    assert "already committed" in second["note"]
+    counts = ("added", "deleted", "net")
+    assert [second[k] for k in counts] == [first[k] for k in counts] == [2, 1, 1]
+
+
+def test_the_cap_refuses_unstages_and_keeps_the_work(worktree):
+    with open(f"{worktree}/base.py", "a") as f:
+        f.write("y = 2\nz = 3\n")
+    r = run(worktree, ["base.py"], max_net=0)
+    assert not r["committed"]
+    assert r["reason"] == "net lines +2 exceed the cap of 0"
+    assert (r["added"], r["deleted"], r["net"]) == (2, 0, 2)
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=worktree,
+                            capture_output=True, text=True).stdout.strip()
+    assert staged == ""
+    dirty = subprocess.run(["git", "diff", "--name-only"], cwd=worktree,
+                           capture_output=True, text=True).stdout.strip()
+    assert dirty == "base.py"
+
+
+def test_a_deletion_passes_the_cap(worktree):
+    with open(f"{worktree}/base.py", "w") as f:
+        f.write("")
+    r = run(worktree, ["base.py"], max_net=0)
+    assert r["committed"] and r["net"] == -1
+
+
+def test_net_equal_to_the_cap_passes(worktree):
+    with open(f"{worktree}/base.py", "w") as f:
+        f.write("x = 2\n")
+    r = run(worktree, ["base.py"], max_net=0)
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (1, 1, 0)
+
+
+def test_a_whitespace_refusal_keeps_its_reason_under_a_cap(worktree):
+    with open(f"{worktree}/base.py", "a") as f:
+        f.write("y = 2 \n")  # trailing whitespace, and net +1 over the cap
+    r = run(worktree, ["base.py"], max_net=0)
+    assert not r["committed"] and r["reason"] == "git diff --cached --check failed"
+
+
+# ---------- the two ways a file can be gone ----------
+
+def _tracked(worktree, name, lines=3):
+    """A committed file with `lines` lines in it, for a test that removes it."""
+    with open(f"{worktree}/{name}", "w") as f:
+        f.write("".join(f"x{i} = {i}\n" for i in range(lines)))
+    git(worktree, "add", name)
+    git(worktree, "commit", "-qm", f"add {name}")
+
+
+def _names_and_status(worktree):
+    """`git show --name-status HEAD` as (status letter, path) pairs."""
+    out = subprocess.run(["git", "show", "--name-status", "--format=", "HEAD"],
+                         cwd=worktree, capture_output=True, text=True).stdout
+    return sorted(tuple(line.split("\t")) for line in out.splitlines() if line.strip())
+
+
+def test_a_file_the_executor_removed_with_git_rm_still_commits(worktree):
+    """The live bug that killed a sweep run. `git rm` stages the deletion and
+    empties the path from both places `git add` looks, so `git add -- helpers.py`
+    died on "did not match any files", the checkpoint failed both its attempts,
+    and the ActivityError took the whole run with it."""
+    _tracked(worktree, "helpers.py")
+    git(worktree, "rm", "-q", "helpers.py")
+    r = run(worktree, ["helpers.py"])
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (0, 3, -3)
+    assert r["files"] == ["helpers.py"]
+    assert _names_and_status(worktree) == [("D", "helpers.py")]
+
+
+def test_a_write_set_of_only_removed_files_runs_no_git_add(worktree, monkeypatch):
+    """Their removal is already in the index, so there is nothing left to stage,
+    and `git add --` with no paths is a hint about `git add .` rather than a
+    command."""
+    import activities.checkpoint as cp
+    real = cp._git
+    calls = []
+
+    async def recorder(*args, cwd=None):
+        calls.append(args)
+        return await real(*args, cwd=cwd)
+
+    monkeypatch.setattr(cp, "_git", recorder)
+    _tracked(worktree, "helpers.py")
+    git(worktree, "rm", "-q", "helpers.py")
+    assert run(worktree, ["helpers.py"])["committed"]
+    assert [c for c in calls if c[0] == "add"] == []
+
+
+def test_a_removed_file_and_a_modified_one_commit_together(worktree):
+    """A round that deleted one module and edited another is one write set, and
+    the half that still needs staging must still be staged."""
+    _tracked(worktree, "helpers.py")
+    git(worktree, "rm", "-q", "helpers.py")
+    with open(f"{worktree}/base.py", "a") as f:
+        f.write("y = 2\n")
+    r = run(worktree, ["helpers.py", "base.py"])
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (1, 3, -2)
+    assert _names_and_status(worktree) == [("D", "helpers.py"), ("M", "base.py")]
+
+
+def test_a_file_removed_with_plain_rm_still_commits(worktree):
+    """The kind of deletion that always worked, pinned so both kinds stay
+    covered: the path is gone from the tree but still in the index, so `git add`
+    finds it there and stages its removal."""
+    _tracked(worktree, "helpers.py")
+    os.remove(f"{worktree}/helpers.py")
+    r = run(worktree, ["helpers.py"])
+    assert r["committed"] and (r["added"], r["deleted"], r["net"]) == (0, 3, -3)
+    assert _names_and_status(worktree) == [("D", "helpers.py")]
+
+
+def test_max_net_is_the_last_parameter_of_both_functions():
+    from activities.checkpoint import checkpoint
+    for fn in (checkpoint_write_set, checkpoint):
+        last = list(inspect.signature(fn).parameters.values())[-1]
+        assert last.name == "max_net" and last.default is None
 
 
 def test_merge_branch_without_any_git_identity(tmp_path):

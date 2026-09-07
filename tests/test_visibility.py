@@ -91,6 +91,13 @@ def test_location_line_between_items():
     assert location_line(2, 3) == "item 2 of 3"
 
 
+def test_location_line_without_a_total():
+    """AC-26. A sweep builds its items as it goes, so there is no total to count
+    towards, and `item 7 of 7` would tell the owner the run is on its last one."""
+    assert location_line(7, None) == "item 7"
+    assert location_line(7, None, 2) == "item 7 · round 2"  # U+00B7 between
+
+
 def test_a_card_whose_summary_starts_with_a_location_still_routes():
     """The line goes in the summary, under the headers, so routing still reads
     the id back out of the card."""
@@ -294,6 +301,18 @@ def test_activity_argument_counts_are_pinned():
     assert len(_args(note)) == 7
 
 
+def test_the_audit_and_the_checkpoint_are_told_what_kind_of_item_this_is():
+    """AC-7 and AC-36, pinned where a live run replays them. `kind` and `max_net`
+    go on the end of the argument lists they already had, because a run waiting
+    at a card replays this workflow from recorded history and an argument that
+    moved would replay as a different call."""
+    src = _flat(_method("_run_item"))
+    assert ('args=[run_dir, result, round_no, item_no, work_item, '
+            'len(self._ledger["items"]), kind],') in src
+    assert ('args=[run_dir, result["worktree"], result["files"], round_no, '
+            'result["summary"], item_no, max_net],') in src
+
+
 def test_owner_question_stays_bare():
     """AC-22. The location line is card furniture; `owner-answers.md` and the
     round entry keep the supervisor's question exactly as it was asked."""
@@ -315,13 +334,18 @@ def test_the_workflow_module_reads_no_clock_env_or_disk():
 
 def test_the_all_parked_note_names_the_last_item():
     """AC-20's `item 3 of 3` case: nothing was accepted, so the run speaks from
-    the item it finished on. A halt speaks from the item it stopped on."""
+    the item it finished on. A halt speaks from the item it stopped on.
+
+    The count is a variable now that the run can inject a convergence item of its
+    own, so the tail has to read it again: `total` left over from the last
+    iteration would name a list one item shorter than the one that ran."""
     src = _method("run")
     all_parked = _flat(src.split("if accepted is None:")[1])
+    assert 'total = len(self._ledger["items"])' in all_parked
     assert ('_stopped_note(run_dir, "every work item was parked", '
-            'len(items), len(items))') in all_parked
+            'total, total)') in all_parked
     halt = _flat(src.split('elif outcome["status"] == "halt":')[1].split("else:")[0])
-    assert '_stopped_note(run_dir, outcome["reason"], i, len(items))' in halt
+    assert '_stopped_note(run_dir, outcome["reason"], n, total)' in halt
 
 
 def test_a_long_question_is_cut_on_the_card_and_kept_whole_in_the_ledger(monkeypatch):

@@ -40,7 +40,8 @@ cd <engine_root> && <docker> compose ps
 after installing.) The run dir already exists. Skip to step 2 with
 `runs/example-hello` and `/projects/loopgraph-example`. Do not write a new brief.
 
-`<engine_root>/runs/<YYYY-MM-DD>-<short-slug>/` with exactly:
+`<engine_root>/runs/<YYYY-MM-DD>-<short-slug>/` with exactly these three files, plus
+`run.yaml` for a sweep or to change the convergence defaults:
 
 - `brief.md` — the feature, the checkable done-when, and the write set (the exact
   paths the executor may touch). One screen, no more. If the request is vague,
@@ -202,6 +203,74 @@ worktree), `discard-failed` (they chose C and the branch survived — read
 item was parked or the supervisor said stop, which is the one verdict that ends a
 whole run. Read `reason` in the ledger and report it with the red gate's output
 tail, verbatim.
+
+## Sweep runs
+
+A sweep has no work items of its own. It runs the project's dead-code detectors,
+removes some of what they report, runs them again, and stops when two passes in a
+row come back at or under a floor, or when its deadline or its item cap lands
+first. The engine decides that from the detectors' output alone; the executor
+never gets a vote on when it is finished.
+
+Add `run.yaml` next to `brief.md`. Presence of `sweep:` is what makes the run a
+sweep. Leave the block out and the run is a normal brief run with the
+`convergence` defaults shown:
+
+```yaml
+convergence:
+  enabled: true     # every run spends an item removing code after
+  every_items: 5    # this many accepted items, or
+  net_lines: 400    # this many net lines added, whichever comes first
+sweep:
+  yield_floor: 3    # end after two passes at or under this
+  deadline: 4d      # 30m, 4h or 4d; leave it out for no deadline
+  max_items: 40
+  groups: [src/, tests/]   # optional; path prefixes each item works in turn
+  detectors:
+    - name: vulture
+      cmd: "vulture src/ --min-confidence 80"
+      timeout: 300
+    - name: ts-prune
+      cmd: "npx ts-prune"
+      timeout: 600
+```
+
+`enabled: false` switches convergence off for a run that has to add a lot of code,
+a migration say. The key is `enabled`, never `off`: YAML reads a bare `off` as a
+boolean, and the run refuses to start with a message saying so.
+
+A detector prints one candidate per line to stdout and exits 0. Only stdout is
+counted, so a warning on stderr is harmless; a non-zero exit or a timeout makes
+the pass incomplete and counts nothing from that detector, and the ledger keeps
+the tail of what it wrote to stderr so you can see why. A misspelt key anywhere
+in the file stops the run before it starts, with the key named in the reason.
+
+`groups` is optional. Each entry is a path prefix compared verbatim against the
+path at the start of every candidate line, which has one leading `./` taken off
+first, so write the prefix without one and end it in `/`: `app/` matches
+`app/core.py` and nothing outside that directory, while `app` also matches
+`apple.py` and `./app/` matches nothing. A candidate no prefix matches goes to a
+group called `(other)`. Leave the key out and candidates are grouped by their
+top-level directory, with files at the repo root in `(root)`.
+
+Each sweep item takes one group of the chosen detector's candidates, and the next
+item takes the next group by name, wrapping round; one pointer carries across
+every detector, so a detector whose list always starts in the same corner cannot
+keep the run there. Rotation changes nothing about the count the run converges
+on: every detector still runs over the whole tree each pass, and every candidate
+is still counted, whichever group it sits in.
+
+Prove every detector the way you prove gates, inside the container on a tree that
+holds tracked files only: in the same `/tmp/gatetest` tree as step 1, run each
+`cmd` and confirm it prints candidates and exits 0. A detector that prints nothing
+on the clean tree ends the sweep on its first pass with nothing done.
+
+The brief of a sweep says what "dead" means for this project and what must never
+be removed. A sweep brief must not carry a `## Work items` heading; the detectors
+are the work list. The run refuses to start if it has one. Every sweep item is
+held to net zero lines: the commit is refused if
+it adds more lines than it removes, tests included, so a false positive that
+needs a whitelist line has to ride along with a real deletion.
 
 ## Don'ts
 

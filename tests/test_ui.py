@@ -795,7 +795,39 @@ def test_the_injected_pattern_survives_javascript():
 #     `hidden` in item 3, and the command is the highest-stakes text on the page:
 #     it is the only thing here that changes what a run does.
 #
-# 10. Read the header. This item needs no run at all, so it is the cheap one.
+# 10. The sweep section, which needs a sweep run, and there was none on this machine
+#     the day this was written — so like item 9 this goes unrun more often than not.
+#     Until there is one, serve a hand-written ledger instead: `ui.make_server(8410,
+#     Path('runs'), temporal_addr=None, feed=FakeFeed(rows=[...], ledgers={id:
+#     {"status": "running", "sweep": {"passes": [...], "ended": None}, "items": [...]}}))`,
+#     with the FakeFeed from this file and a `kind` on an item or two.
+#     See: a `sweep` block above the work items, one line per pass, the failed
+#     detectors named in brackets on an incomplete one, the ending reason under them
+#     once the run has one, and the word `sweep` or `convergence` beside the status
+#     of every item that carries one.
+#     Then click a brief run.
+#     See: no sweep block at all and not one kind word in the items. Every run before
+#     this phase is that run, and a label on every row of them would be this change
+#     costing something and giving nothing back.
+#
+# 11. The group beside a sweep item and the breakdown on a pass, which need a sweep
+#     run whose passes carry groups — none on this machine the day this was written.
+#     Serve a hand-written ledger as in item 10, with `groups` on each pass's
+#     detectors, out of name order across the two detectors: the first
+#     `[{"name": "lib/", "count": 3}]`, the second
+#     `[{"name": "app/", "count": 5}, {"name": "scripts/", "count": 2}]`; and a
+#     `group` on each sweep item, one of them `<b>x</b>`.
+#     See: `sweep · app/` beside the item's status, in the one span the kind word
+#     had, and `sweep · <b>x</b>` on the other item as those eight characters, not
+#     as bold text; and the breakdown in brackets at the end of every pass line,
+#     sorted by name whatever order the detectors reported:
+#     `pass 1: 10 candidates (app/ 5, lib/ 3, scripts/ 2)`.
+#     Then click a brief run.
+#     See: neither. No group beside any item and no brackets on any pass line — a
+#     brief run has no sweep block, and a sweep recorded before groups existed
+#     prints its pass lines exactly as item 10 saw them.
+#
+# 12. Read the header. This item needs no run at all, so it is the cheap one.
 #     See: the release this checkout is on beside the name — `v0.2.0`, or
 #     `untagged` on a clone that has no tag yet — as soon as the first
 #     `/api/runs` lands, and never a blank gap that fills in a second or two
@@ -1420,12 +1452,12 @@ def test_every_section_exists_after_the_board_is_built():
     selection and makes every section, hidden or not, so a patch never has to
     create one — and a poll therefore never builds part of the page."""
     build = function_source(ui.page_html(), "buildBoard")
-    for section in ("state", "why", "awaiting", "items", "rounds", "diff"):
+    for section in ("state", "why", "awaiting", "sweep", "items", "rounds", "diff"):
         assert f'id="{section}"' in build, f"#{section} is not built with the board"
 
 
 def test_the_round_cards_leave_the_board_for_their_own_section():
-    """The board is six sections now, and the log cards are one of them. Left
+    """The board is seven sections now, and the log cards are one of them. Left
     appending to #board they would land on top of the state sections."""
     src = function_source(ui.page_html(), "patchRounds")
     assert "getElementById('rounds')" in src, "the log cards still go straight onto the board"
@@ -1450,6 +1482,120 @@ def test_an_item_row_shows_a_short_commit_or_a_parked_reason():
     assert "'done'" in src and "'parked'" in src, "the two statuses with a detail"
     assert re.search(r"slice\(0,\s*10\)", src), "the commit is not cut to 10 characters"
     assert ".reason" in src, "a parked item says nothing about why"
+
+
+def test_the_items_row_has_a_kind_slot_written_by_the_patch():
+    """AC-29 and AC-11. A sweep item and a convergence item are the engine's own
+    work, and nothing else in the row says so: same number, same pill, same line of
+    text as an item the owner wrote. A brief item gets no word at all — every run
+    before this phase is brief items end to end, and a label on every row of every
+    one of them is noise — and an entry from one of those runs carries no `kind`
+    key, which reads as `brief` here exactly as it does in `lg status`.
+
+    The word goes in a span the builder puts there, so the patch writes text into a
+    node that is already on screen rather than markup into a row the reader may
+    have a selection in.
+    """
+    html = ui.page_html()
+    assert 'class="kind"' in function_source(html, "buildItemRow"), \
+        "the row has no slot for the kind, so a patch would have to write markup to say it"
+    src = function_source(html, "patchItemRow")
+    assert re.search(r"setText\(kind,", src), "the kind is written some way other than setText"
+    assert re.search(r"!==\s*'brief'", src), \
+        "a brief item is labelled `brief`, or a missing kind reaches the page as `undefined`"
+
+
+def test_a_sweep_item_row_shows_its_group_through_settext():
+    """AC-9. A sweep item takes one path group, and the row has to say which: two
+    items of one detector are otherwise the same number, the same pill and the
+    same line of text.
+
+    It goes in the span the kind word already has, because a column of its own
+    would be empty on every row of every brief run. And it is written as text like
+    everything else a poll writes, so a group named `<b>x</b>` reaches the reader
+    as those eight characters — this file cannot see that, and the browser
+    checklist's item 11 is where it is looked at.
+    """
+    src = function_source(ui.page_html(), "patchItemRow")
+    assert "entry.group" in src, "the row never reads the item's group"
+    assert "sweep · " in src, \
+        "the page puts something other than lg status's separator between the two words"
+    assert re.search(r"setText\(kind,", src), "the group is written some way other than setText"
+
+
+def test_pass_rows_carry_the_breakdown_through_settext():
+    """AC-9. The other half of the same line in `lg status`: how many candidates a
+    pass found in each directory, in brackets on the end of the pass row.
+
+    Sorted by name, as the terminal sorts it — the detectors report in whatever
+    order they were run, and a breakdown that follows them moves a directory
+    around the line from one pass to the next. The whole line is written with
+    setText, so a directory name is text and never markup.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchSweep")
+    assert ".groups" in src, "the pass rows never read the detectors' groups"
+    assert ".sort()" in src, \
+        "the breakdown keeps the order the detectors reported, which lg status sorts by name"
+    assert re.search(r"setText\(row,", src), "the row is written some way other than setText"
+    for piece in (" candidates (", ") ("):
+        assert piece in html, f"the page no longer says {piece!r}"
+
+
+def test_the_sweep_copy_is_pinned():
+    """Every word the sweep section says that was not read off a ledger, plus the
+    two ends of it: the section is made once with the board, and a poll fills it."""
+    html = ui.page_html()
+    assert 'id="sweep"' in function_source(html, "buildBoard"), \
+        "the sweep section is not built with the board, so a poll would have to make it"
+    for line in ("(no passes yet)", "candidates", "(incomplete: ", "ended: "):
+        assert line in html, f"the page no longer says {line!r}"
+    assert "patchSweep(" in function_source(html, "patchBoard"), \
+        "the section is built with the board and then filled by nothing"
+    src = function_source(html, "patchSweep")
+    assert re.search(r"\.hidden\s*=\s*!\w+;", src), \
+        "the section's visibility does not follow the ledger's sweep key"
+
+
+def test_the_page_and_lg_status_share_the_sweep_lines():
+    """AC-28 and AC-29 are the same four lines written twice, the way the no-card
+    line above is: `lg` cannot import a page string and `ui.py` cannot import from a
+    file with no extension without loading it.
+
+    So the templates are read out of `lg` and never typed again here — a copy in
+    this test would pin the page to the test and let the terminal drift away from
+    both. Every piece outside a `{...}` placeholder is fixed text the page has to
+    say, ` candidates (incomplete: ` included: that one is what stops the incomplete
+    clause being pasted on as a second string, which is a line the two files could
+    then word differently.
+    """
+    lg = load_lg()
+    html = ui.page_html()
+    for key, template in lg.SWEEP_LINES.items():
+        for piece in re.split(r"\{[^}]*\}", template):
+            assert piece in html, \
+                f"the page does not say {piece!r}, which lg status's {key} line does"
+    assert "', '" in function_source(html, "patchSweep"), \
+        "the failed detectors are joined with something other than lg status's separator"
+
+
+def test_pass_rows_are_keyed_and_built_once():
+    """Passes only grow, so the section is never emptied and filled back up. A row
+    already on screen is found by its pass number and written over, and a new one is
+    inserted where the ledger has it — the map diff the items list is written on,
+    for the reason it is written on it: a reader with a line selected keeps it.
+    """
+    html = ui.page_html()
+    src = function_source(html, "patchSweep")
+    assert "buildPassRow(" in src, "the rows come from somewhere other than the builder"
+    for m in re.finditer(r"\bbuildPassRow\(", src):
+        assert src[:m.start()].rstrip().endswith("="), \
+            "patchSweep calls buildPassRow for what it does, not for the row it hands back"
+    assert "insertBefore" in src, "a new pass row cannot arrive without moving the rows above it"
+    assert ".remove()" in src, "a row whose pass the reply no longer carries stays for ever"
+    build = function_source(html, "buildPassRow")
+    assert re.search(r"dataset\.pass\s*=", build), \
+        "a pass row carries no key, so its text could only be matched to it by position"
 
 
 def test_the_question_is_left_out_when_it_was_never_recorded():

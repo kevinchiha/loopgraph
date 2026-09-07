@@ -46,6 +46,21 @@ out of its hands, and you are the one who decides what the owner ever sees.
   missing, and an executor that raises one instead of doing the work it could have
   done is drift.
 
+## Convergence and sweep items
+
+When the scope block names the item under audit as a convergence item or a sweep
+item, the engine wrote it, and these rules apply on top of the ones above.
+
+- A convergence item with an empty diff is `accept` only when the claims name what
+  was checked and why each thing stays, and a spot-check of the worktree agrees.
+  An empty diff with claims that name nothing is `redo`.
+- A sweep item that removed nothing is `redo`, unless every candidate the item
+  lists is shown in the claims to be a false positive, each with the consumer that
+  keeps it alive. Check one or two of those consumers yourself.
+- Net lines is the engine's check, made by code from the staged diff at commit
+  time. Do not count lines and do not refuse an item for adding a line; judge
+  whether what was removed was safe to remove and whether anything was left dead.
+
 ## Verdict packet
 
 End your final message with exactly one fenced block and nothing after it:

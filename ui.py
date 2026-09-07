@@ -105,18 +105,32 @@ PAGE = """<!doctype html>
                    color:var(--purple); word-break:break-all;
                    font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
   #awaiting .nocard { margin-top:9px; color:#d29922; font-size:12.5px; }
+  /* The detector passes, above the items they produced. The lines are the ones
+     lg status prints, so they are set in the terminal's own font and the counts
+     line up down the column. */
+  #sweep { margin-bottom:22px; }
+  #sweep .pass { font:12.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;
+                 word-break:break-word; }
+  #sweep .ended { margin-top:6px; color:var(--dim); font-size:12.5px; }
+  #sweep .none { color:var(--dim); font-size:12.5px; }
   #items { margin-bottom:22px; }
   #items .none { color:var(--dim); font-size:12.5px; }
-  .item { display:grid; grid-template-columns:24px minmax(0,1fr) auto; gap:2px 10px;
+  /* Four columns since the kind word joined the row: number, item, status, kind.
+     The detail spans the three past the number, on the line below them. */
+  .item { display:grid; grid-template-columns:24px minmax(0,1fr) auto auto; gap:2px 10px;
           align-items:baseline; padding:8px 0; border-bottom:1px solid var(--line); }
   .item .n { color:var(--dim); font:12px ui-monospace,Menlo,monospace; }
   .item .what { min-width:0; word-break:break-word; }
-  .item .detail { grid-column:2 / 4; color:var(--dim); word-break:break-word;
+  /* Beside the pill and never inside it: the pill is the item's status, and a
+     removal item being the engine's own work is not one. Empty on a brief item,
+     which is every item of every run before this phase. */
+  .item .kind { color:var(--purple); font:11px ui-monospace,Menlo,monospace; }
+  .item .detail { grid-column:2 / 5; color:var(--dim); word-break:break-word;
                   font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; }
   .item .detail:empty { display:none; }
   .round { margin-bottom:22px; }
-  #items > h2, .round > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px;
-                             color:var(--dim); text-transform:uppercase; margin-bottom:8px; }
+  #sweep > h2, #items > h2, .round > h2 { font-size:11px; font-weight:700; letter-spacing:1.2px;
+                                          color:var(--dim); text-transform:uppercase; margin-bottom:8px; }
   /* The verdict is the one word on the card that says whether anything was
      accepted, so it is not dim like the labels around it. */
   .round .verdict { font:700 12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -326,6 +340,8 @@ function buildBoard(id) {
     + '<div class="answer"><span class="lbl">answer with:</span><code class="cmd"></code></div>'
     + '<div class="nocard">no card was sent; the lg approve command is the only way to answer</div>'
     + '</section>'
+    + '<section id="sweep" hidden><h2>sweep</h2><div class="rows"></div>'
+    + '<div class="ended"></div><div class="none">(no passes yet)</div></section>'
     + '<section id="items" hidden><h2>work items</h2><div class="rows"></div>'
     + '<div class="none">no items yet</div></section>'
     + '<div id="rounds"></div><div id="diff" hidden></div>';
@@ -351,7 +367,17 @@ function buildItemRow(n) {
   // Empty on purpose, exactly as a run row is: every word comes from
   // patchItemRow, so nothing an item is called can reach the page as markup.
   row.innerHTML = '<span class="n"></span><span class="what"></span>'
-                + '<span class="pill"></span><span class="detail"></span>';
+                + '<span class="pill"></span><span class="kind"></span><span class="detail"></span>';
+  return row;
+}
+function buildPassRow(pass) {
+  const row = document.createElement('div');
+  row.className = 'pass';
+  // Keyed on the pass number the way an item row is keyed on its own: that is how
+  // the row is found again on the next poll. Empty on purpose, as those rows are —
+  // the line is written by patchSweep, so nothing a detector is called can reach
+  // the page as markup.
+  row.dataset.pass = pass;
   return row;
 }
 // status and reason, or the one line saying why there is no state at all.
@@ -416,6 +442,60 @@ function patchOptions(box, options) {
   }
   for (const row of rows.values()) row.remove();
 }
+// The detector passes, in lg status's words. A brief run's ledger has no `sweep`
+// key and the section stays hidden; the section itself is built with the board
+// either way, so a poll only ever fills it in or hides it.
+function patchSweep(ledger) {
+  const box = document.getElementById('sweep');
+  const sweep = ledger && ledger.sweep;
+  box.hidden = !sweep;
+  if (!sweep) return;
+  const [, rows, ended, none] = box.children;
+  const passes = sweep.passes || [];
+  const have = new Map([...rows.children].map(row => [row.dataset.pass, row]));
+  let after = null;
+  for (const p of passes) {
+    const key = String(p.pass);
+    let row = have.get(key);
+    if (row) {
+      have.delete(key);
+    } else {
+      row = buildPassRow(key);
+      // A pass only ever arrives at the end, and it is still placed the way an
+      // item row is placed: the rows already on screen do not move, so a line the
+      // reader has selected stays selected.
+      rows.insertBefore(row, after ? after.nextSibling : rows.firstChild);
+    }
+    // A non-empty note means there is something to read about that detector: it
+    // died, or its output was cut at 1 MiB. Names print only on an incomplete
+    // pass, and a pass is incomplete only when a detector died, so what the owner
+    // sees here is the tool to go and look at. Both lines are lg status's, word for word,
+    // and each is written whole rather than pasted together from a stem and a
+    // clause, so the two files cannot word one of them differently.
+    const names = (p.detectors || []).filter(d => d.note).map(d => d.name).join(', ');
+    // How many candidates the pass found in each directory, summed across its
+    // detectors — two tools reporting one directory are one number to read — and
+    // sorted by name, which is the order lg status sorts them in and the only one
+    // that keeps a directory in the same place from pass to pass. A pass recorded
+    // before groups existed sums to nothing and prints the line it always did,
+    // rather than empty brackets.
+    const counts = new Map();
+    for (const d of p.detectors || [])
+      for (const g of d.groups || []) counts.set(g.name, (counts.get(g.name) || 0) + g.count);
+    const groups = [...counts.keys()].sort().map(name => `${name} ${counts.get(name)}`).join(', ');
+    setText(row, groups
+      ? (p.complete ? `pass ${p.pass}: ${p.total} candidates (${groups})`
+                    : `pass ${p.pass}: ${p.total} candidates (incomplete: ${names}) (${groups})`)
+      : (p.complete ? `pass ${p.pass}: ${p.total} candidates`
+                    : `pass ${p.pass}: ${p.total} candidates (incomplete: ${names})`));
+    after = row;
+  }
+  for (const row of have.values()) row.remove();
+  // Why the sweep stopped, which is only there once it has.
+  ended.hidden = !sweep.ended;
+  setText(ended, sweep.ended ? 'ended: ' + sweep.ended : '');
+  none.hidden = passes.length > 0;
+}
 function patchItems(ledger) {
   const box = document.getElementById('items');
   box.hidden = !ledger;
@@ -444,11 +524,25 @@ function patchItems(ledger) {
   none.hidden = items.length > 0;
 }
 function patchItemRow(row, entry) {
-  const [n, what, state, detail] = row.children;
+  const [n, what, state, kind, detail] = row.children;
   setText(n, String(entry.n));
   setText(what, entry.item || '');
   state.className = 'pill ' + pill(entry.status);
   setText(state, entry.status || '');
+  // A removal item and a detector's item are the engine's own work, and nothing
+  // else in the row says so. An entry from a run older than `kind` has no key:
+  // those runs had brief items and nothing else, which is how lg status reads them
+  // too. Written on every poll, the empty word included — a convergence item takes
+  // its execution position and the pending items after it move up, so the entry
+  // under a row keyed `n` can be a different item from one poll to the next, and a
+  // word left unwritten would be the old item's, under the new item's number.
+  const word = entry.kind && entry.kind !== 'brief' ? entry.kind : '';
+  // A sweep item takes one path group, and which one is all that tells two items
+  // of the same detector apart. It goes in the word's own span: a column of its
+  // own would be empty on every row of every brief run, and every run before this
+  // phase is one of those. An item from before the rotation carries no `group`,
+  // and lg status prints the two words in this order too.
+  setText(kind, word === 'sweep' && entry.group ? `sweep · ${entry.group}` : word);
   // A done item's commit, cut to the length anyone actually reads, or a parked
   // item's reason, which is the only thing that says why the run moved on.
   setText(detail, entry.status === 'done' ? String(entry.commit || '').slice(0, 10)
@@ -460,6 +554,7 @@ function patchItemRow(row, entry) {
 function patchBoard(d) {
   patchState(d);
   patchAwaiting(d && d.ledger);
+  patchSweep(d && d.ledger);
   patchItems(d && d.ledger);
 }
 // A round's key, `<item>-<round>`, and the one place the item-1 default lives.
@@ -1137,7 +1232,9 @@ def diff_payload(wf_id: str, feed, runs_dir: Path) -> dict:
         rounds = ledger.get("rounds") or []
         if not rounds:
             return _reason("no rounds yet")
-        last = rounds[-1]
+        # The last round that ran: a round whose executor died before it made a
+        # worktree has none to diff, and the pane should show the round before it.
+        last = next((r for r in reversed(rounds) if r.get("worktree")), rounds[-1])
         repo, why = resolve_repo(last.get("worktree", ""), runs_dir,
                                  read_env(ROOT / ".env").get("LOOPGRAPH_PROJECTS_DIR"))
         if repo is None:

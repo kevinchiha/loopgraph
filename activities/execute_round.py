@@ -70,6 +70,32 @@ def parse_final_json(text: str) -> dict:
     return json.loads(matches[-1])
 
 
+CANDIDATE_CAP = 200  # chars per candidate
+
+
+def clean_candidates(raw) -> list[str]:
+    """The things an executor found by hand, one line each, no repeats.
+
+    A sweep pastes these raw into the next item's text, which lands in the
+    executor prompt and in the auditor's scope block, above the engine's own
+    sections. A newline in one could open a "# Gate results" of its own, which is
+    the bug flatten_claim fixed for claims; audit.py imports from this module and
+    never the other way round, so the collapse is repeated here rather than
+    imported. Cleaning happens before anything stores a candidate, so nothing
+    downstream ever holds a raw one.
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for c in raw:
+        if not isinstance(c, str):
+            continue
+        line = " ".join(c.split())[:CANDIDATE_CAP]
+        if line and line not in out:
+            out.append(line)
+    return out
+
+
 def parse_porcelain(porcelain: str) -> list[str]:
     """`git status --porcelain -z --untracked-files=all` → the paths that changed.
 
@@ -97,6 +123,19 @@ def parse_porcelain(porcelain: str) -> list[str]:
             i += 1
         i += 1
     return sorted(files)
+
+
+def run_paths(run_dir: str, run_token: str) -> tuple[str, str]:
+    """The worktree and the branch a run works in.
+
+    Every activity that touches the run's checkout derives these two strings, and
+    deriving them twice is a rename away from a sweep whose detectors read one
+    worktree while its executor writes another.
+    """
+    run = Path(run_dir)
+    worktree = str(run / "worktrees" / (run_token or "run"))
+    branch = f"lg-{run.name}-{run_token}" if run_token else f"lg-{run.name}"
+    return worktree, branch
 
 
 # ---------- container-side effects ----------
@@ -223,9 +262,7 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
     prompt = assemble_prompt(brief, constraints, work_item or brief, directive,
                              read_answers(run_dir))
 
-    token = run_token or "run"
-    worktree = str(run / "worktrees" / token)
-    branch = f"lg-{run.name}" if not run_token else f"lg-{run.name}-{run_token}"
+    worktree, branch = run_paths(run_dir, run_token)
     base_branch = (await _git("branch", "--show-current", cwd=target_repo)).strip()
     await ensure_worktree(target_repo, worktree, branch)
     await reset_to_checkpoint(worktree, base_commit)
@@ -262,6 +299,10 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
         # its own and must not have one: the supervisor reads these and decides
         # which, if any, become a card.
         "blocked": final["result"].get("blocked", []) or [],
+        # Extra work the executor spotted while doing this item. The sweep hands
+        # them to the next item; the fallback payload run_executor builds when the
+        # JSON block is missing has no such key, and .get covers it.
+        "candidates": clean_candidates(final["result"].get("candidates")),
         "files": files,
         "diff_stat": diff_stat.strip(),
         "gate_results": final["gate_results"],

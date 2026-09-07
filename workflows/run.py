@@ -7,7 +7,7 @@ The full LoopGraphRun (rounds, cadences, signals) lands in M3 — same file.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -16,6 +16,8 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from activities.audit import audit
     from activities.checkpoint import checkpoint, discard, merge
+    from activities.config import load_run_config
+    from activities.discover import discover
     from activities.execute_round import execute_round, run_baseline
     from activities.gate import run_gates
     from activities.items import load_work_items
@@ -127,18 +129,269 @@ def audit_failure_reason(e: BaseException) -> str:
     return " <- ".join(parts)[:AUDIT_REASON_CAP]
 
 
-def build_merge_summary(summary: str, total: int, parked: list[dict]) -> str:
+def config_error_reason(e: BaseException) -> str:
+    """Why the run cannot start, in the words run.yaml's own checker used.
+
+    The ActivityError on top says "Activity task failed", which is no help to
+    anyone about to edit a file; the line naming the offending key is on
+    `__cause__`, wrapped as an ApplicationError. Anything else that can go wrong
+    scheduling the activity has no such line, so it is reported whole.
+    """
+    cur: BaseException | None = e
+    seen = 0
+    while cur is not None and seen < 4:  # bounded: __cause__ chains can cycle
+        # Temporal keeps the raw message on `.message`; str() prepends the type
+        # the activity raised, which would push `run.yaml:` off the front.
+        text = " ".join((getattr(cur, "message", None) or str(cur)).split())
+        if text.startswith("run.yaml:"):
+            # Capped like the audit reason: this goes on a card and into the
+            # ledger, and a YAML parser's own line can run to thousands of
+            # characters.
+            return text[:AUDIT_REASON_CAP]
+        cur = cur.__cause__
+        seen += 1
+    return audit_failure_reason(e)
+
+
+def build_merge_summary(summary: str, total: int, parked: list[dict],
+                        ended: str | None = None) -> str:
     """The merge card's text when some items did not make it.
 
     Says plainly what merging does and does not include, because the one thing
-    the owner must not think is that a green card means everything got done."""
-    if not parked:
-        return summary
-    lines = "\n".join(f"- item {e['n']}: {str(e['item'])[:120]} ({e['reason']})" for e in parked)
-    kept = total - len(parked)
-    return (f"{summary}\n\nParked, NOT in this branch:\n{lines}\n\n"
-            f"Merging takes the {kept} item(s) that passed. The parked ones need "
-            f"another run.")
+    the owner must not think is that a green card means everything got done. A
+    sweep also says which condition stopped it: converged, out of items and out
+    of time all arrive as the same merge-ready card otherwise.
+    """
+    text = summary
+    if parked:
+        lines = "\n".join(f"- item {e['n']}: {str(e['item'])[:120]} ({e['reason']})" for e in parked)
+        kept = total - len(parked)
+        text = (f"{summary}\n\nParked, NOT in this branch:\n{lines}\n\n"
+                f"Merging takes the {kept} item(s) that passed. The parked ones need "
+                f"another run.")
+    # `is not None`, not truthiness: an ending reason that came out empty is a
+    # bug the owner should see on the card, not one that vanishes off it.
+    return f"{text}\n\nsweep ended: {ended}" if ended is not None else text
+
+
+def build_convergence_item(files: list[str]) -> str:
+    """The removal item the engine writes for itself once a run has added enough.
+
+    Nobody wrote this item by hand, so the text is the whole instruction: what
+    the executor may not do, how the cap is measured, which files the last
+    accepted items touched, and what to do when there is genuinely nothing to
+    remove. It says "net lines", not "net production lines", because the engine
+    counts every staged line: a text that excluded tests would invite the
+    executor to buy its removals back with new ones.
+    """
+    return "\n".join([
+        "Convergence item. No new behaviour, no new files, no new public surface.",
+        "Net lines for this item must be at or under zero; the engine measures it with",
+        "git diff --numstat over every staged line, tests included, and refuses the",
+        "commit if it is not.",
+        "Look at what the last items added:",
+        *files,
+        "Remove dead code, merge duplicates you introduced, delete anything with no consumer.",
+        "Every gate stays green. If there is genuinely nothing to remove, change no file and",
+        "say in your claims what you checked and why each thing stays.",
+    ])
+
+
+def build_sweep_item(detector: dict, pass_no: int, extras: list[str], group: int) -> str:
+    """One sweep item: one of a detector's path groups, and what to do about it.
+
+    `group` indexes `detector_groups(detector)`. An item takes one group so its
+    write set sits in one part of the repo: an item over the whole list picks
+    whatever the detector printed first, and a run of them edits the same files
+    over and over while the rest of the repo goes unworked.
+
+    The counts and the sample all come from the detector entry, so they cannot
+    disagree. They are different numbers on purpose: a detector reports
+    everything it found and hands over only the first few, and an executor told
+    the sample was the list would think the job was nearly done. The other groups
+    are named but not sampled, so the executor can see the shape of the pass
+    without reading it as this item's work. `extras` are things an earlier item
+    found by hand; they get worked, but no detector counts them, so the text says
+    they do not move the run's end.
+    """
+    groups = detector_groups(detector)
+    chosen = groups[group]
+    lines = chosen["lines"]
+    takes = (f"groups by path; this item takes group `{chosen['name']}` "
+             f"({chosen['count']} candidates).")
+    if chosen["count"] and not lines:
+        # Past the sample cap: `discover` kept this group's count and none of its
+        # lines. The command is the only way back to them, and an item that just
+        # printed nothing would hide every candidate in the group.
+        sample = [takes,
+                  f"No sample was kept for this group; run `{detector['cmd']}` from the "
+                  "repo root and take the lines that fall in it:"]
+    else:
+        sample = [f"{takes} The first",
+                  f"{len(lines)} follow, one per line, printed from the repo root:",
+                  *lines]
+    others = [f"{g['name']}: {g['count']} candidates"
+              for i, g in enumerate(groups) if i != group]
+    return "\n".join([
+        f"Sweep item. Detector `{detector['name']}` (pass {pass_no}) reported "
+        f"{detector['count']} candidates across {len(groups)}",
+        *sample,
+        "The other groups this pass, for the picture only; later items take them:",
+        *(others or ["(none)"]),
+        "Take the largest safe family of these that shares one behaviour claim, one write set",
+        "and one gate. Remove or merge it. Leave the rest for a later item. Net lines for",
+        "this item must be at or under zero; the engine measures it and refuses the commit",
+        "if it is not. Every gate stays green.",
+        "Also reported by an earlier item, not by a detector (work them if they are real; they do",
+        "not count toward the run's end):",
+        *(extras or ["(none)"]),
+        "Register anything you find by hand under `candidates` in your output.",
+    ])
+
+
+EXTRAS_CAP = 20    # candidates an earlier item found, carried to the next one
+STALL_LIMIT = 3    # sweep items parked in a row before the run gives up
+LEDGER_LINES = 10  # candidate lines per detector the ledger keeps
+
+
+def trim_pass(found: dict, pass_no: int) -> dict:
+    """A `discover` result cut down to what the ledger can afford to carry.
+
+    The ledger is not a log: it is the `ledger` query's whole reply on every
+    dashboard poll, and the workflow's return value, and Temporal caps a payload
+    at 2 MB. Storing the result whole was measured at 1,569 KB for a 40-item
+    sweep over three detectors and 1,941 KB over four, because every pass kept
+    60 candidate lines and a 2000-character stderr tail per detector.
+
+    Ten lines is enough for the owner to see what a pass was looking at, and the
+    executor still gets the chosen group's whole sample: this returns a copy and
+    leaves `found` alone, which is what the item text is built from. The stderr
+    tail is kept only where the note says there is something to read, which is
+    the same test `lg status` and the dashboard use to decide whether to name the
+    detector at all. `cmd` stays whatever the note says: it is one short string,
+    and an owner reading a failed pass wants to see which command it was.
+
+    A group keeps its name and its count and never its sample: the sample is the
+    detector's own lines split up again, and the names and counts are all the
+    per-pass breakdown reads.
+    """
+    detectors = []
+    for d in found["detectors"]:
+        kept = {"name": d["name"], "cmd": d["cmd"], "exit_code": d["exit_code"],
+                "count": d["count"], "note": d["note"],
+                "lines": d["lines"][:LEDGER_LINES]}
+        if d["note"]:
+            kept["stderr_tail"] = d["stderr_tail"]
+        # The one guarded read of `groups` outside `detector_groups`: a pass
+        # recorded before this phase has to keep the exact shape it had, and
+        # writing `groups: []` there would change every one of them for a key
+        # that prints nothing.
+        if "groups" in d:
+            kept["groups"] = [{"name": g["name"], "count": g["count"]} for g in d["groups"]]
+        detectors.append(kept)
+    return {"pass": pass_no, "complete": found["complete"], "total": found["total"],
+            "detectors": detectors}
+
+
+def sweep_end_reason(passes: list[dict], sweep: dict, elapsed: float, items_run: int,
+                     parked_streak: int) -> str | None:
+    """Why this sweep is over, or None to build another item.
+
+    The order is the whole of it. Two conditions can land on the same pass, and
+    a fixed order is what stops the same run reporting a different ending
+    depending on which check happened to run first. Detector failure comes
+    before everything else, because a zero from a detector that died is not a
+    zero: the run would converge on a number the repo never had.
+    """
+    latest = passes[-1]
+    if latest["total"] == 0 and not latest["complete"]:
+        failed = ", ".join(d["name"] for d in latest["detectors"] if d["note"])
+        return f"detectors failed: {failed}"
+    if latest["complete"] and latest["total"] == 0:
+        return "converged: nothing reported"
+    floor = sweep["yield_floor"]
+    # Complete passes only: an incomplete one is a count nobody can trust.
+    counted = [p["total"] for p in passes if p["complete"]]
+    if len(counted) >= 2 and counted[-2] <= floor and counted[-1] <= floor:
+        return f"converged: two passes at or under {floor} ({counted[-2]}, {counted[-1]})"
+    # `is not None`, because 0 is a deadline that has already passed and
+    # truthiness would read it as a run with no deadline at all.
+    if sweep["deadline_seconds"] is not None and elapsed >= sweep["deadline_seconds"]:
+        return f"deadline reached after {items_run} items"
+    if items_run >= sweep["max_items"]:
+        return f"item cap {sweep['max_items']} reached"
+    if parked_streak >= STALL_LIMIT:
+        return f"sweep stalled: {STALL_LIMIT} consecutive items parked"
+    return None
+
+
+def pick_detector(entries: list[dict], last_used: int | None) -> int | None:
+    """Which detector the next sweep item comes from, or None if none reported.
+
+    Round-robin from the one after the detector the last item used, wrapping,
+    skipping any that reported nothing this pass. A detector's list is often the
+    same corner of the repo every pass, and always taking the first would pin the
+    run there while the others go unworked. A detector on 0 has nothing to hand
+    over, so taking it would build an item with an empty sample.
+    """
+    start = 0 if last_used is None else last_used + 1
+    order = [(start + step) % len(entries) for step in range(len(entries))]
+    return next((i for i in order if entries[i]["count"]), None)
+
+
+def pick_group(groups: list[dict], last: str | None) -> int | None:
+    """Which of that detector's groups the next item takes, or None if it has none.
+
+    The next name along, wrapping to the front when there is none. `groups` is
+    name-sorted (`discover` sorts it), so "the first name after `last`" is the
+    next group. The pointer is a name rather than an index because the set of
+    groups changes from pass to pass and from detector to detector: an index
+    would point at a different group the moment a directory emptied. A name that
+    has left the list still lands on the next name after it, which is what one
+    pointer shared across detectors needs.
+
+    The loop never asks about a detector with no groups: `pick_detector` skips a
+    detector on 0, and a counted detector has at least one group. None is the
+    answer for anyone who asks anyway.
+    """
+    if not groups:
+        return None
+    if last is None:
+        return 0
+    return next((i for i, g in enumerate(groups) if g["name"] > last), 0)
+
+
+def detector_groups(entry: dict) -> list[dict]:
+    """A detector entry's groups, with a pass that predates them read as one group.
+
+    Every read that builds an item goes through here; `trim_pass` checks for the
+    key itself, on purpose, so an old pass trims to the key set it had. A run
+    that started before groups existed has no `groups` in its history, and
+    Temporal replays that history through today's code: raising would fail the
+    workflow task and leave the run stuck with nothing to do about it. Reading
+    the whole detector as one group named `(all)` builds the item v1 built.
+    """
+    if "groups" in entry:
+        return entry["groups"]
+    return [{"name": "(all)", "count": entry["count"], "lines": entry["lines"]}]
+
+
+def merge_extras(extras: list[str], candidates: list[str], cap: int = EXTRAS_CAP) -> list[str]:
+    """What the next sweep item carries: the extras it was handed, plus whatever
+    this item found by hand that is not on the list already.
+
+    A candidate that is already there keeps the position it first had. Appending
+    it again would let a thing every executor notices walk the older ones off the
+    front, and nobody would ever work them. The list is trimmed from the front to
+    `cap` because it rides in the item text, which lands in the executor's prompt
+    and in the auditor's scope block: an unbounded one pushes the detector's own
+    candidates out of both.
+    """
+    merged = list(extras)
+    for candidate in candidates:
+        if candidate not in merged:
+            merged.append(candidate)
+    return merged[-cap:]
 
 
 @workflow.defn
@@ -153,6 +406,9 @@ class LoopGraphRun:
     def __init__(self) -> None:
         self._ledger: dict = {"status": "running", "items": [], "rounds": [], "checkpoint": None}
         self._target_repo: str = ""
+        # run.yaml, read once before anything else runs. The convergence knobs and
+        # the sweep block both live here.
+        self._config: dict = {}
         self._decisions: list[str] = []
         # The last checkpoint this run committed. Rounds reset to it rather than to
         # HEAD, so a commit the executor made during a failed attempt can never
@@ -166,64 +422,303 @@ class LoopGraphRun:
         An item that will not go green is parked and the run carries on, so one
         bad item does not throw away the ones that worked. The owner hears about
         a park immediately and their reply is picked up before the next item.
-        """
-        self._target_repo = target_repo
-        # Capture the starting commit before anything runs, so the very first round
-        # already has a baseline to reset to rather than trusting HEAD.
-        self._base_commit = await workflow.execute_activity(
-            run_baseline,
-            args=[target_repo],
-            start_to_close_timeout=timedelta(minutes=2),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-        items = await workflow.execute_activity(
-            load_work_items,
-            args=[run_dir],
-            start_to_close_timeout=timedelta(minutes=1),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-        if not items:
-            items = [work_item or ""]  # no work-items section: the whole brief, one item
-        self._ledger["items"] = [{"n": i, "item": it, "status": "pending"}
-                                 for i, it in enumerate(items, start=1)]
 
-        carried: str | None = None   # an owner reply, handed to the next item
+        A sweep run has no brief items and takes its work from the detectors
+        instead; `_run_sweep` is that half of the loop.
+        """
+        # Where a sweep's deadline counts from, and the only clock this module
+        # may read: Temporal replays `workflow.now()` to the same instant, so the
+        # run that resumes after a worker restart is not suddenly four days old.
+        start = workflow.now()
+        self._target_repo = target_repo
+        # run.yaml first, and once. A knob the schema does not know is an error,
+        # not a default taken quietly, and finding it after the baseline would
+        # mean the run had already started work on a config nobody could trust.
+        # The retry policy is run_baseline's: the activity refuses a bad file
+        # itself and is never asked twice about it, so what is left for the
+        # policy to cover is a worker restart or a slow disk, which used to end
+        # the run for good on an `ActivityError` nobody could act on.
+        try:
+            self._config = await workflow.execute_activity(
+                load_run_config,
+                args=[run_dir],
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as e:  # noqa: BLE001 - a broken run.yaml ends the run, cleanly
+            reason = config_error_reason(e)
+            self._ledger.update(status="stopped", reason=reason)
+            await self._stopped_note(run_dir, reason, None, None)
+            return self._ledger
+        # Every activity from here on, in an item or between them. A dead one
+        # stops the run and says so. The run returns its ledger rather than
+        # raising because Temporal answers the `ledger` query on a failed
+        # workflow by replaying the state at the failure: a raise leaves
+        # `lg status`, the dashboard and the owner all believing the run is
+        # still going, with no card to tell them otherwise.
+        try:
+            # Capture the starting commit before anything runs, so the very first round
+            # already has a baseline to reset to rather than trusting HEAD.
+            self._base_commit = await workflow.execute_activity(
+                run_baseline,
+                args=[target_repo],
+                start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if self._config["sweep"] is not None:
+                # The detectors are the item source, so there is no brief list to
+                # load and no convergence item to inject: a sweep item is already
+                # held to net zero, and a removal pass would be the same item twice.
+                return await self._run_sweep(run_dir, target_repo, self._config["sweep"],
+                                             start)
+            items = await workflow.execute_activity(
+                load_work_items,
+                args=[run_dir],
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if not items:
+                items = [work_item or ""]  # no work-items section: the whole brief, one item
+            # The kind is set when the entry is made, not when it finishes: an entry
+            # with no kind while it runs is one the dashboard cannot label.
+            self._ledger["items"] = [{"n": i, "item": it, "status": "pending", "kind": "brief"}
+                                     for i, it in enumerate(items, start=1)]
+
+            carried: str | None = None   # an owner reply, handed to the next item
+            accepted: dict | None = None  # last accepted round result, for the final card
+            checkpoint_result: dict | None = None
+
+            conv = self._config["convergence"]
+            queue = list(items)          # the brief's items, taken from the front
+            n = 0                        # items executed, and the number the next one gets
+            items_since = 0              # accepted brief items since the last removal pass
+            net_since = 0                # net lines those items committed
+            touched: list[str] = []      # every path they wrote
+
+            while True:
+                # Before the next brief item AND after the last one, which is the same
+                # branch: a five-item brief that added 600 lines needs its removal pass
+                # after item 5, or the rule skips exactly the run it exists for.
+                if conv["enabled"] and (items_since >= conv["every_items"]
+                                        or net_since >= conv["net_lines"]):
+                    kind = "convergence"
+                    item = build_convergence_item(sorted(set(touched)))
+                    entry = {"n": n + 1, "item": item, "status": "pending", "kind": kind}
+                    # It takes the position it runs in, and the pending items after it
+                    # move up. Appending it with the next free number would put
+                    # `item 6 of 6` on a card mid-run, which reads as the run going
+                    # backwards; the dashboard keys rows on `n` and re-patches their
+                    # text, so renumbering pending rows loses nothing.
+                    self._ledger["items"].insert(n, entry)
+                    for later in self._ledger["items"][n + 1:]:
+                        later["n"] += 1
+                elif not queue:
+                    break
+                else:
+                    kind = "brief"
+                    item = queue.pop(0)
+                    entry = self._ledger["items"][n]
+                total = len(self._ledger["items"])
+                n += 1
+                entry["status"] = "running"
+                outcome = await self._run_item(run_dir, target_repo, item, n, carried, kind)
+                if kind == "brief":
+                    # Cleared only after a brief item. The park card tells the owner
+                    # to reply with anything the next item should know; clearing after
+                    # every item spent that reply on the convergence item the engine
+                    # injects — its own item, about the run's own growth — and the
+                    # brief item the note was written for never saw it.
+                    carried = None
+                if outcome["status"] == "accepted":
+                    cp = outcome["checkpoint"]
+                    if cp is None:
+                        # A convergence item the auditor accepted with an empty write
+                        # set: there was nothing left to remove. It committed nothing,
+                        # so the merge card must go on naming the last real checkpoint.
+                        entry.update(status="done", commit=None, note="nothing to remove")
+                    else:
+                        entry["status"] = "done"
+                        entry["commit"] = cp.get("commit")
+                        accepted, checkpoint_result = outcome["result"], cp
+                        if kind == "brief":
+                            items_since += 1
+                            net_since += cp.get("net", 0)
+                            touched.extend(cp["files"])
+                elif outcome["status"] == "halt":
+                    entry.update(status="parked", reason=outcome["reason"])
+                    self._ledger.update(status="stopped", reason=outcome["reason"])
+                    await self._stopped_note(run_dir, outcome["reason"], n, total)
+                    return self._ledger
+                else:
+                    entry.update(status="parked", reason=outcome["reason"])
+                    await self._park_note(run_dir, n, total, item, outcome["reason"])
+                if kind == "convergence":
+                    # The pass happened, whatever came of it. Carrying the counters on
+                    # would inject the next one immediately and every item after it.
+                    items_since, net_since, touched = 0, 0, []
+
+                # Anything the owner sent while that item ran is steering for the next
+                # one. It is already in workflow state: the dispatcher signalled it.
+                notes = self._drain_decisions()
+                if notes:
+                    entry.setdefault("owner_notes", []).extend(notes)
+                    fresh = ("The owner sent this mid-run, after item "
+                             f"{n}: {' / '.join(notes)}")
+                    # Joined, not overwritten: a note kept across a convergence item
+                    # and a note sent during it are both steering for the same next
+                    # brief item, and dropping either loses an owner's answer.
+                    carried = f"{carried} / {fresh}" if carried else fresh
+
+            parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
+            if accepted is None:
+                self._ledger.update(status="stopped", reason="every work item was parked")
+                # Nothing was accepted, so there is no item the run stopped "on": it
+                # ran out at the last one, and that is where the note speaks from. The
+                # count is read again here because an injected item changed it.
+                total = len(self._ledger["items"])
+                await self._stopped_note(run_dir, "every work item was parked", total, total)
+                return self._ledger
+            self._ledger.update(status="merge-ready")
+            await self._owner_card(run_dir, accepted, checkpoint_result, parked)
+            return self._ledger
+        except Exception as e:  # noqa: BLE001 - the run ends, and reports it
+            reason = "engine failure: " + audit_failure_reason(e)
+            self._ledger.update(status="stopped", reason=reason)
+            if "sweep" in self._ledger and self._ledger["sweep"].get("ended") is None:
+                # Why a sweep ended is read off this one key by `lg status`,
+                # the dashboard and the merge card. A sweep that had already
+                # ended keeps its own reason: a merge card that died is not why
+                # the detectors stopped reporting.
+                self._ledger["sweep"]["ended"] = reason
+            try:
+                await self._stopped_note(run_dir, reason, None, None)
+            except Exception:  # noqa: BLE001 - a dead sender must not unwrite the ledger
+                workflow.logger.warning("no stopped note went out: %s", reason)
+            return self._ledger
+
+    async def _run_sweep(self, run_dir: str, target_repo: str, sweep: dict,
+                         start: datetime) -> dict:
+        """The other item source: a detector pass, one item, another pass.
+
+        A pass runs before the first item so the run has a baseline to measure
+        against, and again after every item, because the detectors are the only
+        thing allowed to say the work is finished. The executor may add work —
+        what it found by hand rides on the next item as `extras` — but nothing it
+        reports moves a total or an end condition. An agent deciding when its own
+        job is done is exactly what the engine exists to prevent.
+        """
+        self._ledger["sweep"] = {"passes": [], "ended": None, "last_group": None}
+        # Every detector's own timeout, plus 20 seconds each because the runner
+        # polls in 20-second steps and can only kill on a step boundary (a
+        # detector with `timeout: 30` dies at 40), plus two minutes for the
+        # worktree and the reset to the last checkpoint. The bare sum would kill
+        # the pass while its last detector was still being killed, and report
+        # the whole thing as a Temporal failure rather than a timed-out detector.
+        pass_timeout = timedelta(
+            seconds=sum(d["timeout"] + 20 for d in sweep["detectors"]) + 120)
+
+        carried: str | None = None    # an owner reply, handed to the next item
         accepted: dict | None = None  # last accepted round result, for the final card
         checkpoint_result: dict | None = None
+        extras: list[str] = []        # candidates earlier items found by hand
+        items_run = 0
+        parked_streak = 0             # parked in a row; STALL_LIMIT ends the run
+        used: int | None = None       # index of the detector the last item came from
+        pass_no = 0
 
-        for i, item in enumerate(items, start=1):
-            entry = self._ledger["items"][i - 1]
-            entry["status"] = "running"
-            outcome = await self._run_item(run_dir, target_repo, item, i, carried)
+        while True:
+            pass_no += 1
+            try:
+                found = await workflow.execute_activity(
+                    discover,
+                    args=[run_dir, target_repo, self._run_token(), self._base_commit],
+                    start_to_close_timeout=pass_timeout,
+                    heartbeat_timeout=timedelta(minutes=3),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            # A pass that failed both attempts ends the sweep the way a pass whose
+            # detectors all died does, and for the same reason: there is no number
+            # to build an item from. Letting it raise killed the workflow with the
+            # ledger unwritten, so the `ledger` query went on saying `running` and
+            # no card went out — the failure the audit call already closed inside
+            # an item. Nothing is appended to `passes`: a pass that never returned
+            # measured nothing.
+            except Exception as e:  # noqa: BLE001 - the sweep ends, the run reports
+                reason = f"discover failed: {audit_failure_reason(e)}"
+                break
+            # `found` stays a local: the item text below quotes one group's whole
+            # sample and names the other groups, and the ledger keeps ten lines
+            # per detector.
+            self._ledger["sweep"]["passes"].append(trim_pass(found, pass_no))
+            elapsed = (workflow.now() - start).total_seconds()
+            reason = sweep_end_reason(self._ledger["sweep"]["passes"], sweep, elapsed,
+                                      items_run, parked_streak)
+            if reason:
+                break
+
+            # A pass with nothing to hand over has already ended the run above,
+            # so there is always a detector left for `pick_detector` to find, and
+            # a detector that counted something has a group for `pick_group`.
+            entries = found["detectors"]
+            used = pick_detector(entries, used)
+            groups = detector_groups(entries[used])
+            picked = pick_group(groups, self._ledger["sweep"]["last_group"])
+            item = build_sweep_item(entries[used], pass_no, extras, picked)
+            # The pointer moves as the item is built, not when it is accepted, so
+            # a group whose item parked is not handed straight back to the next
+            # one; and it lives in the ledger, so a rotation stuck on one group is
+            # something `lg status` and the dashboard can show.
+            self._ledger["sweep"]["last_group"] = groups[picked]["name"]
+            entry = {"n": items_run + 1, "item": item, "status": "running",
+                     "kind": "sweep", "group": groups[picked]["name"]}
+            self._ledger["items"].append(entry)
+            items_run += 1
+            outcome = await self._run_item(run_dir, target_repo, item, items_run,
+                                           carried, "sweep")
             carried = None
             if outcome["status"] == "accepted":
-                entry["status"] = "done"
-                entry["commit"] = outcome["checkpoint"].get("commit")
-                accepted, checkpoint_result = outcome["result"], outcome["checkpoint"]
+                cp = outcome["checkpoint"]
+                entry.update(status="done", commit=cp.get("commit"), net=cp.get("net"))
+                accepted, checkpoint_result = outcome["result"], cp
+                parked_streak = 0
             elif outcome["status"] == "halt":
                 entry.update(status="parked", reason=outcome["reason"])
                 self._ledger.update(status="stopped", reason=outcome["reason"])
-                await self._stopped_note(run_dir, outcome["reason"], i, len(items))
+                # Not one of the five end conditions, but it is still why the
+                # sweep ended, and that is the one key `lg status` reads.
+                self._ledger["sweep"]["ended"] = outcome["reason"]
+                await self._stopped_note(run_dir, outcome["reason"], items_run, None)
                 return self._ledger
             else:
                 entry.update(status="parked", reason=outcome["reason"])
-                await self._park_note(run_dir, i, len(items), item, outcome["reason"])
+                parked_streak += 1
+                await self._park_note(run_dir, items_run, None, item, outcome["reason"])
+            # A parked item read the code too, so its candidates count. They are
+            # text for the next item and nothing else: counting them would hand
+            # the executor the number the run ends on.
+            extras = merge_extras(extras, outcome["result"]["candidates"])
 
-            # Anything the owner sent while that item ran is steering for the next
-            # one. It is already in workflow state: the dispatcher signalled it.
+            # Anything the owner sent while that item ran is steering for the
+            # next one. It is already in workflow state: the dispatcher signalled
+            # it.
             notes = self._drain_decisions()
             if notes:
                 entry.setdefault("owner_notes", []).extend(notes)
                 carried = ("The owner sent this mid-run, after item "
-                           f"{i}: {' / '.join(notes)}")
+                           f"{items_run}: {' / '.join(notes)}")
 
+        self._ledger["sweep"]["ended"] = reason
+        self._ledger["reason"] = reason
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
         if accepted is None:
-            self._ledger.update(status="stopped", reason="every work item was parked")
-            # Nothing was accepted, so there is no item the run stopped "on": it
-            # ran out at the last one, and that is where the note speaks from.
-            await self._stopped_note(run_dir, "every work item was parked",
-                                     len(items), len(items))
+            self._ledger.update(status="stopped")
+            # A sweep that converged on its baseline pass ran no item and has
+            # nowhere to speak from; `item 0 of 0` is a wrong answer to where the
+            # run is.
+            if items_run:
+                await self._stopped_note(run_dir, reason, items_run, None)
+            else:
+                await self._stopped_note(run_dir, reason, None, None)
             return self._ledger
         self._ledger.update(status="merge-ready")
         await self._owner_card(run_dir, accepted, checkpoint_result, parked)
@@ -237,13 +732,22 @@ class LoopGraphRun:
         return workflow.info().workflow_id.rsplit("-", 1)[-1][:12]
 
     async def _run_item(self, run_dir: str, target_repo: str, work_item: str,
-                        item_no: int, carried: str | None) -> dict:
+                        item_no: int, carried: str | None, kind: str = "brief") -> dict:
         """One work item: rounds until the supervisor accepts, or it is parked.
 
         Returns accepted (with the result and its checkpoint), parked (the run
         carries on to the next item), or halt (the supervisor said stop, which is
-        the one verdict that ends the whole run)."""
+        the one verdict that ends the whole run). Every one of them carries the
+        round result, because a sweep harvests the executor's candidates off a
+        parked item too: it read the code either way.
+
+        `kind` says what sort of item this is. The auditor is told, because the
+        supervisor sees only what the prompt hands it and would otherwise judge a
+        removal item as a feature. The checkpoint is told as a number: a sweep or
+        convergence item may not grow the repo, and the engine measures that
+        rather than asking."""
         directive = carried
+        max_net = 0 if kind in ("sweep", "convergence") else None
         spent = 0       # executor passes charged to the correction budget
         asks = 0        # owner questions, which are not charged to it
         round_no = 0    # every pass, for the ledger and the log file names
@@ -253,14 +757,32 @@ class LoopGraphRun:
             if not answered:
                 spent += 1
             answered = False
-            result = await workflow.execute_activity(
-                execute_round,
-                args=[run_dir, target_repo, work_item, round_no, directive, item_no,
-                      self._run_token(), self._base_commit],
-                start_to_close_timeout=timedelta(hours=2),  # correction loop may re-run slow gates
-                heartbeat_timeout=timedelta(minutes=3),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
+            try:
+                result = await workflow.execute_activity(
+                    execute_round,
+                    args=[run_dir, target_repo, work_item, round_no, directive, item_no,
+                          self._run_token(), self._base_commit],
+                    # correction loop may re-run slow gates
+                    start_to_close_timeout=timedelta(hours=2),
+                    heartbeat_timeout=timedelta(minutes=3),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            # An executor round that never returned is the same news as one whose
+            # gates stayed red: nothing to judge, nothing to commit. It gets a round
+            # entry all the same, or the round `lg status` and the dashboard were
+            # watching disappears from under them.
+            except Exception as e:  # noqa: BLE001 - the item is lost, the run is not
+                why = audit_failure_reason(e)
+                self._ledger["rounds"].append({
+                    "item_no": item_no, "round": round_no, "status": "failed",
+                    "attempts": 0, "claims": [], "files": [], "directive": directive,
+                    "verdict": "executor failed", "verdict_reasons": [why]})
+                # A sweep reads `candidates` off every parked item, so the stand-in
+                # result has to carry the key even with nothing to put in it.
+                return {"status": "parked",
+                        "result": {"status": "failed", "claims": [], "files": [],
+                                   "candidates": []},
+                        "reason": f"executor failed: {why}"}
             entry = {
                 "item_no": item_no,
                 "round": round_no,
@@ -279,14 +801,14 @@ class LoopGraphRun:
             }
             self._ledger["rounds"].append(entry)
             if result["status"] != "green":
-                return {"status": "parked",
+                return {"status": "parked", "result": result,
                         "reason": "gates red after the correction cap"}
 
             try:
                 verdict = await workflow.execute_activity(
                     audit,
                     args=[run_dir, result, round_no, item_no, work_item,
-                          len(self._ledger["items"])],
+                          len(self._ledger["items"]), kind],
                     start_to_close_timeout=timedelta(minutes=30),
                     heartbeat_timeout=timedelta(minutes=3),
                     retry_policy=RetryPolicy(maximum_attempts=2),
@@ -303,25 +825,46 @@ class LoopGraphRun:
                 # `lg status`, which is the line the owner checks first.
                 entry["verdict"] = "audit failed"
                 entry["verdict_reasons"] = [why]
-                return {"status": "parked", "reason": f"audit failed: {why}"}
+                return {"status": "parked", "result": result,
+                        "reason": f"audit failed: {why}"}
             entry["verdict"] = verdict["verdict"]
             entry["verdict_reasons"] = verdict["reasons"]
 
             if verdict["verdict"] == "accept":
-                cp = await workflow.execute_activity(
-                    checkpoint,
-                    args=[run_dir, result["worktree"], result["files"], round_no,
-                          result["summary"], item_no],
-                    start_to_close_timeout=timedelta(minutes=45),  # gate re-run may be a full build
-                    heartbeat_timeout=timedelta(minutes=3),
-                    retry_policy=RetryPolicy(maximum_attempts=2),
-                )
+                if kind == "convergence" and not result["files"]:
+                    # The one item allowed to finish having changed nothing: the
+                    # auditor looked and agreed there was nothing left to remove.
+                    # Checkpoint would park it on `empty write set`, which would
+                    # end a clean run as a failed one.
+                    return {"status": "accepted", "result": result, "checkpoint": None}
+                try:
+                    cp = await workflow.execute_activity(
+                        checkpoint,
+                        args=[run_dir, result["worktree"], result["files"], round_no,
+                              result["summary"], item_no, max_net],
+                        # gate re-run may be a full build
+                        start_to_close_timeout=timedelta(minutes=45),
+                        heartbeat_timeout=timedelta(minutes=3),
+                        retry_policy=RetryPolicy(maximum_attempts=2),
+                    )
+                # A checkpoint that died is not a checkpoint that refused, and the
+                # verdict stays `accept` because that is what happened: the auditor
+                # passed the round and the commit is what was lost. A live run died
+                # here on a `git rm`'d path the checkpoint could not stage.
+                except Exception as e:  # noqa: BLE001 - the item is lost, the run is not
+                    why = audit_failure_reason(e)
+                    entry["checkpoint_failed"] = why
+                    return {"status": "parked", "result": result,
+                            "reason": f"checkpoint failed: {why}"}
                 self._ledger["checkpoint"] = cp
                 if cp.get("commit"):
                     self._base_commit = cp["commit"]
                 if not cp["committed"]:
-                    return {"status": "parked",
+                    return {"status": "parked", "result": result,
                             "reason": f"checkpoint refused: {cp['reason']}"}
+                # Convergence fires on lines added since the last removal item, so
+                # the number has to survive the round it was measured in.
+                entry["net"] = cp["net"]
                 # Best effort, and it runs AFTER the commit. Letting it raise
                 # failed the whole workflow over a distilled sentence, throwing
                 # away a run whose work was already safely on the branch.
@@ -338,20 +881,26 @@ class LoopGraphRun:
                 return {"status": "accepted", "result": result, "checkpoint": cp}
 
             if verdict["verdict"] == "stop":
-                return {"status": "halt",
+                return {"status": "halt", "result": result,
                         "reason": f"supervisor said stop: {'; '.join(verdict['reasons'])[:300]}"}
             if verdict["verdict"] == "plan":
-                return {"status": "parked",
+                return {"status": "parked", "result": result,
                         "reason": f"supervisor asked to replan: {'; '.join(verdict['reasons'])[:300]}"}
             if verdict["verdict"] == "ask":
                 if asks >= MAX_ASKS:
-                    return {"status": "parked", "reason": "owner-question cap reached"}
+                    return {"status": "parked", "result": result,
+                            "reason": "owner-question cap reached"}
                 asks += 1
                 d = verdict["directive"]
                 question = d.get("action", "Supervisor needs an owner decision")
                 options = verdict.get("options") or {}
+                # A sweep counts nothing towards a total: it builds its items
+                # as it goes, and `item 7 of 7` would say the run was on its
+                # last one every time it asked. The auditor still gets the
+                # integer above, which is a list length and not a total.
+                total = None if "sweep" in self._ledger else len(self._ledger["items"])
                 reply = await self._ask_owner(run_dir, question, options, item_no,
-                                              len(self._ledger["items"]), round_no)
+                                              total, round_no)
                 entry["owner_question"] = question
                 entry["owner_reply"] = reply
                 # Write it where the AUDITOR can read it. The supervisor never sees
@@ -373,7 +922,7 @@ class LoopGraphRun:
                 continue
             over = budget_spent(spent, asks)
             if over:
-                return {"status": "parked", "reason": over}
+                return {"status": "parked", "result": result, "reason": over}
             d = verdict["directive"]
             directive = (
                 f"Context: {d.get('context', '')}\nAction: {d.get('action', '')}\n"
@@ -475,7 +1024,7 @@ class LoopGraphRun:
         return value.upper() if allowed else value
 
     async def _ask_owner(self, run_dir: str, question: str, options: dict,
-                         item_no: int, total: int, round_no: int) -> str:
+                         item_no: int, total: int | None, round_no: int) -> str:
         """Supervisor `ask`: a question the owner answers by button, text or signal.
 
         The location line is prefixed here, not inside _await_decision, so the
@@ -492,7 +1041,7 @@ class LoopGraphRun:
         return await self._await_decision(run_dir, "decision", summary, None,
                                           options, accept_text=True)
 
-    async def _park_note(self, run_dir: str, item_no: int, total: int,
+    async def _park_note(self, run_dir: str, item_no: int, total: int | None,
                          item: str, reason: str) -> None:
         """Tell the owner an item was parked. Does not wait: the run has already
         moved on to the next item, and their reply is picked up between items."""
@@ -504,13 +1053,17 @@ class LoopGraphRun:
         await self._note(run_dir, "parked", text)
 
     async def _stopped_note(self, run_dir: str, reason: str,
-                            item_no: int, total: int) -> None:
+                            item_no: int | None, total: int | None) -> None:
         """Tell the owner a run ended. A stop used to return silently, so nobody
         was told the run was over, and any items already committed sat on a branch
-        nobody knew about."""
+        nobody knew about.
+
+        A run that ended before any item ran has nowhere to speak from and gets no
+        location line: `item 0 of 0` is a wrong answer to where the run is."""
         done = [e for e in self._ledger["items"] if e["status"] == "done"]
         parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
-        lines = [location_line(item_no, total), "",
+        where = [location_line(item_no, total), ""] if item_no is not None else []
+        lines = [*where,
                  f"why: {reason}", "",
                  f"{len(done)} item(s) committed, {len(parked)} parked."]
         if done:
@@ -548,11 +1101,17 @@ class LoopGraphRun:
                           parked: list[dict] | None = None) -> None:
         """Merge-ready: hold at a safe no-change state until the owner decides."""
         total = len(self._ledger["items"])
+        # A sweep has no total to count towards and stops on a condition rather
+        # than on a list running out, so its card says which condition: converged,
+        # out of items and out of time arrive as this same card otherwise.
+        is_sweep = "sweep" in self._ledger
         # The last item is where the run finished, so that is where this speaks
         # from. Location line plus merge summary, parked list included, is exactly
         # what the owner saw, and the page prints it back as it is.
-        summary = location_line(total, total) + "\n\n" + build_merge_summary(
-            result["summary"], total, parked or [])
+        where = location_line(total, None if is_sweep else total)
+        summary = where + "\n\n" + build_merge_summary(
+            result["summary"], total, parked or [],
+            ended=self._ledger["sweep"]["ended"] if is_sweep else None)
         letter = await self._await_decision(
             run_dir, "merge-ready", summary, cp["commit"],
             {"A": "merge into " + (result["base_branch"] or "base") + " (local, no push)",

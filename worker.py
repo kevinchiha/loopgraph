@@ -10,6 +10,8 @@ from temporalio.worker import Worker
 
 from activities.audit import audit
 from activities.checkpoint import checkpoint, discard, merge
+from activities.config import load_run_config
+from activities.discover import discover
 from activities.execute_round import execute_round, run_baseline
 from activities.gate import run_gates
 from activities.items import load_work_items
@@ -46,9 +48,9 @@ async def main() -> None:
         client,
         task_queue=TASK_QUEUE,
         workflows=[GateCheckRun, RoundRun, LoopGraphRun],
-        activities=[run_gates, execute_round, run_baseline, audit, checkpoint, merge,
+        activities=[run_gates, execute_round, run_baseline, discover, audit, checkpoint, merge,
                     discard, learn,
-                    load_work_items, send_card, telegram_configured,
+                    load_run_config, load_work_items, send_card, telegram_configured,
                     record_owner_answer],
     )
     print(f"worker up on task queue {TASK_QUEUE!r}", flush=True)
