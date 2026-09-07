@@ -851,6 +851,14 @@ def clean_worktrees(slug: str, runs_dir: str, projects_dir: str | None) -> list[
     Returns one line per worktree it could NOT de-register; empty list means all
     clean. It deletes nothing itself: the run directory is the caller's to remove.
 
+    Every line starts with the worktree it is about, because AC-24 says each one
+    is reported by name and the reasons alone do not carry it: two worktrees of a
+    run stopped by a missing .env give the same sentence twice, and two identical
+    lines report neither of them. A worktree that resolves and simply has no
+    registration left is reported as nothing at all — it is already out of that
+    repository, and a line crying failure over work that is done is the same lie
+    in the other direction.
+
     Every registration is named one at a time, by the path the repository
     recorded for it, and NOTHING here prunes. Measured on git 2.39.5 against a
     repository holding two runs' worktrees, both registered under container paths
@@ -913,8 +921,9 @@ def clean_worktrees(slug: str, runs_dir: str, projects_dir: str | None) -> list[
         if repo is None:
             # The repository moved, .env is missing, the pointer file is gone.
             # Nothing can be de-registered from a repository this machine cannot
-            # find, and the next worktree may well be in one it can.
-            report.append(why)
+            # find, and the next worktree may well be in one it can. The reason is
+            # the resolver's, word for word; only the name in front of it is ours.
+            report.append(f"{name}: {why}")
             continue
 
         if repo not in listings:

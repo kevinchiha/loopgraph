@@ -260,9 +260,10 @@ def test_an_unresolvable_worktree_is_reported_and_skips_nothing(lg, world):
     up at the first failure would leave the second one registered and still hand
     back a report that looks like the truth.
 
-    The expected line is taken from the resolver rather than typed again here.
-    What this pins is that the reason reaches the report whole, not the words the
-    resolver happens to use this month.
+    The reason is taken from the resolver rather than typed again here, so what
+    this pins is that it reaches the report whole — not the words the resolver
+    happens to use this month. The name in front of it is the part AC-24 asks
+    for and is this file's to spell.
     """
     repo = world.repository()
     world.container(repo, "doomed", "bb22")
@@ -273,9 +274,61 @@ def test_an_unresolvable_worktree_is_reported_and_skips_nothing(lg, world):
     _, why = ui.resolve_repo(container_path("doomed", "aa11"), world.runs, world.projects)
     assert why, "the fixture's lost worktree resolves after all"
 
-    assert clean(lg, world, "doomed") == [why]
+    assert clean(lg, world, "doomed") == [f"aa11: {why}"]
     assert container_path("doomed", "bb22") not in world.listed(repo), \
         "the worktree after the unresolvable one was never cleaned"
+
+
+def test_two_worktrees_stopped_by_the_same_reason_are_still_told_apart(lg, world):
+    """AC-24 reports each worktree it could not clean up BY NAME, and the reason
+    on its own cannot do that. A run whose .env has gone missing stops on every
+    worktree it has, for the same reason each time, so without the name in front
+    the report is the identical sentence twice and names neither of them.
+
+    `projects_dir` is None here, which is what a machine with no .env yet hands
+    in — the resolver's answer is one fixed sentence with no path in it at all,
+    which is the case no other test can distinguish.
+    """
+    repo = world.repository()
+    world.container(repo, "doomed", "aa11")
+    world.container(repo, "doomed", "bb22")
+
+    report = lg.clean_worktrees("doomed", str(world.runs), None)
+
+    _, why = ui.resolve_repo(container_path("doomed", "aa11"), world.runs, None)
+    assert why, "a missing projects dir resolves after all"
+    assert report == [f"aa11: {why}", f"bb22: {why}"]
+    assert len(set(report)) == 2, f"two worktrees, one line each, told apart: {report}"
+    # And nothing was touched: a repository that could not be resolved is not a
+    # repository anything may be removed from.
+    for token in ("aa11", "bb22"):
+        assert container_path("doomed", token) in world.listed(repo)
+
+
+def test_every_report_line_names_the_worktree_it_is_about(lg, world, monkeypatch):
+    """AC-24, over all three ways a worktree can fail at once: unresolvable, in a
+    repository that will not say what it has, and a remove that came back
+    non-zero. One run, three worktrees, three lines, each starting with its own
+    name — that is the property, whatever the reasons turn out to say."""
+    good, mute = world.repository("good"), Path(world.projects) / "mute"
+    mute.mkdir()  # a directory that resolves and is not a git repository
+    world.container(good, "doomed", "cc33")
+    for token, project in (("aa11", "gone"), ("bb22", "mute")):
+        worktree = world.runs / "doomed" / "worktrees" / token
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text(f"gitdir: /projects/{project}/.git/worktrees/{token}\n")
+    real = lg._run
+
+    def flaky(argv, cwd, **rest):
+        if "remove" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "fatal: nope\n")
+        return real(argv, cwd, **rest)
+
+    monkeypatch.setattr(lg, "_run", flaky)
+
+    report = lg.clean_worktrees("doomed", str(world.runs), world.projects)
+    assert [line.split(":")[0] for line in report] == ["aa11", "bb22", "cc33"], \
+        f"a report line does not start with the worktree it is about: {report}"
 
 
 def test_no_branch_is_ever_deleted(lg, world, recorded):
