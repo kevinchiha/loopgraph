@@ -450,130 +450,149 @@ class LoopGraphRun:
             self._ledger.update(status="stopped", reason=reason)
             await self._stopped_note(run_dir, reason, None, None)
             return self._ledger
-        # Capture the starting commit before anything runs, so the very first round
-        # already has a baseline to reset to rather than trusting HEAD.
-        self._base_commit = await workflow.execute_activity(
-            run_baseline,
-            args=[target_repo],
-            start_to_close_timeout=timedelta(minutes=2),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-        if self._config["sweep"] is not None:
-            # The detectors are the item source, so there is no brief list to
-            # load and no convergence item to inject: a sweep item is already
-            # held to net zero, and a removal pass would be the same item twice.
-            return await self._run_sweep(run_dir, target_repo, self._config["sweep"],
-                                         start)
-        items = await workflow.execute_activity(
-            load_work_items,
-            args=[run_dir],
-            start_to_close_timeout=timedelta(minutes=1),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-        if not items:
-            items = [work_item or ""]  # no work-items section: the whole brief, one item
-        # The kind is set when the entry is made, not when it finishes: an entry
-        # with no kind while it runs is one the dashboard cannot label.
-        self._ledger["items"] = [{"n": i, "item": it, "status": "pending", "kind": "brief"}
-                                 for i, it in enumerate(items, start=1)]
+        # Every activity from here on, in an item or between them. A dead one
+        # stops the run and says so. The run returns its ledger rather than
+        # raising because Temporal answers the `ledger` query on a failed
+        # workflow by replaying the state at the failure: a raise leaves
+        # `lg status`, the dashboard and the owner all believing the run is
+        # still going, with no card to tell them otherwise.
+        try:
+            # Capture the starting commit before anything runs, so the very first round
+            # already has a baseline to reset to rather than trusting HEAD.
+            self._base_commit = await workflow.execute_activity(
+                run_baseline,
+                args=[target_repo],
+                start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if self._config["sweep"] is not None:
+                # The detectors are the item source, so there is no brief list to
+                # load and no convergence item to inject: a sweep item is already
+                # held to net zero, and a removal pass would be the same item twice.
+                return await self._run_sweep(run_dir, target_repo, self._config["sweep"],
+                                             start)
+            items = await workflow.execute_activity(
+                load_work_items,
+                args=[run_dir],
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if not items:
+                items = [work_item or ""]  # no work-items section: the whole brief, one item
+            # The kind is set when the entry is made, not when it finishes: an entry
+            # with no kind while it runs is one the dashboard cannot label.
+            self._ledger["items"] = [{"n": i, "item": it, "status": "pending", "kind": "brief"}
+                                     for i, it in enumerate(items, start=1)]
 
-        carried: str | None = None   # an owner reply, handed to the next item
-        accepted: dict | None = None  # last accepted round result, for the final card
-        checkpoint_result: dict | None = None
+            carried: str | None = None   # an owner reply, handed to the next item
+            accepted: dict | None = None  # last accepted round result, for the final card
+            checkpoint_result: dict | None = None
 
-        conv = self._config["convergence"]
-        queue = list(items)          # the brief's items, taken from the front
-        n = 0                        # items executed, and the number the next one gets
-        items_since = 0              # accepted brief items since the last removal pass
-        net_since = 0                # net lines those items committed
-        touched: list[str] = []      # every path they wrote
+            conv = self._config["convergence"]
+            queue = list(items)          # the brief's items, taken from the front
+            n = 0                        # items executed, and the number the next one gets
+            items_since = 0              # accepted brief items since the last removal pass
+            net_since = 0                # net lines those items committed
+            touched: list[str] = []      # every path they wrote
 
-        while True:
-            # Before the next brief item AND after the last one, which is the same
-            # branch: a five-item brief that added 600 lines needs its removal pass
-            # after item 5, or the rule skips exactly the run it exists for.
-            if conv["enabled"] and (items_since >= conv["every_items"]
-                                    or net_since >= conv["net_lines"]):
-                kind = "convergence"
-                item = build_convergence_item(sorted(set(touched)))
-                entry = {"n": n + 1, "item": item, "status": "pending", "kind": kind}
-                # It takes the position it runs in, and the pending items after it
-                # move up. Appending it with the next free number would put
-                # `item 6 of 6` on a card mid-run, which reads as the run going
-                # backwards; the dashboard keys rows on `n` and re-patches their
-                # text, so renumbering pending rows loses nothing.
-                self._ledger["items"].insert(n, entry)
-                for later in self._ledger["items"][n + 1:]:
-                    later["n"] += 1
-            elif not queue:
-                break
-            else:
-                kind = "brief"
-                item = queue.pop(0)
-                entry = self._ledger["items"][n]
-            total = len(self._ledger["items"])
-            n += 1
-            entry["status"] = "running"
-            outcome = await self._run_item(run_dir, target_repo, item, n, carried, kind)
-            if kind == "brief":
-                # Cleared only after a brief item. The park card tells the owner
-                # to reply with anything the next item should know; clearing after
-                # every item spent that reply on the convergence item the engine
-                # injects — its own item, about the run's own growth — and the
-                # brief item the note was written for never saw it.
-                carried = None
-            if outcome["status"] == "accepted":
-                cp = outcome["checkpoint"]
-                if cp is None:
-                    # A convergence item the auditor accepted with an empty write
-                    # set: there was nothing left to remove. It committed nothing,
-                    # so the merge card must go on naming the last real checkpoint.
-                    entry.update(status="done", commit=None, note="nothing to remove")
+            while True:
+                # Before the next brief item AND after the last one, which is the same
+                # branch: a five-item brief that added 600 lines needs its removal pass
+                # after item 5, or the rule skips exactly the run it exists for.
+                if conv["enabled"] and (items_since >= conv["every_items"]
+                                        or net_since >= conv["net_lines"]):
+                    kind = "convergence"
+                    item = build_convergence_item(sorted(set(touched)))
+                    entry = {"n": n + 1, "item": item, "status": "pending", "kind": kind}
+                    # It takes the position it runs in, and the pending items after it
+                    # move up. Appending it with the next free number would put
+                    # `item 6 of 6` on a card mid-run, which reads as the run going
+                    # backwards; the dashboard keys rows on `n` and re-patches their
+                    # text, so renumbering pending rows loses nothing.
+                    self._ledger["items"].insert(n, entry)
+                    for later in self._ledger["items"][n + 1:]:
+                        later["n"] += 1
+                elif not queue:
+                    break
                 else:
-                    entry["status"] = "done"
-                    entry["commit"] = cp.get("commit")
-                    accepted, checkpoint_result = outcome["result"], cp
-                    if kind == "brief":
-                        items_since += 1
-                        net_since += cp.get("net", 0)
-                        touched.extend(cp["files"])
-            elif outcome["status"] == "halt":
-                entry.update(status="parked", reason=outcome["reason"])
-                self._ledger.update(status="stopped", reason=outcome["reason"])
-                await self._stopped_note(run_dir, outcome["reason"], n, total)
+                    kind = "brief"
+                    item = queue.pop(0)
+                    entry = self._ledger["items"][n]
+                total = len(self._ledger["items"])
+                n += 1
+                entry["status"] = "running"
+                outcome = await self._run_item(run_dir, target_repo, item, n, carried, kind)
+                if kind == "brief":
+                    # Cleared only after a brief item. The park card tells the owner
+                    # to reply with anything the next item should know; clearing after
+                    # every item spent that reply on the convergence item the engine
+                    # injects — its own item, about the run's own growth — and the
+                    # brief item the note was written for never saw it.
+                    carried = None
+                if outcome["status"] == "accepted":
+                    cp = outcome["checkpoint"]
+                    if cp is None:
+                        # A convergence item the auditor accepted with an empty write
+                        # set: there was nothing left to remove. It committed nothing,
+                        # so the merge card must go on naming the last real checkpoint.
+                        entry.update(status="done", commit=None, note="nothing to remove")
+                    else:
+                        entry["status"] = "done"
+                        entry["commit"] = cp.get("commit")
+                        accepted, checkpoint_result = outcome["result"], cp
+                        if kind == "brief":
+                            items_since += 1
+                            net_since += cp.get("net", 0)
+                            touched.extend(cp["files"])
+                elif outcome["status"] == "halt":
+                    entry.update(status="parked", reason=outcome["reason"])
+                    self._ledger.update(status="stopped", reason=outcome["reason"])
+                    await self._stopped_note(run_dir, outcome["reason"], n, total)
+                    return self._ledger
+                else:
+                    entry.update(status="parked", reason=outcome["reason"])
+                    await self._park_note(run_dir, n, total, item, outcome["reason"])
+                if kind == "convergence":
+                    # The pass happened, whatever came of it. Carrying the counters on
+                    # would inject the next one immediately and every item after it.
+                    items_since, net_since, touched = 0, 0, []
+
+                # Anything the owner sent while that item ran is steering for the next
+                # one. It is already in workflow state: the dispatcher signalled it.
+                notes = self._drain_decisions()
+                if notes:
+                    entry.setdefault("owner_notes", []).extend(notes)
+                    fresh = ("The owner sent this mid-run, after item "
+                             f"{n}: {' / '.join(notes)}")
+                    # Joined, not overwritten: a note kept across a convergence item
+                    # and a note sent during it are both steering for the same next
+                    # brief item, and dropping either loses an owner's answer.
+                    carried = f"{carried} / {fresh}" if carried else fresh
+
+            parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
+            if accepted is None:
+                self._ledger.update(status="stopped", reason="every work item was parked")
+                # Nothing was accepted, so there is no item the run stopped "on": it
+                # ran out at the last one, and that is where the note speaks from. The
+                # count is read again here because an injected item changed it.
+                total = len(self._ledger["items"])
+                await self._stopped_note(run_dir, "every work item was parked", total, total)
                 return self._ledger
-            else:
-                entry.update(status="parked", reason=outcome["reason"])
-                await self._park_note(run_dir, n, total, item, outcome["reason"])
-            if kind == "convergence":
-                # The pass happened, whatever came of it. Carrying the counters on
-                # would inject the next one immediately and every item after it.
-                items_since, net_since, touched = 0, 0, []
-
-            # Anything the owner sent while that item ran is steering for the next
-            # one. It is already in workflow state: the dispatcher signalled it.
-            notes = self._drain_decisions()
-            if notes:
-                entry.setdefault("owner_notes", []).extend(notes)
-                fresh = ("The owner sent this mid-run, after item "
-                         f"{n}: {' / '.join(notes)}")
-                # Joined, not overwritten: a note kept across a convergence item
-                # and a note sent during it are both steering for the same next
-                # brief item, and dropping either loses an owner's answer.
-                carried = f"{carried} / {fresh}" if carried else fresh
-
-        parked = [e for e in self._ledger["items"] if e["status"] == "parked"]
-        if accepted is None:
-            self._ledger.update(status="stopped", reason="every work item was parked")
-            # Nothing was accepted, so there is no item the run stopped "on": it
-            # ran out at the last one, and that is where the note speaks from. The
-            # count is read again here because an injected item changed it.
-            total = len(self._ledger["items"])
-            await self._stopped_note(run_dir, "every work item was parked", total, total)
+            self._ledger.update(status="merge-ready")
+            await self._owner_card(run_dir, accepted, checkpoint_result, parked)
             return self._ledger
-        self._ledger.update(status="merge-ready")
-        await self._owner_card(run_dir, accepted, checkpoint_result, parked)
-        return self._ledger
+        except Exception as e:  # noqa: BLE001 - the run ends, and reports it
+            reason = "engine failure: " + audit_failure_reason(e)
+            self._ledger.update(status="stopped", reason=reason)
+            if "sweep" in self._ledger:
+                # Why a sweep ended is read off this one key by `lg status`,
+                # the dashboard and the merge card.
+                self._ledger["sweep"]["ended"] = reason
+            try:
+                await self._stopped_note(run_dir, reason, None, None)
+            except Exception:  # noqa: BLE001 - a dead sender must not unwrite the ledger
+                workflow.logger.warning("no stopped note went out: %s", reason)
+            return self._ledger
 
     async def _run_sweep(self, run_dir: str, target_repo: str, sweep: dict,
                          start: datetime) -> dict:
@@ -736,14 +755,32 @@ class LoopGraphRun:
             if not answered:
                 spent += 1
             answered = False
-            result = await workflow.execute_activity(
-                execute_round,
-                args=[run_dir, target_repo, work_item, round_no, directive, item_no,
-                      self._run_token(), self._base_commit],
-                start_to_close_timeout=timedelta(hours=2),  # correction loop may re-run slow gates
-                heartbeat_timeout=timedelta(minutes=3),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
+            try:
+                result = await workflow.execute_activity(
+                    execute_round,
+                    args=[run_dir, target_repo, work_item, round_no, directive, item_no,
+                          self._run_token(), self._base_commit],
+                    # correction loop may re-run slow gates
+                    start_to_close_timeout=timedelta(hours=2),
+                    heartbeat_timeout=timedelta(minutes=3),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            # An executor round that never returned is the same news as one whose
+            # gates stayed red: nothing to judge, nothing to commit. It gets a round
+            # entry all the same, or the round `lg status` and the dashboard were
+            # watching disappears from under them.
+            except Exception as e:  # noqa: BLE001 - the item is lost, the run is not
+                why = audit_failure_reason(e)
+                self._ledger["rounds"].append({
+                    "item_no": item_no, "round": round_no, "status": "failed",
+                    "attempts": 0, "claims": [], "files": [], "directive": directive,
+                    "verdict": "executor failed", "verdict_reasons": [why]})
+                # A sweep reads `candidates` off every parked item, so the stand-in
+                # result has to carry the key even with nothing to put in it.
+                return {"status": "parked",
+                        "result": {"status": "failed", "claims": [], "files": [],
+                                   "candidates": []},
+                        "reason": f"executor failed: {why}"}
             entry = {
                 "item_no": item_no,
                 "round": round_no,
@@ -798,14 +835,25 @@ class LoopGraphRun:
                     # Checkpoint would park it on `empty write set`, which would
                     # end a clean run as a failed one.
                     return {"status": "accepted", "result": result, "checkpoint": None}
-                cp = await workflow.execute_activity(
-                    checkpoint,
-                    args=[run_dir, result["worktree"], result["files"], round_no,
-                          result["summary"], item_no, max_net],
-                    start_to_close_timeout=timedelta(minutes=45),  # gate re-run may be a full build
-                    heartbeat_timeout=timedelta(minutes=3),
-                    retry_policy=RetryPolicy(maximum_attempts=2),
-                )
+                try:
+                    cp = await workflow.execute_activity(
+                        checkpoint,
+                        args=[run_dir, result["worktree"], result["files"], round_no,
+                              result["summary"], item_no, max_net],
+                        # gate re-run may be a full build
+                        start_to_close_timeout=timedelta(minutes=45),
+                        heartbeat_timeout=timedelta(minutes=3),
+                        retry_policy=RetryPolicy(maximum_attempts=2),
+                    )
+                # A checkpoint that died is not a checkpoint that refused, and the
+                # verdict stays `accept` because that is what happened: the auditor
+                # passed the round and the commit is what was lost. A live run died
+                # here on a `git rm`'d path the checkpoint could not stage.
+                except Exception as e:  # noqa: BLE001 - the item is lost, the run is not
+                    why = audit_failure_reason(e)
+                    entry["checkpoint_failed"] = why
+                    return {"status": "parked", "result": result,
+                            "reason": f"checkpoint failed: {why}"}
                 self._ledger["checkpoint"] = cp
                 if cp.get("commit"):
                     self._base_commit = cp["commit"]
