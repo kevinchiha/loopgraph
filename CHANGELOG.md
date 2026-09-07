@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-07
+
 - Sweep runs: a `run.yaml` with detectors makes the engine remove what they report,
   one path group per item, until two passes in a row come back at or under the
   floor, or the deadline or the item cap lands first.
