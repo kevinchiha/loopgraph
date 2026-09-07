@@ -12,6 +12,12 @@ something that was never on the list. Stderr is still captured, bounded to a
 tail, because a broken detector with no diagnostic anywhere in the run leaves the
 owner with nothing to fix.
 
+Candidates are grouped by path here rather than in the workflow because a
+detector's stdout runs to 1 MiB and everything the workflow is handed lands in
+Temporal's history for the life of the run. The activity does the grouping and
+returns at most GROUP_LINES_CAP sample lines per detector; the counts are exact
+whatever the samples cost.
+
 The runner is `gate.py`'s shape, not its code: `_run_one` merges stderr into
 stdout, and a detector's list is read from the front rather than the tail.
 """
@@ -19,6 +25,7 @@ stdout, and a detector's list is read from the front rather than the tail.
 from __future__ import annotations
 
 import asyncio
+import re
 
 from temporalio import activity
 
@@ -29,17 +36,79 @@ from activities.gate import _drain, _kill_group
 STDOUT_CAP = 1_048_576   # bytes of detector stdout kept, from the front
 STDERR_TAIL = 2000       # characters of detector stderr kept, from the end
 LINES_SHOWN = 60         # candidates quoted back in the item; the ledger keeps fewer (trim_pass)
+GROUP_LINES_CAP = 1200   # sample lines kept per detector across all of its groups
+
+# The path is the front of a candidate line, so it ends at the first `:` or space:
+# that covers a bare path and the `path:line: message` a grep-shaped detector prints.
+_PATH_END = re.compile(r"[:\s]")
 
 
-def count_candidates(data: bytes) -> tuple[int, list[str]]:
-    """Detector stdout → (candidates, the first LINES_SHOWN of them).
+def count_candidates(data: bytes) -> tuple[int, list[str], list[str]]:
+    """Detector stdout → (candidates, the first LINES_SHOWN of them, all of them).
 
     A candidate is a line that is not blank once stripped; the lines themselves
     are handed on exactly as printed, because a detector prints paths and a path
-    that has been tidied names no file.
+    that has been tidied names no file. The whole list comes back as well because
+    the groups are counted over every candidate, not over the sample.
     """
     lines = [line for line in data.decode(errors="replace").splitlines() if line.strip()]
-    return len(lines), lines[:LINES_SHOWN]
+    return len(lines), lines[:LINES_SHOWN], lines
+
+
+def group_key(line: str, prefixes: list[str] | None) -> str:
+    """The name of the group a candidate line belongs to.
+
+    Leading whitespace goes first, or a detector that indents its output files
+    every line under `(root)`. One leading `./` is removed, so a detector that
+    prints `./src/a.py` groups with one that prints `src/a.py`.
+
+    Without `prefixes` the group is the first path segment, not a fixed depth of
+    two: depth two splits `app/core.py` from `app/text.py` on a small repo and
+    does nothing at all on one whose code sits under `src/`. That layout is what
+    `prefixes` is for. They are compared verbatim, with no globbing and no
+    tidying, so `app` matches `apple.py` and `src/lib/` does not match `src/lib`.
+    A path no prefix matches goes to `(other)` rather than being dropped: dropping
+    it would let a typo in `groups` quietly shrink the run's scope while the
+    detector's count still held those lines.
+    """
+    path = _PATH_END.split(line.lstrip(), 1)[0]
+    if path.startswith("./"):
+        path = path[2:]
+    if prefixes is not None:
+        return next((p for p in prefixes if path.startswith(p)), "(other)")
+    head, slash, _ = path.partition("/")
+    return head + slash if slash else "(root)"
+
+
+def group_candidates(lines: list[str], prefixes: list[str] | None) -> list[dict]:
+    """Candidate lines → `[{"name", "count", "lines"}]`, sorted by name.
+
+    Given the whole captured stdout, not the LINES_SHOWN quoted back in the entry:
+    the group counts have to sum to the detector's count, and a directory whose
+    candidates all sit past line 60 has to exist as a group for an item to land on.
+
+    Samples are filled in name order and stop at the first group that would take
+    the total past GROUP_LINES_CAP; that group and every group after it keep
+    `lines: []` with their count exact. Stopping rather than skipping ahead to a
+    smaller group keeps which groups carry a sample a question of their names
+    alone. A group with no sample still names its count, and the item text sends
+    the executor back to the detector's own command for its lines.
+    """
+    groups: dict[str, dict] = {}
+    for line in lines:
+        group = groups.setdefault(group_key(line, prefixes), {"count": 0, "lines": []})
+        group["count"] += 1
+        if len(group["lines"]) < LINES_SHOWN:
+            group["lines"].append(line)
+    out, kept, full = [], 0, False
+    for name in sorted(groups):
+        sample = groups[name]["lines"]
+        if full or kept + len(sample) > GROUP_LINES_CAP:
+            full, sample = True, []
+        else:
+            kept += len(sample)
+        out.append({"name": name, "count": groups[name]["count"], "lines": sample})
+    return out
 
 
 async def _head(stream, keep: int, buf: bytearray) -> None:
@@ -65,8 +134,9 @@ async def _head(stream, keep: int, buf: bytearray) -> None:
             buf.extend(chunk[:keep + 1 - len(buf)])
 
 
-async def run_detector(det: dict, cwd: str, heartbeat=None) -> dict:
-    """One detector, run through the shell in `cwd`."""
+async def run_detector(det: dict, cwd: str, heartbeat=None,
+                       prefixes: list[str] | None = None) -> dict:
+    """One detector, run through the shell in `cwd`, its candidates grouped by path."""
     proc = await asyncio.create_subprocess_shell(
         det["cmd"],
         cwd=cwd,
@@ -108,7 +178,7 @@ async def run_detector(det: dict, cwd: str, heartbeat=None) -> dict:
     for reader in pending:
         reader.cancel()
 
-    count, lines = count_candidates(bytes(out[:STDOUT_CAP]))
+    count, lines, candidates = count_candidates(bytes(out[:STDOUT_CAP]))
     if exit_code is None:
         pass  # note already says it timed out
     elif exit_code != 0:
@@ -117,8 +187,9 @@ async def run_detector(det: dict, cwd: str, heartbeat=None) -> dict:
         note = "stdout cut at 1 MiB"
     if exit_code != 0:
         # A detector that died proves nothing about the yield. What it printed is
-        # kept for the owner to read, but the run must not converge on it.
-        count = 0
+        # kept for the owner to read, but the run must not converge on it, and its
+        # groups would send items to corners of the repo on the same broken evidence.
+        count, candidates = 0, []
     return {
         "name": det["name"],
         "cmd": det["cmd"],
@@ -127,6 +198,7 @@ async def run_detector(det: dict, cwd: str, heartbeat=None) -> dict:
         "lines": lines,
         "note": note,
         "stderr_tail": bytes(err).decode(errors="replace")[-STDERR_TAIL:],
+        "groups": group_candidates(candidates, prefixes),
     }
 
 
@@ -155,12 +227,13 @@ async def discover(run_dir: str, target_repo: str, run_token: str, base_commit: 
     # Read as a plain function: this is already inside an activity, and going
     # through Temporal for a file the worker can open would be a round trip for
     # nothing.
-    detectors = read_run_config(run_dir)["sweep"]["detectors"]
+    sweep = read_run_config(run_dir)["sweep"]
     results = []
-    for det in detectors:
+    for det in sweep["detectors"]:
         if hb:
             hb(f"detector {det['name']}")
-        results.append(await run_detector(det, worktree, heartbeat=hb))
+        results.append(await run_detector(det, worktree, heartbeat=hb,
+                                          prefixes=sweep["groups"]))
     return {
         "complete": all(r["exit_code"] == 0 for r in results),
         "total": sum(r["count"] for r in results if r["exit_code"] == 0),

@@ -16,7 +16,8 @@ import pytest
 import yaml
 from temporalio.testing import ActivityEnvironment
 
-from activities.discover import LINES_SHOWN, STDERR_TAIL, STDOUT_CAP, discover, run_detector
+from activities.discover import (GROUP_LINES_CAP, LINES_SHOWN, STDERR_TAIL, STDOUT_CAP,
+                                 discover, group_candidates, group_key, run_detector)
 
 TOKEN = "ab12cd"
 
@@ -150,6 +151,73 @@ def test_stdout_past_the_cap_is_cut_and_said_so(tmp_path):
     assert r["count"] == STDOUT_CAP // 2, "yes prints two bytes a line"
 
 
+def test_group_key_defaults_to_the_first_segment():
+    """The path is read from the front of the line, so a detector that prints
+    `path:line: message` groups the same as one that prints bare paths."""
+    assert group_key("app/core.py:18: legacy_sum", None) == "app/"
+    assert group_key("./src/lib/a.py", None) == "src/"
+    assert group_key("setup.py:3: x", None) == "(root)"
+    assert group_key("    app/core.py:18: x", None) == "app/", \
+        "an indented detector puts its whole list in (root)"
+    assert group_key("./", None) == "(root)"
+
+
+def test_group_key_with_prefixes_is_verbatim():
+    """A prefix is compared as text, with no globbing and no tidying: `app`
+    matching `apple.py` is the price of `src/lib/` matching that directory alone."""
+    assert group_key("src/lib", ["src/lib/"]) == "(other)"
+    assert group_key("apple.py", ["app"]) == "app"
+    assert group_key("src/lib/a.py", ["src/", "src/lib/"]) == "src/", "the first listed wins"
+    assert group_key("docs/x.md", ["app/"]) == "(other)"
+
+
+def test_groups_cover_every_counted_line_and_sum_to_the_count(tmp_path):
+    """Grouping runs over the whole captured stdout, not the 60 lines quoted back:
+    a small directory whose candidates all sit past line 60 is still a group, and
+    the counts still add up to the number the run converges on."""
+    r = asyncio.run(run_detector(_detector(
+        r"seq 1 70 | sed 's|^|app/f|;s|$|.py:1: x|'; "
+        r"seq 1 5 | sed 's|^|lib/g|;s|$|.py:1: x|'"), str(tmp_path)))
+    assert r["count"] == 75 and not any(line.startswith("lib/") for line in r["lines"])
+    groups = r["groups"]
+    assert [g["name"] for g in groups] == ["app/", "lib/"], "groups are name-sorted"
+    assert [g["count"] for g in groups] == [70, 5]
+    assert sum(g["count"] for g in groups) == r["count"]
+    assert len(groups[0]["lines"]) == LINES_SHOWN
+    assert groups[1]["lines"] == [f"lib/g{i}.py:1: x" for i in range(1, 6)]
+
+
+def test_a_group_past_the_cap_keeps_its_count():
+    """Twenty-one full groups: the sample stops at the first group that does not
+    fit and stays stopped, so which groups carry lines depends on their names and
+    never on their sizes. The counts are exact either way."""
+    lines = [f"g{i:02d}/f{j}.py" for i in range(21) for j in range(LINES_SHOWN)]
+    lines.append("zz/one.py")
+    groups = group_candidates(lines, None)
+
+    assert [g["name"] for g in groups] == [f"g{i:02d}/" for i in range(21)] + ["zz/"]
+    assert [g["count"] for g in groups] == [LINES_SHOWN] * 21 + [1]
+    assert all(len(g["lines"]) == LINES_SHOWN for g in groups[:20])
+    assert sum(len(g["lines"]) for g in groups) == GROUP_LINES_CAP
+    assert groups[20]["lines"] == []
+    assert groups[21]["lines"] == [], "a one-line group slipped in behind a group that did not fit"
+
+
+def test_a_failed_or_silent_detector_has_no_groups(tmp_path):
+    """Groups are candidates, and a detector that died or said nothing reported
+    none. Its count is already 0; its groups must say the same."""
+    broken = asyncio.run(run_detector(_detector("echo app/a.py; exit 1"), str(tmp_path)))
+    assert broken["count"] == 0 and broken["groups"] == []
+    assert broken["lines"] == ["app/a.py"], "the failed detector's output is still kept"
+
+    slow = asyncio.run(run_detector(
+        _detector("echo app/a.py; sleep 30", timeout=1), str(tmp_path)))
+    assert slow["exit_code"] is None and slow["groups"] == []
+
+    quiet = asyncio.run(run_detector(_detector("true"), str(tmp_path)))
+    assert quiet["count"] == 0 and quiet["groups"] == []
+
+
 def test_detectors_run_in_the_worktree_after_a_reset(run_dir, repo):
     """AC-13: a parked item leaves uncommitted changes in the shared worktree,
     and a detector that measured those would count junk as yield."""
@@ -161,6 +229,19 @@ def test_detectors_run_in_the_worktree_after_a_reset(run_dir, repo):
     r = _pass(run_dir, repo)
     assert r["detectors"][0]["lines"] == ["cli.py"], "the parked item's junk was counted"
     assert r["detectors"][1]["lines"] == [str(worktree)]
+
+
+def test_discover_hands_the_configured_prefixes_to_every_detector(run_dir, repo):
+    """The prefixes come from the sweep block the activity already opens, and a
+    path no prefix matches goes to (other) rather than being dropped: a typo in
+    `groups` would otherwise shrink the run's scope while the count still held it."""
+    (run_dir / "run.yaml").write_text(yaml.safe_dump(
+        {"sweep": {"yield_floor": 0, "groups": ["app/"],
+                   "detectors": [_detector(r"printf 'app/a.py\nlib/b.py\n'")]}}))
+    r = _pass(run_dir, repo)
+    groups = r["detectors"][0]["groups"]
+    assert [(g["name"], g["count"]) for g in groups] == [("(other)", 1), ("app/", 1)]
+    assert groups[1]["lines"] == ["app/a.py"]
 
 
 def test_discover_heartbeats_before_the_first_detector(run_dir, repo):
