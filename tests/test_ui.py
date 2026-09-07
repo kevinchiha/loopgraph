@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import importlib.util
 import inspect
@@ -4569,9 +4570,24 @@ def test_the_dashboard_has_no_write_methods():
     Narrowed, not dropped. The dashboard spends its read-only guarantee exactly
     once, on `POST /api/archive`, and everything this test used to forbid it still
     forbids — a second write path, a PUT or a DELETE, a git command that writes.
-    Whatever else `do_POST` grows, the first thing it does is turn away every path
-    but the one, so a branch added below that guard cannot be reached by a request
-    for anything else.
+
+    What it reads about `do_POST` is one property: the only URL path it names is
+    `/api/archive`. A second write path cannot be added without naming itself, so
+    both smuggles fail here —
+    `... != "/api/archive" and self.path != "/api/wipe"` and
+    `self.path not in ("/api/archive", "/api/wipe")`.
+
+    It reads nothing about the shape. Binding the path to a local first, or
+    inverting to `if path == "/api/archive": … else: 405`, are ordinary ways to
+    write that guard and stay green: an earlier version of this test pinned the
+    operator and the statement's position, which failed both of them and left a
+    contributor with a red test about code that was fine. The guarantee is held by
+    test_get_archive_is_405_and_other_posts_are_405, which POSTs to nine paths it
+    must refuse and to one the dashboard serves nothing on at all. That is what
+    caught a smuggle moved ahead of the guard, where nothing about the condition
+    had changed and this test saw nothing. A false red here is loud and gets
+    fixed; a false green there ships the hole. So the behaviour is the guard and
+    this is the tripwire beside it.
 
     Both files, because the dashboard process runs git in two of them: the diff
     pane here, and the version checker's reads through version.py. A guard that
@@ -4583,34 +4599,17 @@ def test_the_dashboard_has_no_write_methods():
     assert re.findall(r"def (do_\w+)\(", src) == ["do_GET", "do_POST"], \
         "the dashboard answers a method other than GET and POST"
 
-    body = handler_method(src, "do_POST").split('"""')[2]
-    assert body.count("/api/archive") == 1, "do_POST names a path other than /api/archive"
-    statements = [ln.strip() for ln in body.splitlines()
-                  if ln.strip() and not ln.strip().startswith("#")]
-
-    # ONE comparison, against ONE literal. A compound guard is how a second write
-    # path gets in without looking like one:
-    #   if urlparse(self.path).path != "/api/archive" and self.path != "/api/wipe":
-    # That reads like the line it replaced, names /api/archive once, still opens
-    # with `if`, still answers 405 below — and serves POST /api/wipe a 200 that
-    # writes the store. So no `and`, no `or`, and nothing on the right of the
-    # comparison but the one path.
-    guard = statements[0]
-    assert guard.startswith("if ") and guard.endswith(":"), \
-        f"do_POST opens with `{guard}` rather than a guard turning every other path away"
-    condition = guard[len("if "):-1]
-    assert not re.search(r"\b(and|or|not|in|if|else)\b", condition), \
-        f"do_POST's guard is a compound condition, so a path can be let through beside " \
-        f"/api/archive: `{condition}`"
-    assert condition.count("!=") == 1 and "==" not in condition, \
-        f"do_POST's guard is not one comparison: `{condition}`"
-    subject, wanted = condition.split("!=")
-    assert wanted.strip() == '"/api/archive"', \
-        f"do_POST's guard compares against `{wanted.strip()}` rather than \"/api/archive\""
-    assert "path" in subject, \
-        f"do_POST's guard turns requests away on `{subject.strip()}` rather than on the path"
-    assert statements[1].startswith("return") and "405" in statements[1], \
-        f"the path guard answers `{statements[1]}` rather than a 405"
+    # Parsed, not searched. A path named in a comment is not a second endpoint,
+    # two adjacent literals are the one string they compile to, and a docstring is
+    # one constant rather than the words in it.
+    method = handler_method(src, "do_POST").splitlines()
+    pad = len(method[0]) - len(method[0].lstrip())
+    tree = ast.parse("\n".join(ln[pad:] if len(ln) > pad else ln.lstrip() for ln in method))
+    constants = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)]
+    named = [c for c in constants if isinstance(c, str) and c.startswith("/")]
+    assert named == ["/api/archive"], \
+        f"do_POST names {named} — a URL path beside /api/archive is a second write path"
+    assert 405 in constants, "do_POST refuses no method with a 405"
 
     for path, expected in [(Path(ui.__file__), {"rev-parse", "diff"}),
                            (Path(ui.version.__file__),
