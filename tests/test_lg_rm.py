@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import inspect
 import os
 import subprocess
 from importlib.machinery import SourceFileLoader
@@ -135,12 +134,26 @@ def world(tmp_path, monkeypatch):
         git(repo, "worktree", "add", "-q", "-b", branch_of(slug, token), str(worktree))
         return worktree
 
+    def record(repo: Path, worktree: Path) -> Path:
+        """The repository's own record directory for that worktree.
+
+        Asked for rather than assumed, because git names a record after the last
+        component of the worktree path and appends a number when two worktrees
+        share one. Two runs of `lg round` really do: RoundRun passes no run token
+        and execute_round.run_paths falls back to the literal `run`, so both
+        register a directory called `run` and the second record is `run1`.
+        """
+        for found in sorted((repo / ".git" / "worktrees").iterdir()):
+            if (found / "gitdir").read_text().strip() == f"{worktree}/.git":
+                return found
+        raise AssertionError(f"{repo} has no record for {worktree}")
+
     def container(repo: Path, slug: str, token: str) -> Path:
         worktree = host(repo, slug, token)
-        (repo / ".git" / "worktrees" / token / "gitdir").write_text(
-            f"{container_path(slug, token)}/.git\n")
+        found = record(repo, worktree)
+        (found / "gitdir").write_text(f"{container_path(slug, token)}/.git\n")
         (worktree / ".git").write_text(
-            f"gitdir: /projects/{repo.name}/.git/worktrees/{token}\n")
+            f"gitdir: /projects/{repo.name}/.git/worktrees/{found.name}\n")
         return worktree
 
     def listed(repo: Path) -> list[str]:
@@ -158,28 +171,52 @@ def clean(lg, world, slug: str) -> list[str]:
     return lg.clean_worktrees(slug, str(world.runs), world.projects)
 
 
-def git_calls(lg) -> list[tuple[str, ...]]:
-    """Every git command in the helper's source, as the words it spells out.
+def word_runs(lg) -> list[tuple[str, ...]]:
+    """Every run of literal words in a list, a tuple or a call, anywhere in `lg`.
 
-    Parsed and not searched: a subcommand named in a comment is not a command the
-    helper runs, and the reason a prune is forbidden has to be writable next to
-    the code that does not run one. Read off the source as well as off a recorded
-    run, because a command added behind a condition no test happens to take would
-    never reach the recorder at all.
+    The whole module, not one function's own source: an argv is an argv wherever
+    it is written. Spelled into `_run` as a list, hoisted to a module constant, or
+    handed to a small helper that puts the program name on the front — moving it
+    changes nothing these guards exist to catch, and it should not turn them red.
+    What it must never do is put a forbidden command out of sight.
 
-    The count is what makes this a guard rather than a sample: an argv built any
-    other way — assembled elsewhere, or a subcommand held in a variable — leaves a
-    `"git"` with no literal list around it and fails here instead of passing
-    unseen.
+    Parsed and not searched, so the rule can be written down beside the code that
+    keeps it: a comment is not in the tree at all, and a sentence naming a
+    subcommand is one string constant rather than the words inside it.
     """
-    src = inspect.getsource(lg.clean_worktrees)
-    argvs = [node for node in ast.walk(ast.parse(src))
-             if isinstance(node, ast.List) and node.elts
-             and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == "git"]
-    assert len(argvs) == src.count('"git"'), \
-        "clean_worktrees builds a git command out of something other than a literal list"
-    return [tuple(word.value for word in argv.elts if isinstance(word, ast.Constant))
-            for argv in argvs]
+    found = []
+    for node in ast.walk(ast.parse(Path(lg.__file__).read_text())):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            words = node.elts
+        elif isinstance(node, ast.Call):
+            words = node.args
+        else:
+            continue
+        run = tuple(word.value for word in words
+                    if isinstance(word, ast.Constant) and isinstance(word.value, str))
+        if run:
+            found.append(run)
+    return found
+
+
+def commands_for(lg, subcommand: str) -> set[tuple[str, str]]:
+    """Every `<subcommand> <verb>` pair `lg` spells, wherever the argv lives."""
+    return {(word, run[i + 1]) for run in word_runs(lg)
+            for i, word in enumerate(run[:-1]) if word == subcommand}
+
+
+def bare_words(lg) -> set[str]:
+    """Every argv-shaped string constant in `lg`: one word, no whitespace.
+
+    This is the net under the two above. A command assembled some other way — the
+    subcommand held in a variable, glued on with `+`, chosen by a dictionary —
+    still has to spell its word somewhere, and a word on its own is the shape an
+    argv element has. Sentences explaining a rule have spaces in them and are one
+    constant each, so the explanation never trips the guard.
+    """
+    return {node.value for node in ast.walk(ast.parse(Path(lg.__file__).read_text()))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and node.value and not any(char.isspace() for char in node.value)}
 
 
 def test_a_container_registered_worktree_is_deregistered(lg, world):
@@ -215,6 +252,41 @@ def test_a_second_runs_registration_survives(lg, world):
         assert (kept / record).exists(), f"the live run lost its {record}"
     assert container_path("live", "tok2") in world.listed(repo), \
         "the repository no longer names the live run's worktree"
+
+
+def test_two_runs_whose_worktrees_share_a_name_are_told_apart(lg, world):
+    """AC-29's catastrophe by the one route left open, and the reason the match on
+    the recorded path is exact rather than a suffix.
+
+    Two runs of one repository really can have worktree directories with the same
+    name. `lg round` gives every one of them the name `run`: RoundRun starts
+    execute_round with no run token (`workflows/run.py`) and `run_paths` falls
+    back to the literal `run` (`activities/execute_round.py`). So the repository
+    holds `/app/runs/aaa-live/worktrees/run` and
+    `/app/runs/zzz-doomed/worktrees/run`, and cleaning the second meets the first
+    in the listing before its own.
+
+    Matching on anything less than the whole path — `endswith('/worktrees/run')`
+    is the obvious wrong turn — takes the live run's registration, leaves the dead
+    one's behind, and hands back an empty report saying all is well. The live run
+    then dies with `fatal: not a git repository` at its next command. Every other
+    test here uses distinct names and none of them can see it, which is the same
+    shape as the two-run case above.
+    """
+    repo = world.repository()
+    world.container(repo, "aaa-live", "run")
+    world.container(repo, "zzz-doomed", "run")
+    live, doomed = container_path("aaa-live", "run"), container_path("zzz-doomed", "run")
+    assert world.listed(repo)[1:] == [live, doomed], \
+        "the fixture did not leave the live run ahead of the doomed one in git's own order"
+
+    assert clean(lg, world, "zzz-doomed") == []
+
+    assert live in world.listed(repo), \
+        "the live run's registration was taken by the removal of a different run"
+    assert doomed not in world.listed(repo), "the run being removed is still registered"
+    kept = sorted(entry.name for entry in (repo / ".git" / "worktrees").iterdir())
+    assert len(kept) == 1, f"one record should be left, and it should be the live run's: {kept}"
 
 
 def test_a_host_registered_worktree_is_deregistered(lg, world):
@@ -343,7 +415,10 @@ def test_no_branch_is_ever_deleted(lg, world, recorded):
     assert branch_of("doomed", "tok1") in world.git(
         repo, "branch", "--format=%(refname:short)").split(), "the run's branch was deleted"
     assert [argv for argv in recorded if "branch" in argv] == []
-    assert [argv for argv in git_calls(lg) if "branch" in argv] == []
+    # And nowhere in `lg` is there a second branch command to become one. The one
+    # that is there reads the current branch for `lg update`'s refusal; anything
+    # else appearing beside it is worth a person looking, delete or not.
+    assert commands_for(lg, "branch") == {("branch", "--show-current")}
 
 
 @pytest.mark.parametrize("case", ["missing", "empty"])
@@ -373,10 +448,10 @@ def test_prune_is_never_run(lg, world, recorded):
     ran = [argv for argv in recorded if argv[:1] == ["git"]]
     assert ran, "no git command ran at all, so this test proves nothing"
     assert [argv for argv in ran if "prune" in argv] == [], "the helper pruned the repository"
-    assert [argv for argv in git_calls(lg) if "prune" in argv] == [], \
-        "the helper's source spells a prune it did not happen to reach here"
-    assert sorted({argv[1:3] for argv in git_calls(lg)}) == [("worktree", "list"),
-                                                             ("worktree", "remove")]
+    # And no prune is spelled anywhere in `lg`, reached this run or not: one
+    # behind a condition no test happens to take is the whole danger.
+    assert "prune" not in bare_words(lg), "`lg` spells a prune somewhere in it"
+    assert commands_for(lg, "worktree") == {("worktree", "list"), ("worktree", "remove")}
 
 
 def test_a_repository_that_cannot_be_listed_is_reported_and_asked_once(lg, world, recorded):
