@@ -164,6 +164,6 @@ def drive_item(fake, kind: str = "brief", work_item: str = "the item") -> tuple:
     wf = run_module.LoopGraphRun()
     wf._ledger["items"] = [{"n": 1, "item": work_item, "status": "running", "kind": kind}]
     if kind == "sweep":
-        wf._ledger["sweep"] = {"passes": [], "ended": None}
+        wf._ledger["sweep"] = {"passes": [], "ended": None, "last_group": None}
     outcome = _swap(fake, wf, wf._run_item("runs/x", "/projects/x", work_item, 1, None, kind))
     return outcome, wf

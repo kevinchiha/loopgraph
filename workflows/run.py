@@ -197,22 +197,47 @@ def build_convergence_item(files: list[str]) -> str:
     ])
 
 
-def build_sweep_item(detector: dict, pass_no: int, extras: list[str]) -> str:
-    """One sweep item: what a detector reported, and what to do about it.
+def build_sweep_item(detector: dict, pass_no: int, extras: list[str], group: int) -> str:
+    """One sweep item: one of a detector's path groups, and what to do about it.
 
-    The count and the sample both come from the detector entry, so they cannot
+    `group` indexes `detector_groups(detector)`. An item takes one group so its
+    write set sits in one part of the repo: an item over the whole list picks
+    whatever the detector printed first, and a run of them edits the same files
+    over and over while the rest of the repo goes unworked.
+
+    The counts and the sample all come from the detector entry, so they cannot
     disagree. They are different numbers on purpose: a detector reports
     everything it found and hands over only the first few, and an executor told
-    the sample was the list would think the job was nearly done. `extras` are
-    things an earlier item found by hand; they get worked, but no detector
-    counts them, so the text says they do not move the run's end.
+    the sample was the list would think the job was nearly done. The other groups
+    are named but not sampled, so the executor can see the shape of the pass
+    without reading it as this item's work. `extras` are things an earlier item
+    found by hand; they get worked, but no detector counts them, so the text says
+    they do not move the run's end.
     """
-    lines = detector["lines"]
+    groups = detector_groups(detector)
+    chosen = groups[group]
+    lines = chosen["lines"]
+    takes = (f"groups by path; this item takes group `{chosen['name']}` "
+             f"({chosen['count']} candidates).")
+    if chosen["count"] and not lines:
+        # Past the sample cap: `discover` kept this group's count and none of its
+        # lines. The command is the only way back to them, and an item that just
+        # printed nothing would hide every candidate in the group.
+        sample = [takes,
+                  f"No sample was kept for this group; run `{detector['cmd']}` from the "
+                  "repo root and take the lines that fall in it:"]
+    else:
+        sample = [f"{takes} The first",
+                  f"{len(lines)} follow, one per line, printed from the repo root:",
+                  *lines]
+    others = [f"{g['name']}: {g['count']} candidates"
+              for i, g in enumerate(groups) if i != group]
     return "\n".join([
         f"Sweep item. Detector `{detector['name']}` (pass {pass_no}) reported "
-        f"{detector['count']} candidates. The first",
-        f"{len(lines)} follow, one per line, printed from the repo root:",
-        *lines,
+        f"{detector['count']} candidates across {len(groups)}",
+        *sample,
+        "The other groups this pass, for the picture only; later items take them:",
+        *(others or ["(none)"]),
         "Take the largest safe family of these that shares one behaviour claim, one write set",
         "and one gate. Remove or merge it. Leave the rest for a later item. Net lines for",
         "this item must be at or under zero; the engine measures it and refuses the commit",
@@ -560,7 +585,7 @@ class LoopGraphRun:
         reports moves a total or an end condition. An agent deciding when its own
         job is done is exactly what the engine exists to prevent.
         """
-        self._ledger["sweep"] = {"passes": [], "ended": None}
+        self._ledger["sweep"] = {"passes": [], "ended": None, "last_group": None}
         # Every detector's own timeout, plus 20 seconds each because the runner
         # polls in 20-second steps and can only kill on a step boundary (a
         # detector with `timeout: 30` dies at 40), plus two minutes for the
@@ -609,12 +634,20 @@ class LoopGraphRun:
                 break
 
             # A pass with nothing to hand over has already ended the run above,
-            # so there is always a detector left for `pick_detector` to find.
+            # so there is always a detector left for `pick_detector` to find, and
+            # a detector that counted something has a group for `pick_group`.
             entries = found["detectors"]
             used = pick_detector(entries, used)
-            item = build_sweep_item(entries[used], pass_no, extras)
+            groups = detector_groups(entries[used])
+            picked = pick_group(groups, self._ledger["sweep"]["last_group"])
+            item = build_sweep_item(entries[used], pass_no, extras, picked)
+            # The pointer moves as the item is built, not when it is accepted, so
+            # a group whose item parked is not handed straight back to the next
+            # one; and it lives in the ledger, so a rotation stuck on one group is
+            # something `lg status` and the dashboard can show.
+            self._ledger["sweep"]["last_group"] = groups[picked]["name"]
             entry = {"n": items_run + 1, "item": item, "status": "running",
-                     "kind": "sweep"}
+                     "kind": "sweep", "group": groups[picked]["name"]}
             self._ledger["items"].append(entry)
             items_run += 1
             outcome = await self._run_item(run_dir, target_repo, item, items_run,

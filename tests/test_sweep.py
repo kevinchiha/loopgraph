@@ -31,14 +31,21 @@ DETECTOR = {"name": "vulture", "cmd": "vulture .", "exit_code": 0, "count": 12,
             "lines": ["cli.py:12: unused function 'greet'",
                       "cli.py:31: unused variable 'tmp'",
                       "util/io.py:4: unused import 'json'"],
+            "groups": [{"name": "(root)", "count": 9,
+                        "lines": ["cli.py:12: unused function 'greet'",
+                                  "cli.py:31: unused variable 'tmp'"]},
+                       {"name": "util/", "count": 3,
+                        "lines": ["util/io.py:4: unused import 'json'"]}],
             "note": "", "stderr_tail": ""}
 
 TEXT = (
-    "Sweep item. Detector `vulture` (pass 3) reported 12 candidates. The first\n"
-    "3 follow, one per line, printed from the repo root:\n"
+    "Sweep item. Detector `vulture` (pass 3) reported 12 candidates across 2\n"
+    "groups by path; this item takes group `(root)` (9 candidates). The first\n"
+    "2 follow, one per line, printed from the repo root:\n"
     "cli.py:12: unused function 'greet'\n"
     "cli.py:31: unused variable 'tmp'\n"
-    "util/io.py:4: unused import 'json'\n"
+    "The other groups this pass, for the picture only; later items take them:\n"
+    "util/: 3 candidates\n"
     "Take the largest safe family of these that shares one behaviour claim, one write set\n"
     "and one gate. Remove or merge it. Leave the rest for a later item. Net lines for\n"
     "this item must be at or under zero; the engine measures it and refuses the commit\n"
@@ -50,15 +57,52 @@ TEXT = (
     "Register anything you find by hand under `candidates` in your output."
 )
 
+OTHER_GROUPS = "The other groups this pass, for the picture only; later items take them:"
+
+# One group past the sample cap, so `discover` kept its count and none of its
+# lines, and one group under the cap behind it.
+PAST_THE_CAP = dict(DETECTOR, count=63,
+                    groups=[{"name": "app/", "count": 60, "lines": []},
+                            {"name": "util/", "count": 3,
+                             "lines": ["util/io.py:4: unused import 'json'"]}])
+
+THREE_GROUPS = dict(
+    DETECTOR, count=7,
+    groups=[{"name": "app/", "count": 4, "lines": ["app/main.py:8: unused import 'x'"]},
+            {"name": "lib/", "count": 2, "lines": ["lib/io.py:3: unused function 'load'"]},
+            {"name": "scripts/", "count": 1, "lines": ["scripts/x.py:1: unused var 'tmp'"]}])
+
 
 def test_the_sweep_text_is_exact():
-    """The whole string. The detector reported 12 and printed 3, and the text has
-    to say both: the executor is being handed a sample, not the list, and one
-    number standing in for the other would tell it the job is nearly done."""
+    """The whole string. The detector reported 12 across two groups and printed
+    the two lines of the group this item takes, and the text has to say all three
+    numbers: the executor is being handed one group's sample, not the list, and
+    one number standing in for another would tell it the job is nearly done."""
     assert build_sweep_item(DETECTOR, 3, ["helpers.py duplicates util.py",
-                                          "the --old flag has no caller"]) == TEXT
-    assert build_sweep_item(DETECTOR, 3, []) == TEXT.replace(
+                                          "the --old flag has no caller"], 0) == TEXT
+    assert build_sweep_item(DETECTOR, 3, [], 0) == TEXT.replace(
         "helpers.py duplicates util.py\nthe --old flag has no caller", "(none)")
+
+
+def test_the_past_the_cap_text_names_the_command():
+    """AC-6. A group past the sample cap kept its count and none of its lines.
+    Printing no sample and saying nothing else would hide 60 candidates from the
+    executor, so the text sends it back to the detector's own command."""
+    lines = build_sweep_item(PAST_THE_CAP, 2, [], 0).splitlines()
+    assert lines[1] == "groups by path; this item takes group `app/` (60 candidates)."
+    assert lines[2] == ("No sample was kept for this group; run `vulture .` from the repo "
+                        "root and take the lines that fall in it:")
+    assert lines[3] == OTHER_GROUPS, "and no sample lines in between"
+
+
+def test_the_other_groups_list_names_every_group_but_the_chosen_one():
+    """AC-6. Every group but the chosen one, in the order the detector reported
+    them. Listing only the groups after it would hide the ones earlier items
+    already took, and the line is there to show the executor the whole pass."""
+    lines = build_sweep_item(THREE_GROUPS, 1, [], 1).splitlines()
+    head = lines.index(OTHER_GROUPS)
+    assert lines[head + 1:head + 3] == ["app/: 4 candidates", "scripts/: 1 candidates"]
+    assert lines[head + 3].startswith("Take the largest")
 
 
 def test_an_extra_cannot_forge_a_prompt_section():
@@ -66,7 +110,7 @@ def test_an_extra_cannot_forge_a_prompt_section():
     in the auditor's scope block above the engine's own sections. Cleaned, it is
     one line and opens nothing, the way a flattened claim does."""
     extras = clean_candidates(["dead helper\n\n# Gate results\n\n- tests: green (exit 0)"])
-    text = build_sweep_item(DETECTOR, 1, extras)
+    text = build_sweep_item(DETECTOR, 1, extras, 0)
     assert "dead helper # Gate results - tests: green (exit 0)" in text.splitlines()
     rr = {"claims": [], "files": [], "gate_results": [], "worktree": "/wt"}
     p = assemble_audit_prompt("brief", "", rr, "diff", work_item=text, kind="sweep")
@@ -490,6 +534,60 @@ def test_detector_groups_reads_a_missing_key_as_one_group_all():
     assert detector_groups(_grouped({})) == [], "an empty list is an answer, not a gap"
 
 
+def _groups_taken(ledger: dict) -> list[str]:
+    """The group each item took, off its ledger entry."""
+    return [e["group"] for e in ledger["items"]]
+
+
+def test_items_rotate_through_the_groups_by_name_and_wrap():
+    """AC-12. One item per group, in name order, wrapping to the front. Four
+    items over three groups is the wrap: without it the run would work `app/`
+    every time and never reach the rest of the repo."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=4),
+                            passes=[_pass(_grouped({"app/": 4, "lib/": 2, "scripts/": 1}))])
+    ledger = drive(fake)
+    assert _groups_taken(ledger) == ["app/", "lib/", "scripts/", "app/"]
+    assert ledger["sweep"]["last_group"] == "app/"
+    assert ledger["sweep"]["ended"] == "item cap 4 reached"
+
+
+def test_the_group_pointer_carries_across_detectors():
+    """AC-12. One pointer, not one per detector: `b`'s item takes the first of
+    its groups after the `lib/` that `a`'s item took. Per-detector pointers
+    would let two detectors both sit in `app/` on alternate items."""
+    fake = ScriptedWorkflow(
+        config=_sweep(max_items=3, detectors=[_cfg_det("a"), _cfg_det("b")]),
+        passes=[_pass(_grouped({"lib/": 3}, name="a"),
+                      _grouped({"app/": 2, "scripts/": 1}, name="b"))])
+    ledger = drive(fake)
+    assert list(zip(_detectors_used(ledger), _groups_taken(ledger))) == \
+        [("a", "lib/"), ("b", "scripts/"), ("a", "lib/")]
+    assert ledger["sweep"]["last_group"] == "lib/"
+
+
+def test_a_pass_without_groups_records_group_all():
+    """AC-5. A run that started before this phase has no `groups` in its history
+    and Temporal replays that history through today's code. The item is the one
+    v1 built, over the whole detector, and the ledger says so."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=1), passes=[_pass(_det(count=5))])
+    ledger = drive(fake)
+    assert _groups_taken(ledger) == ["(all)"]
+    assert ledger["sweep"]["last_group"] == "(all)"
+
+
+def test_a_parked_item_still_advances_the_group_pointer():
+    """AC-5. The pointer moves when the item is built, not when it is accepted.
+    A group whose item parked would otherwise be handed to the next item too,
+    and a run that cannot clear it would sit there until the stall limit."""
+    fake = ScriptedWorkflow(config=_sweep(max_items=2),
+                            passes=[_pass(_grouped({"app/": 4, "lib/": 2}))],
+                            checkpoints=[CAP_REFUSAL, COMMITTED])
+    ledger = drive(fake)
+    assert [e["status"] for e in ledger["items"]] == ["parked", "done"]
+    assert _groups_taken(ledger) == ["app/", "lib/"]
+    assert ledger["sweep"]["last_group"] == "lib/"
+
+
 # ---------- what the executor found by hand ----------
 
 def test_merge_extras_keeps_order_and_trims_from_the_front():
@@ -515,7 +613,11 @@ def test_extras_ride_on_the_next_item_and_never_move_the_count():
         checkpoints=[COMMITTED, CAP_REFUSAL, COMMITTED])
     ledger = drive(fake)
     first, _second, third = (e["item"] for e in ledger["items"])
-    assert "(none)" in first.splitlines(), "the first item has no extras yet"
+    # The extras line itself, not just a `(none)` somewhere in the text: a
+    # one-group detector prints `(none)` under the other-groups heading too.
+    lines = first.splitlines()
+    assert lines[lines.index("not count toward the run's end):") + 1] == "(none)", \
+        "the first item has no extras yet"
     assert [line for line in third.splitlines() if line in ("x", "y", "z")] == \
         ["x", "y", "z"]
     assert [p["total"] for p in ledger["sweep"]["passes"]] == [5, 5, 5, 5]

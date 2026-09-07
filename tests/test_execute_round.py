@@ -95,7 +95,8 @@ def test_generated_items_get_the_executor_prompt_a_brief_item_gets():
     reconcile with the first."""
     from workflows.run import build_convergence_item, build_sweep_item
     plain = assemble_prompt("BRIEF", "C", "Add a --hello flag")
-    generated = [build_sweep_item({"name": "vulture", "count": 2, "lines": ["a", "b"]}, 1, []),
+    generated = [build_sweep_item({"name": "vulture", "count": 2, "lines": ["a", "b"]},
+                                  1, [], 0),
                  build_convergence_item(["cli.py"])]
     for item in generated:
         p = assemble_prompt("BRIEF", "C", item)
