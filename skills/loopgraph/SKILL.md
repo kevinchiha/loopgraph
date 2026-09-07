@@ -241,7 +241,7 @@ the tail of what it wrote to stderr so you can see why. A misspelt key anywhere
 in the file stops the run before it starts, with the key named in the reason.
 
 `groups` is optional. Each entry is a path prefix compared verbatim against the
-path at the start of every candidate line, which has any leading `./` taken off
+path at the start of every candidate line, which has one leading `./` taken off
 first, so write the prefix without one and end it in `/`: `app/` matches
 `app/core.py` and nothing outside that directory, while `app` also matches
 `apple.py` and `./app/` matches nothing. A candidate no prefix matches goes to a
