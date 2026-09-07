@@ -52,6 +52,19 @@ BAD_SWEEP = [
      "run.yaml: sweep.detectors[0].timeout must be an integer of at least 1"),
 ]
 
+GROUPS_MESSAGE = "run.yaml: sweep.groups must be a list of path prefixes"
+
+# Every wrong shape gets that one message: a groups key that quietly read as "no
+# groups" would quietly change which corner of the repo each item works.
+BAD_SWEEP_GROUPS = [
+    SWEEP + "  groups: []\n",
+    SWEEP + "  groups: app/\n",
+    SWEEP + "  groups:\n    app/: 1\n",
+    SWEEP + "  groups: [app/, 3]\n",
+    SWEEP + '  groups: [app/, ""]\n',
+    SWEEP + "  groups: [yes]\n",
+]
+
 NEEDS_A_FLOOR_AND_A_DETECTOR = [
     ("sweep:\n  detectors:\n    - name: a\n      cmd: x\n",
      "run.yaml: sweep.yield_floor must be an integer of at least 0"),
@@ -139,7 +152,8 @@ def test_a_sweep_block_parses_with_its_defaults():
     assert cfg["convergence"] == DEFAULT_CONVERGENCE
     assert cfg["sweep"] == {
         "yield_floor": 3, "deadline_seconds": None, "max_items": 40,
-        "detectors": [{"name": "dead", "cmd": "vulture .", "timeout": 600}]}
+        "detectors": [{"name": "dead", "cmd": "vulture .", "timeout": 600}],
+        "groups": None}
 
 
 def test_deadline_units():
@@ -157,6 +171,22 @@ def test_deadline_units():
 @pytest.mark.parametrize("text,message", NEEDS_A_FLOOR_AND_A_DETECTOR)
 def test_a_sweep_needs_a_floor_and_at_least_one_detector(text, message):
     refused(text, message)
+
+
+def test_sweep_groups_parse_as_written():
+    """A prefix is compared verbatim later, so the parser normalises nothing: the
+    second entry keeps its missing slash, and a repeat stays a repeat."""
+    cfg = parse_run_config(SWEEP + "  groups: [app/, src/lib]\n")
+    assert cfg["sweep"]["groups"] == ["app/", "src/lib"]
+    assert parse_run_config(SWEEP + "  groups: [b/, a/, b/]\n")["sweep"]["groups"] == [
+        "b/", "a/", "b/"]
+
+
+@pytest.mark.parametrize("text", BAD_SWEEP_GROUPS)
+def test_bad_sweep_groups_are_refused(text):
+    """`[yes]` is `[True]`, not `["yes"]`, so the entries are checked with
+    isinstance and never coerced with str(), the same trap the detector cmd hits."""
+    refused(text, GROUPS_MESSAGE)
 
 
 def test_a_detector_cmd_that_is_not_a_string_is_refused():
@@ -187,6 +217,7 @@ def test_every_error_starts_with_run_yaml():
     stop reason, so the prefix is what tells them which file to go and fix."""
     fixtures = [(text, "") for text, _ in
                 UNKNOWN_KEYS + BAD_CONVERGENCE + BAD_SWEEP + NEEDS_A_FLOOR_AND_A_DETECTOR]
+    fixtures += [(text, "") for text in BAD_SWEEP_GROUPS]
     fixtures += [(TOP_LEVEL_LIST, ""), (BARE_OFF, ""), (NOT_YAML, ""), (BAD_DEADLINE[0], ""),
                  (SWEEP, WORK_ITEMS_BRIEF)]
     for text, brief in fixtures:

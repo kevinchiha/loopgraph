@@ -10,6 +10,7 @@ A run directory may hold a `run.yaml` next to `brief.md` and `gates.yaml`:
       yield_floor: 0
       deadline: 4d
       max_items: 40
+      groups: ["app/", "src/lib/"]
       detectors:
         - name: dead code
           cmd: "vulture . | wc -l"
@@ -17,7 +18,8 @@ A run directory may hold a `run.yaml` next to `brief.md` and `gates.yaml`:
 
 Everything is optional. No file at all is a normal run with default convergence.
 A `sweep:` block is the mode switch: the run then takes its items from the
-detectors instead of the brief.
+detectors instead of the brief. Its `groups` are path prefixes compared verbatim,
+so `app` matches `apple.py`; end each one in `/`.
 
 Every mistake in here is an error naming the key, never a default taken quietly.
 A `yeild_floor` that silently meant "no floor" is exactly the failure this file
@@ -114,13 +116,21 @@ def _sweep(block) -> dict | None:
         return None
     if not isinstance(block, dict):
         raise ValueError("run.yaml: sweep must be a mapping")
-    _check_keys(block, ("yield_floor", "deadline", "max_items", "detectors"), "sweep")
+    _check_keys(block, ("yield_floor", "deadline", "max_items", "detectors", "groups"), "sweep")
     # A missing yield_floor gets the same message as a wrong one: a sweep with no
     # floor has no stopping condition of its own.
     floor = _integer(block.get("yield_floor"), "sweep.yield_floor", 0)
     deadline = block.get("deadline")
     deadline_seconds = None if deadline is None else parse_deadline(deadline)
     max_items = _integer(block.get("max_items", DEFAULT_MAX_ITEMS), "sweep.max_items", 1)
+    groups = block.get("groups")
+    # Absent means "group by top-level directory"; a wrong one is refused rather
+    # than dropped, because a groups that quietly became None would quietly
+    # change which corner of the repo each item works. The entries are strings,
+    # not anything str() would take: `groups: [yes]` is `[True]`.
+    if groups is not None and (not isinstance(groups, list) or not groups
+                               or not all(isinstance(g, str) and g for g in groups)):
+        raise ValueError("run.yaml: sweep.groups must be a list of path prefixes")
     entries = block.get("detectors")
     if not isinstance(entries, list) or not entries:
         raise ValueError("run.yaml: sweep.detectors must be a non-empty list")
@@ -143,7 +153,8 @@ def _sweep(block) -> dict | None:
     return {"yield_floor": floor,
             "deadline_seconds": deadline_seconds,
             "max_items": max_items,
-            "detectors": detectors}
+            "detectors": detectors,
+            "groups": groups}
 
 
 def parse_run_config(text: str, brief: str = "") -> dict:
