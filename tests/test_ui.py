@@ -814,9 +814,12 @@ def test_the_injected_pattern_survives_javascript():
 # is for. 161 tests were green over it, and a scripted browser would have passed
 # it too: `innerText` and `textContent` both leave generated content out, so a
 # robot reading that summary back gets the same string whether the dots are on
-# screen or not. Anything a script can read back is already checked elsewhere in
-# this file. What is left is what only an eye settles, so when an item below says
-# `See:`, it means look at it.
+# screen or not. So when an item below says `See:`, do not skip it on the grounds
+# that a test must have it: nothing in this file has laid out a page, and the
+# widths, the colours, the indents and the offsets below are checked nowhere else.
+# A script driving a real browser CAN read most of them back, and one is worth
+# writing if this list is being run often — but it has to ask for the computed
+# value, and the one thing above is the one thing it would still miss.
 #
 # Twenty-two items, about forty minutes, in this order. Items 1, 2, 6, 8 and 13
 # are a minute of standing still between them, and that is the cheap part. Eight
@@ -1090,7 +1093,10 @@ def test_the_injected_pattern_survives_javascript():
 #     `feed.rows.append(dict(feed.rows[0], id='run-two-cccccc', dir='two'))`.
 #     See, within four seconds: `(2) loopgraph`, and the dot unchanged — it says
 #     whether anything wants the reader, never how much.
-#     Now answer that one: `feed.rows[1]['state'] = 'running'`.
+#     Now answer that one: `feed.rows[2]['state'] = 'running'`. Index 2, not 1 —
+#     item 4's pair is the open run and then the closed one, so the row you just
+#     appended is the third, and answering row 1 answers a run that was never in
+#     the count and leaves the tab reading `(2)` while you wait for it to drop.
 #     See, within four seconds: `(1) loopgraph`. Then answer the first as well,
 #     `feed.rows[0]['state'] = 'running'` and `del feed.ledgers[id]['awaiting']`.
 #     See: the tab reads `loopgraph` with no brackets at all and the dot has gone
@@ -1169,9 +1175,11 @@ def test_the_injected_pattern_survives_javascript():
 #     Neither of those two is likely to be on the board when you look. For the
 #     first, serve a ledger whose newest round carries `"status": "green"` and no
 #     `verdict` key at all; that is the whole fixture, and it does not need the run
-#     to be open. For the second it does: put a file called `r9-executor.log` in a
-#     run directory whose served ledger has no round 9 in it, and give that run's
-#     row a `start_time` and no `close_time`. A card only claims to be in progress
+#     to be open. For the second it does: put a file called `r2-executor.log` in a
+#     run directory whose served ledger has round 1 and no round 2, and give that
+#     run's row a `start_time` and no `close_time`. A log name with no item prefix
+#     keys to item 1, so that file is the `ITEM 1 · ROUND 2` above and not some
+#     other line. A card only claims to be in progress
 #     on a run that is still open, which is the whole reason a finished run's
 #     unrecorded rounds do not all read as running.
 #     See, last: the newest card on the board is open and every card below it is
@@ -1180,7 +1188,8 @@ def test_the_injected_pattern_survives_javascript():
 #
 # 19. The verdict colours, which want one round of each kind on one board: serve a
 #     ledger with four rounds carrying `accept`, `redo`, `escalated`, and a word
-#     this page has never met — `deferred` will do.
+#     this page has never met — `deferred` will do. Shut the newest card, which is
+#     the one the board opens for you, so all four are folded.
 #     See, with every card shut: ACCEPT green, REDO yellow, ESCALATED red, and each
 #     of them the only thing on its own summary line that is not dim gray. That is
 #     what makes the column readable at a glance: the labels recede and the three
@@ -1193,9 +1202,12 @@ def test_the_injected_pattern_survives_javascript():
 #     See: the verdict line inside each card is the SAME colour as that round's
 #     word in its own summary — green over green, yellow over yellow, red over red.
 #     It is lowercase there and uppercase in the summary; that is the stylesheet,
-#     not a disagreement. DEFERRED is the exception and is meant to be: dim in the
-#     summary, the board's neutral blue on the open card, because neither of those
-#     is a meaning.
+#     not a disagreement. The unknown word is the exception: `deferred` is dim in
+#     the summary, taking the summary line's own colour, and the board's accent
+#     blue on the open card, which is what `.round .verdict` sets for a word with
+#     no class on it. Neither is a meaning-colour, so nothing is being said twice
+#     — but they are two colours for one word, and whether that is right is the
+#     owner's call and not this list's.
 #     A green summary over a blue verdict line is the cascade, not the JavaScript.
 #     Both elements are handed the same class; the colour rules name
 #     `.round .verdict` in front of them precisely so the card's own accent-blue
@@ -1266,8 +1278,10 @@ def test_the_injected_pattern_survives_javascript():
 #     `logs only`.
 #     See: the strip carries the directory name and the `archive` button and
 #     nothing between them — no pill, no duration — above the line `no workflow for
-#     this run`. A pill up there is the page inventing a status for a run it knows
-#     nothing about. The button belongs there: a directory of log files is a row
+#     this run`, or `temporal unreachable — logs only` if the feed never answered,
+#     which are item 3's two lines. A pill up there is the page inventing a status
+#     for a run it knows nothing about. The button belongs there: a directory of
+#     log files is a row
 #     the owner can hide like any other, and it is the only archive the dashboard
 #     will do without asking Temporal anything.
 #     Then serve a run that has times and a ledger the page cannot get:

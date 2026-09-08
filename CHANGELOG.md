@@ -34,7 +34,7 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   supervisor is still out and on a `redo`, red on `escalated`. A round shows that word
   twice, once folded and once open, and both take the same colour, so you can read a
   column of folded cards and see which rounds went wrong without reading a word. A
-  verdict the dashboard has never met is left uncoloured and keeps every letter of its
+  verdict the dashboard has never met keeps its plain colour and every letter of its
   text.
 - Opening one of a round's two log panes gives it the room the closed one is not
   using — about 930px of a 1440px window instead of 516. Open both and they go back
