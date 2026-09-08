@@ -797,16 +797,36 @@ def test_the_injected_pattern_survives_javascript():
 #
 # Run this by hand whenever PAGE changes. Nothing in this file has ever seen the
 # page: it reads the JavaScript as text, so anything about how the page LOOKS is
-# outside every check in it. Two defects shipped through a green suite in this
-# phase alone. Sections that set `hidden` stayed on screen, because a `display` in
-# the page's own stylesheet outranks the browser's built-in `[hidden]` rule — CSS,
-# which nothing here parses. And a board said three contradictory things about one
-# run at once: a card reading `in progress`, a row reading `unknown`, a line saying
-# the page knew nothing. Each half was right on its own.
+# outside every check in it. Four defects have shipped through a green suite now.
+# Sections that set `hidden` stayed on screen, because a `display` in the page's
+# own stylesheet outranks the browser's built-in `[hidden]` rule — CSS, which
+# nothing here parses. A board said three contradictory things about one run at
+# once: a card reading `in progress`, a row reading `unknown`, a line saying the
+# page knew nothing; each half was right on its own. A round summary rendered
+# `item 1 · round 2accept4 files`, because the separators between its pieces are
+# a `::before` in the stylesheet and deleting one rule takes all of them away.
+# And the strip meant to pin to the top of the board sat 16px down it with the
+# round cards scrolling through the band above, because a sticky offset is
+# measured from the scroll container's PADDING box and the board had padding at
+# the top.
 #
-# Ten minutes, in this order — items 1, 2, 6 and 8 are 45 seconds of waiting on
-# their own, and an honest number gets a checklist finished rather than dropped
-# halfway through. Start the dashboard on a port that is not the owner's 8400 —
+# The third of those is the one to remember, because it says what this checklist
+# is for. 161 tests were green over it, and a scripted browser would have passed
+# it too: `innerText` and `textContent` both leave generated content out, so a
+# robot reading that summary back gets the same string whether the dots are on
+# screen or not. Anything a script can read back is already checked elsewhere in
+# this file. What is left is what only an eye settles, so when an item below says
+# `See:`, it means look at it.
+#
+# Twenty-two items, about forty minutes, in this order. Items 1, 2, 6, 8 and 13
+# are a minute of standing still between them, and that is the cheap part. Eight
+# items — 4, 10, 11, 16, 17, 18, 19 and 22 — want a run in a state this machine
+# may not have and are served from a hand-written feed instead, which is a server
+# to start and a server to stop each time. Item 20 wants a round to arrive while
+# you watch and item 9 a run actually holding a card; both go unrun more often
+# than they are run, which is the reason they are written down rather than left
+# out. An honest number gets a checklist finished rather than dropped halfway
+# through. Start the dashboard on a port that is not the owner's 8400 —
 # `.venv/bin/python ui.py 8410` — open http://localhost:8410, and
 # open the browser's developer tools at the Network tab (F12). Keep an eye on the
 # Console tab too: an exception thrown inside a fetch is why a pane goes blank,
@@ -834,19 +854,30 @@ def test_the_injected_pattern_survives_javascript():
 #
 #  3. Click a run in the rail whose pill reads `unknown` and whose detail reads
 #     `logs only` — a directory with no workflow behind it.
-#     See: one line, `no workflow for this run` or `temporal unreachable — logs
-#     only`, and then the log cards. Nothing above that line. No status pill, no
-#     `answer with:` box, no work items, no diff pane.
+#     See: the strip naming the run, with `archive` at its right-hand end and
+#     NOTHING between the two — no pill and no duration, because there is no
+#     workflow to have either. Under it one line, `no workflow for this run` or
+#     `temporal unreachable — logs only`, and then the log cards. Nothing else on
+#     the board at all: no status pill, no `answer with:` box, no work items, no
+#     diff pane.
 #     Anything still showing is a section that set `hidden` and stayed visible,
 #     which is the CSS bug: the page needs `[hidden] { display:none !important }`
 #     to beat its own rules, and something has got past it.
 #
-#  4. Read a run's row and its board together, on several runs.
-#     See: the pill in the row and the pill on the board say the same word, and
-#     nothing says `in progress` on a run whose row shows a duration that has
-#     stopped.
+#  4. Read a run's row, the strip at the top of its board and the board itself
+#     together, on several runs. There are three pills now and not two: the rail
+#     row's, the strip's and the board's own `#state`.
+#     See: all three say the same word for the same run, and nothing says
+#     `in progress` on a run whose row shows a duration that has stopped. The
+#     strip copies the row rather than working the word out again, so a
+#     disagreement between those two is a copy that has stopped copying, and one
+#     between either of them and the board is the two rules for `waiting` having
+#     come apart.
 #     A page that contradicts itself here is worse than one that says nothing: the
-#     reader cannot tell which half to believe.
+#     reader cannot tell which half to believe. That includes the board saying
+#     there is nothing to show about a run the strip is naming an inch above it:
+#     when the ledger cannot be read the strip keeps the name, the pill and the
+#     duration, and item 22 is where the line under it is read.
 #     Nothing in items 1 to 3 makes a run that is WAITING, and this item only
 #     compares whatever words are already on screen, so serve a pair by hand the
 #     way item 10 does: `ui.make_server(8410, Path('runs'), temporal_addr=None,
@@ -854,12 +885,14 @@ def test_the_injected_pattern_survives_javascript():
 #     row carrying a `start_time` and no `close_time` — that pair is what
 #     patchRunRow turns into `data-live`, which the board's waiting branch reads —
 #     and a second row carrying both times and the same stale `awaiting`.
-#     See, on the open run: `waiting` in blue in the rail row and `waiting` in blue
-#     on the board, with the awaiting block under them.
+#     See, on the open run: `waiting` in blue in the rail row, `waiting` in blue on
+#     the strip and `waiting` in blue on the board, with the awaiting block under
+#     them.
 #     See, on the closed one: the status it recorded — `stopped` on a run the
-#     engine died in — and no awaiting block at all. No question, no options, no
-#     `lg approve` command. A run that has ended asking to be answered is this
-#     item's failure, not item 9's.
+#     engine died in — in all three places, and no awaiting block at all. No
+#     question, no options, no `lg approve` command. A run that has ended asking to
+#     be answered is this item's failure, not item 9's.
+#     Leave this server up: item 16 reads the tab off the same pair.
 #
 #  5. Scroll to the foot of the board, past the round cards. The diff pane is
 #     there, closed. Open it.
@@ -896,13 +929,23 @@ def test_the_injected_pattern_survives_javascript():
 #     GET, and nothing else. Every `/api/log` row names a real log file. A
 #     collapsed pane asks for nothing, so the number of `/api/log` rows matches the
 #     number of panes you left open.
+#     Now fold up the ROUND CARD around one of those open panes and read the rows
+#     for another 10 seconds.
+#     See: the count does not change. A pane inside a folded card is still an open
+#     pane and goes on polling on purpose, so the log the reader put away is up to
+#     date the moment they open the card again. It is panes the number counts, not
+#     cards, and a drop here would be a rule that shut off a request the reader is
+#     going to want.
 #     `name=undefined` in a `/api/log` row is the log poll having picked up the
-#     diff pane, which is a `.panel` too and holds no log name. Any other method is
-#     a dashboard that is no longer read-only. Any other path is a request nobody
-#     meant to send. Touch nothing while you watch: the archive button posts, and a
-#     `POST /api/archive` in this window means it has reached a timer, which is
+#     diff pane, which is a `.panel` too and holds no log name.
+#     Exactly one request on this page is not a GET: `POST /api/archive`, sent on
+#     the archive button's own click and nowhere else. So touch nothing while you
+#     watch and there must be none of those either. A `POST /api/archive` in a
+#     window where nobody clicked is the write having reached a timer, which is
 #     item 15's failure and the worst one on this page — the dashboard hiding runs
-#     nobody asked it to hide.
+#     nobody asked it to hide. Any other method, and any method at all on any other
+#     path, is a second write appearing on a dashboard that has one, and a request
+#     nobody meant to send.
 #
 #  9. Only when a run is actually holding a card. There was no such run on this
 #     machine the day this was written, so this item goes unrun more often than
@@ -995,18 +1038,255 @@ def test_the_injected_pattern_survives_javascript():
 #     See: the hidden row comes back where it was, marked `archived` in purple
 #     beside its detail, and the count does not change — it counts what the server
 #     says is archived, not what is on screen. Untick it and the row goes again.
-#     Then click `unarchive` and watch it come back with the toggle off.
+#     Leave it archived, take the `#…` off the URL so the address bar is just
+#     `http://localhost:8410/`, and reload with the toggle off.
+#     See: the page opens on the first run you can SEE — the one under the hidden
+#     row — and not on the archived one, even when the archived one is the newest
+#     and would have been the top of the rail. Archiving the newest finished run is
+#     the ordinary reason to archive anything, and a page that then opens on it
+#     puts the highlight on a row nobody can see and leaves the reader with a board
+#     they cannot find in the list beside it.
+#     Now tick the toggle, click the archived row and press `unarchive`, and watch
+#     it come back with the toggle off again.
 #     Now click a run that is still running and press `archive`.
 #     See: the server's own sentence in red beside the button —
 #     `workflow still open: finish or answer it before archiving` — and the row
 #     still on the rail with nothing else changed. A 409 in the console is the
 #     browser reporting the status, not an error the page failed to handle. Click
 #     another run and the sentence goes with the board it was on.
+#     Now stop Temporal and reload. The rail is rebuilt from the run directories
+#     alone, so every row is keyed on a directory name and reads `unknown` with
+#     `logs only` beside it. Archive one of those, then put it back.
+#     See: both go through, with no refusal beside the button. A row known only
+#     from its log files names no workflow, so there is nothing that could still be
+#     open to ask about; and putting a run BACK is never refused whether Temporal
+#     is up or down, because un-archiving hides nothing, and the day Temporal is
+#     down is the day the owner is most likely to be tidying up. `cannot confirm
+#     the workflow is closed; is Temporal up?` on an unarchive is the one-way gate
+#     having been made to swing both ways, and it locks the owner out of undoing
+#     their own click.
+#     See, and do not report it: the run you archived by its workflow id further up
+#     is not on this rail at all and the header count has dropped to match. Those
+#     rows come from Temporal and Temporal is stopped. The id is still in
+#     `runs/.archived.json` and the row comes back archived when Temporal does.
+#     Start Temporal again before the last check.
 #     Finally, with every run on the rail archived, reload the page.
 #     See: an empty rail, `select a run`, and `archived (N)` in the header saying
 #     where they went. Tick the toggle and the top run selects itself within four
 #     seconds. A rail that fills up and stays unselected is the load-time fallback
 #     skipping archived rows the toggle is showing.
+#
+# 16. The tab, which is the only thing on this page written for a reader who is
+#     looking at something else. Read it off the pair item 4 served, so start that
+#     server from `.venv/bin/python -i -c '…'` rather than `-c` alone: the `-i`
+#     leaves `feed` in your hands at a prompt, and this item and item 20 both need
+#     to change what the server is saying while the page is open.
+#     See, with one run waiting: the tab reads `(1) loopgraph`. The count is FIRST,
+#     which is the whole point — a background tab is cut to a couple of centimetres
+#     and `loopgraph (1)` would be cut to `loopgra…`. Beside it the tab's icon is a
+#     dot in the waiting pill's own blue, the same blue as the row in the rail. The
+#     closed run holding a stale `awaiting` is not in that count and never will be.
+#     Now put a second waiting run on the rail: at the prompt,
+#     `feed.rows.append(dict(feed.rows[0], id='run-two-cccccc', dir='two'))`.
+#     See, within four seconds: `(2) loopgraph`, and the dot unchanged — it says
+#     whether anything wants the reader, never how much.
+#     Now answer that one: `feed.rows[1]['state'] = 'running'`.
+#     See, within four seconds: `(1) loopgraph`. Then answer the first as well,
+#     `feed.rows[0]['state'] = 'running'` and `del feed.ledgers[id]['awaiting']`.
+#     See: the tab reads `loopgraph` with no brackets at all and the dot has gone
+#     dim gray. Brackets round a zero — `(0) loopgraph` — is a count being printed
+#     rather than asked about.
+#     A run the owner has archived is left out of that count too, and there is no
+#     way to put one on screen to look at: the dashboard refuses to archive a run
+#     that is still open, and a waiting run is an open one. That guard is checked
+#     from the other side, in item 15.
+#     Then read the Network panel from the moment the page loaded.
+#     See: no request for `/favicon.ico`, and no 404 for one. The icon is a data
+#     URI inside the document's own `<link>`, so a request for that path means the
+#     browser stopped finding the link and went looking for the default — a 404 in
+#     the console on every single load, under a tab showing no dot at all.
+#     Nothing above needs a real run, which is why the tab is checked here rather
+#     than on the day one happens to be waiting.
+#
+# 17. Open a round the supervisor sent back — a `redo` or an `escalated` round
+#     carries the most reasons and the longest. If there is none on this machine,
+#     serve a ledger whose round has `verdict_reasons` holding six or eight
+#     strings, two of them long enough to wrap, and one holding a path with no
+#     spaces anywhere in it to break on:
+#     `runs/2026-09-01-thing/worktrees/lg-thing-aa/src/a/long/module_name.py`.
+#     See: one reason to a line, each starting hard against the left edge of the
+#     card, and every line a reason WRAPPED onto sitting a couple of characters in
+#     from that edge. Read straight down the left: the reasons make one column and
+#     their continuations a second column beside it, so eight reasons read as eight
+#     things. One column, with everything flush left, is the hanging indent gone —
+#     and then a wrapped line looks exactly like the next reason beginning, which
+#     is the whole reason these stopped being one string with newlines in it.
+#     See: the lines stop about 80 characters in — a little over half the width of
+#     the card at 1440px — with a ragged right edge and a good deal of empty card
+#     to the right of them. Reasons running the card's full width, about 150
+#     characters a line, is the 80ch cap gone.
+#     See: a reason is the same size as the words under FILES and DIRECTIVE on the
+#     same card. Reasons set smaller or larger than their neighbours is the row
+#     rule and the field rule having drifted apart. They say the same thing in two
+#     places on purpose, and nothing but an eye ever compares them.
+#     See: the long path breaks inside the card, and the card's right border is
+#     still a straight line down the board. A path running out past the border, or
+#     a horizontal scrollbar appearing at the foot of the board, is the break rule
+#     gone from the reason row.
+#     Then open a round with no reasons at all — one the supervisor accepted first
+#     time, or one still in progress.
+#     See: no REASONS heading, and no empty box under it. A heading over nothing is
+#     that field's own hide, which cannot go through patchField — its last child is
+#     the box of rows, and one setText on it would wipe every reason — so it is
+#     written out by hand in patchRoundCard, where it is the one that can be
+#     forgotten.
+#
+# 18. Read a whole board of rounds without opening anything.
+#     See: every round is a box — the panel's lighter background, a hairline border
+#     and rounded corners, the same box the awaiting block wears minus its blue
+#     left edge — with a clear gap between one card and the next. Cards with no
+#     edge is the boundary gone, and a column of twelve of them then runs together
+#     with nothing but whitespace saying where one round stops.
+#     See: a closed card is ONE line, and it reads
+#     `ITEM 2 · ROUND 3 · ACCEPT · 4 FILES`. Uppercase on screen: the summary wears
+#     the card heading's own style, and the words the page writes in lowercase
+#     reach the reader shouting. That is the stylesheet, not a bug to report.
+#     Now LOOK at the dots between the pieces. They are a `::before` in the
+#     stylesheet, not a character in any string the page writes, so a board
+#     rendering `ITEM 2 · ROUND 3ACCEPT4 FILES` reads back through `textContent`
+#     and `innerText` exactly as it does when it is right — generated content is in
+#     neither of them. That is one of the four defects at the top of this block,
+#     161 tests were green over it, and a scripted browser would have passed it
+#     too. This check is your eyes or it is nothing.
+#     See: a round whose supervisor is still out reads
+#     `ITEM 1 · ROUND 2 · AUDIT RUNNING · 3 FILES` — that phrase, and NOT
+#     `· IN PROGRESS` as well, which is the same news twice on the one line the
+#     whole collapse exists to keep short.
+#     See: a round the executor is still inside — a log file growing with no ledger
+#     row behind it yet — reads `ITEM 1 · ROUND 2 · IN PROGRESS`, with no verdict
+#     word and no file count after it. `0 FILES` there is a measurement of work
+#     that has not happened.
+#     Neither of those two is likely to be on the board when you look. For the
+#     first, serve a ledger whose newest round carries `"status": "green"` and no
+#     `verdict` key at all; that is the whole fixture, and it does not need the run
+#     to be open. For the second it does: put a file called `r9-executor.log` in a
+#     run directory whose served ledger has no round 9 in it, and give that run's
+#     row a `start_time` and no `close_time`. A card only claims to be in progress
+#     on a run that is still open, which is the whole reason a finished run's
+#     unrecorded rounds do not all read as running.
+#     See, last: the newest card on the board is open and every card below it is
+#     shut. Two open cards on a board you have only just loaded is the open flag
+#     being decided somewhere other than where the card is made.
+#
+# 19. The verdict colours, which want one round of each kind on one board: serve a
+#     ledger with four rounds carrying `accept`, `redo`, `escalated`, and a word
+#     this page has never met — `deferred` will do.
+#     See, with every card shut: ACCEPT green, REDO yellow, ESCALATED red, and each
+#     of them the only thing on its own summary line that is not dim gray. That is
+#     what makes the column readable at a glance: the labels recede and the three
+#     verdicts stand out of them.
+#     See: DEFERRED is dim like the rest of its line and still has all eight of its
+#     letters. A word that lost its text is a colour map being asked to supply the
+#     word as well as the colour, which is the one thing it must never do — the
+#     engine can grow a verdict tomorrow and this page has to print it.
+#     Now open all four.
+#     See: the verdict line inside each card is the SAME colour as that round's
+#     word in its own summary — green over green, yellow over yellow, red over red.
+#     It is lowercase there and uppercase in the summary; that is the stylesheet,
+#     not a disagreement. DEFERRED is the exception and is meant to be: dim in the
+#     summary, the board's neutral blue on the open card, because neither of those
+#     is a meaning.
+#     A green summary over a blue verdict line is the cascade, not the JavaScript.
+#     Both elements are handed the same class; the colour rules name
+#     `.round .verdict` in front of them precisely so the card's own accent-blue
+#     rule cannot outrank them. Drop that prefix and the summaries go coloured
+#     while the open cards all stay blue — one round reading two colours — with
+#     every check in this file green over it.
+#     See: `AUDIT RUNNING` takes the yellow too, in both places.
+#
+# 20. What a poll is allowed to do to a board the reader has arranged. This wants a
+#     new round arriving while you watch, so either sit on a run that is actually
+#     working, or keep the hand-written feed in hand as item 16 does and append a
+#     round to `feed.ledgers[id]['rounds']` at the prompt when you are ready.
+#     Before it lands: open two of the older cards, shut the newest one, and leave
+#     a log pane open inside one of the two you opened.
+#     See, when the new round arrives: its card is on top and open, and every card
+#     under it is exactly as you left it — the two you opened still open, the one
+#     you shut still shut, the log pane still open and still scrolled where it was.
+#     A card that flips on a poll is a poll writing `.open`, which no patch function
+#     on this page may do: which card opens is decided once, when the card is made,
+#     and asking the question again every two seconds shuts the card the reader
+#     opened two seconds ago.
+#     See, and do not report it: watch one run through a dozen rounds in one tab and
+#     you end with a dozen open cards, because nothing ever closes one for you.
+#     Reload and all but the newest fold up. That is what never taking a card away
+#     from the reader costs, and it is the side of the trade to be on.
+#
+# 21. Size the browser window to 1440px wide, open a round's executor log and leave
+#     the supervisor pane beside it shut.
+#     See: the open pane takes nearly the whole row and the shut one has narrowed
+#     to the width of its own label. Hover the open pane in the Elements panel and
+#     read the size the browser draws over it: at least 900px — 914 or 930
+#     depending which of the two labels is the one that closed — against the 516 it
+#     had when both panes split the row down the middle. A pane still sitting at
+#     half the row with its neighbour shut is the shrink rule gone, and the reader
+#     is back to reading a log through a letterbox with an empty box beside it.
+#     Now open the second pane as well, then shut them both.
+#     See: equal halves both times. Two open panes share the row, and so do two
+#     shut ones — with neither of them open there is nothing for the rule to fire
+#     on, and a row of two labels should not be lopsided.
+#     Then scroll to the diff pane at the foot of the board and open it.
+#     See: the full width of the board, as it always did. The diff is a `.panel`
+#     too, but it sits alone with no sibling to take room from; a diff pane
+#     narrowed to its own label is that rule reaching past the two-pane row it was
+#     written for.
+#     Finally drag the window narrower than 900px.
+#     See: the two panes stack one above the other and BOTH fill the width. Stacked
+#     panes at the width of their own labels — a ragged column of little boxes down
+#     the left of the board — is the stacked layout having lost its stretch, which
+#     is a separate rule from the one you just watched work across the row.
+#
+# 22. Pick the longest run on the rail and scroll its board to the very bottom.
+#     See: the strip is still there across the top of the board with the run's
+#     directory name, its pill and its duration, and the round cards pass UNDER it
+#     — watch a card's top edge disappear behind the strip's bottom border rather
+#     than stopping at it.
+#     See, while you scroll: the strip's top edge is flush with the top of the
+#     board and there is no band of board above it. A 16px band with card text
+#     sliding through it is the board's top padding back. A sticky offset is
+#     measured from the scroll container's PADDING box, so padding up there holds
+#     the strip that far down and leaves a gap the strip cannot cover — which is
+#     one of the four defects at the top of this block, and every check in this
+#     file was green over it. Text showing THROUGH the strip is its background
+#     having gone see-through: sticky leaves the element in the flow, so it needs
+#     an opaque background of its own or it is two lines of text in one place.
+#     See: on a run that is still going the duration counts up in the strip, and
+#     the line does not shuffle sideways as the digits change.
+#     Now click a run whose rail pill reads `unknown` and whose detail reads
+#     `logs only`.
+#     See: the strip carries the directory name and the `archive` button and
+#     nothing between them — no pill, no duration — above the line `no workflow for
+#     this run`. A pill up there is the page inventing a status for a run it knows
+#     nothing about. The button belongs there: a directory of log files is a row
+#     the owner can hide like any other, and it is the only archive the dashboard
+#     will do without asking Temporal anything.
+#     Then serve a run that has times and a ledger the page cannot get:
+#     `FakeFeed(rows=[ui.run_entry(id, 'running', start, None, None)], ledgers={})`,
+#     which is what a failing ledger query looks like on a run Temporal knows
+#     perfectly well — it happens on 7 of the 15 histories on this machine.
+#     See: the strip keeps the name, the pill AND the duration, and the line under
+#     it reads `ledger did not answer this poll; the run is still there`. NOT `no
+#     workflow for this run`, which denies the run named an inch above it and is
+#     item 4's failure with the two halves closer together than they have ever been.
+#     Finally serve nothing at all — an empty runs directory and no feed:
+#     `ui.make_server(8410, Path(tempfile.mkdtemp()), temporal_addr=None,
+#     feed=None)`.
+#     See: an empty rail, `select a run` on the board, and `temporal unreachable —
+#     logs only` in the header. Watch it for another 10 seconds. `server error`
+#     appearing on any poll is the strip's own guard gone: nothing is selected and
+#     no board was ever built, and a throw from the strip lands in the catch that
+#     writes that word — every 4 seconds, for ever, over a server answering every
+#     request it gets.
 
 DECLARED = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")
 
