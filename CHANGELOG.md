@@ -88,6 +88,9 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   the same project keeps its worktree and goes on running, and no branch is deleted
   anywhere — the work is still there to look at. A worktree whose repository has
   moved off this machine is named in a line saying so, and stops nothing else.
+- Documented `ANTHROPIC_DEFAULT_HAIKU_MODEL` for people whose proxy serves no
+  Claude models. Nothing in the engine changed; headless runs only ever ask for
+  `ANTHROPIC_MODEL`, so this is the escape hatch if one ever asks for more.
 
 ## 0.2.0 - 2026-09-07
 
