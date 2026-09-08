@@ -91,6 +91,23 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 - Documented `ANTHROPIC_DEFAULT_HAIKU_MODEL` for people whose proxy serves no
   Claude models. Nothing in the engine changed; headless runs only ever ask for
   `ANTHROPIC_MODEL`, so this is the escape hatch if one ever asks for more.
+- **Fixed: the example scope gate passed everything.** `runs/example-hello/check-write-set.sh`
+  is the file the README and the skill both tell you to copy when you want a run kept
+  inside its write set. It said `#!/bin/sh` while using `read -d`, which only bash has,
+  so under the worker container's shell its loop died on the first line, the check never
+  ran, and it printed `write set in scope` and passed whatever had changed. Every run
+  built from it had a scope gate that could not fail, and read green in the ledger for
+  it. The engine's own learning edge had found this five times over and written it into
+  a constraints file; nothing acted on it, because a constraint is advice to one run.
+  The script now says `#!/bin/bash`, and the suite fails if that line ever changes back.
+- The skill and the README now tell you to prove a gate can go **red** before you trust
+  it, rather than only that it exits 0. A gate that cannot fail reads exactly like a
+  gate that passed, in your terminal and in the ledger both, which is how the one above
+  survived. They also warn that `lg start` follows the run instead of exiting, so a
+  backgrounded one that has not printed yet looks just like a failure and a second go
+  gives you two runs on one repository; and that `lg ui` binds to Temporal once when it
+  starts, so a dashboard opened before Temporal shows every run as `unknown` until you
+  restart it.
 
 ## 0.2.0 - 2026-09-07
 

@@ -106,6 +106,9 @@ after installing.) The run dir already exists. Skip to step 2 with
 
   Add a scope gate whenever the write set is enumerable: copy
   `runs/example-hello/check-write-set.sh` and edit the filenames in its `case`.
+  Keep its `#!/bin/bash`. The worker container's `/bin/sh` is dash, `read -d` is
+  a bash extension, and under dash that script's loop dies on its first line and
+  the gate exits 0 whatever changed.
 
   Traps worth knowing: Next.js 16 and later have no `next lint`; npm gates in a
   fresh worktree need `npm ci --prefer-offline --no-audit --silent &&` in front,
@@ -131,6 +134,16 @@ after installing.) The run dir already exists. Skip to step 2 with
   If one fails on the clean tree, the project is already broken: report that
   instead of starting a run.
 
+  **Exit 0 is half the proof. Make every gate go RED before you trust it.** A
+  gate that cannot fail reads exactly like a gate that passed, in your terminal
+  and in the ledger both, and it is the one defect this whole step exists to
+  catch. So for each gate, break the thing it guards and watch it fail: put a
+  file outside the write set in the tree for a scope gate, and confirm the gate
+  names that file and exits non-zero; break a test for a test gate. Then undo it
+  and confirm green again. Three directions, and skipping the red one has
+  already shipped a scope gate that was vacuously green for every run on this
+  machine, because `read -d` no-ops under dash and the loop never ran.
+
   **Prove them on tracked files only, in the container.** A run works in a fresh
   worktree, which holds what git tracks and nothing else. Your checkout also holds
   `node_modules`, a `.venv`, a config file you never committed, and any of them can
@@ -151,8 +164,30 @@ after installing.) The run dir already exists. Skip to step 2 with
 ```bash
 cd <engine_root>
 lg start runs/<slug> /projects/<repo-name>
-# prints a workflow id like run-<slug>-ab12cd
+# prints a workflow id like run-<slug>-ab12cd, then FOLLOWS the run and does not return
 ```
+
+**`lg start` does not exit when the run has started.** It prints the workflow id
+and then stays attached for the life of the run. So run it in the background and
+read the id out of its log, or give it a `timeout` and let that kill it — the
+workflow lives in Temporal and the worker executes it, so nothing stops when the
+client goes away.
+
+**Never run it twice.** There is no "already running" guard: a second `lg start`
+on the same run dir starts a second workflow, and then two executors work the same
+brief in two worktrees and both write to the same `logs/` filenames, because a log
+is named `i1-r1-executor.log` with no workflow id in it. A backgrounded first
+attempt whose output has not flushed yet looks exactly like one that failed —
+that is the trap, and it costs a whole duplicate run. Before starting a second
+time, check what is actually open:
+
+```bash
+<docker> compose exec -T temporal tctl --address temporal:7233 workflow list --open
+```
+
+If you do end up with two, `lg` has no stop command; terminate the one you do not
+want by id with `tctl ... workflow terminate --workflow_id <id> --reason <why>`,
+and leave its worktree registration alone (see the prune warning in Don'ts).
 
 Open both dashboards as soon as it starts, because that is where the user watches
 a run, not in your transcript:
@@ -162,6 +197,13 @@ curl -s -m 2 -o /dev/null localhost:8400 || (nohup lg ui > /tmp/lg-ui.log 2>&1 &
 xdg-open http://localhost:8400
 xdg-open http://localhost:8233/namespaces/default/workflows    # the new run is the top row
 ```
+
+**Start the dashboard after Temporal, never before.** `lg ui` binds its Temporal
+connection once, at startup. Start it while Temporal is down and it serves every
+run as `unknown` with `logs only` beside it, for the whole life of the process,
+including runs that start later and are plainly running. It looks like a rail
+that has lost its data. Restart the dashboard and the states come back. If you
+brought the stack up yourself, bring `lg ui` up last.
 
 On a headless or SSH session skip `xdg-open` and give the two URLs in your reply.
 

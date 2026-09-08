@@ -1,6 +1,14 @@
-#!/bin/sh
+#!/bin/bash
 # Scope gate: fail if anything outside the declared write set changed.
 # Copy this for your own runs and edit the two names in the case statement.
+#
+# bash, not sh, and that is load-bearing. `read -d` is a bash extension. Under
+# the worker container's /bin/sh (dash) the loop dies on its first line with
+# "read: Illegal option -d", the body never runs, and the gate prints
+# "write set in scope" and exits 0 no matter what changed. A scope gate that
+# cannot go red is worse than none: it reads green in the ledger while an
+# executor writes anywhere it likes. Five separate rounds rediscovered this and
+# wrote it into a constraints file; nobody changed the shebang.
 #
 # -z and the read loop are not decoration: iterating `$(git status --porcelain)`
 # word-splits on whitespace, so one filename with a space in it became fragments

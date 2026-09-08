@@ -299,7 +299,13 @@ your repos are under `/projects`. Every gate needs a timeout.
 
 The scope gate is worth the two minutes. It fails the round if anything outside
 the declared write set changed, which is how you keep a "small fix" from touching
-nine files. Copy `runs/example-hello/check-write-set.sh` and edit the names in it.
+nine files. Copy `runs/example-hello/check-write-set.sh` and edit the names in it,
+and keep its `#!/bin/bash`: the worker container's `/bin/sh` is dash, `read -d` is
+a bash extension, and under dash the script exits 0 whatever changed.
+
+Prove a gate can go **red** before you trust it, not only that it exits 0. Put a
+file outside the write set in the tree and check the gate names it and fails.
+A gate that cannot fail reads exactly like a gate that passed.
 
 **`constraints.md`** — start it empty. The engine appends what it learns between
 rounds, so round three does not repeat round one's mistake.
