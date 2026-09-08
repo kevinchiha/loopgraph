@@ -8,12 +8,15 @@ past LOG_CAP, so a long run cannot grow a log without limit.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
 from temporalio import activity
 
 LOG_CAP = 1_000_000  # bytes per log file
+STREAM_HEARTBEAT_SECONDS = 30
 
 # One source of truth for a run's log filenames. Three places used to hardcode the
 # shape: the writers here, `lg tail`'s glob, and the dashboard's regex. When the
@@ -56,19 +59,32 @@ async def stream_query(prompt: str, options, log_path: str) -> str:
     from claude_agent_sdk import (AssistantMessage, TextBlock, ToolResultBlock,
                                   ToolUseBlock, query)
 
+    async def keep_activity_alive() -> None:
+        # Model reasoning can produce no stream messages for longer than Temporal's
+        # heartbeat timeout. Keep durability independent of model output cadence.
+        while True:
+            activity.heartbeat("claude waiting")
+            await asyncio.sleep(STREAM_HEARTBEAT_SECONDS)
+
     chunks: list[str] = []
-    async for msg in query(prompt=prompt, options=options):
-        activity.heartbeat("claude streaming")
-        content = getattr(msg, "content", None)
-        if not content:
-            continue
-        for b in content:
-            if isinstance(b, TextBlock):
-                chunks.append(b.text)
-                for line in b.text.splitlines():
-                    append_log(log_path, f"[{_ts()} assistant] {line}")
-            elif isinstance(b, ToolUseBlock):
-                append_log(log_path, f"[{_ts()} tool:{b.name}] {summarize_tool(b.name, b.input)}")
-            elif isinstance(b, ToolResultBlock):
-                append_log(log_path, f"[{_ts()} result] {str(b.content)[:200]}")
+    heartbeat_task = asyncio.create_task(keep_activity_alive())
+    try:
+        async for msg in query(prompt=prompt, options=options):
+            activity.heartbeat("claude streaming")
+            content = getattr(msg, "content", None)
+            if not content:
+                continue
+            for b in content:
+                if isinstance(b, TextBlock):
+                    chunks.append(b.text)
+                    for line in b.text.splitlines():
+                        append_log(log_path, f"[{_ts()} assistant] {line}")
+                elif isinstance(b, ToolUseBlock):
+                    append_log(log_path, f"[{_ts()} tool:{b.name}] {summarize_tool(b.name, b.input)}")
+                elif isinstance(b, ToolResultBlock):
+                    append_log(log_path, f"[{_ts()} result] {str(b.content)[:200]}")
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
     return "\n".join(chunks)
