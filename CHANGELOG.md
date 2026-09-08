@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-08
+
 - The dashboard says `waiting` on a run that is blocked on you, in the left rail and
   on the board, where it used to say `running`. `running` is also what it says while
   an executor works, which is most of a run's life, so the one run you had to answer
