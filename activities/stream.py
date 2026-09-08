@@ -85,6 +85,10 @@ async def stream_query(prompt: str, options, log_path: str) -> str:
                     append_log(log_path, f"[{_ts()} result] {str(b.content)[:200]}")
     finally:
         heartbeat_task.cancel()
-        with suppress(asyncio.CancelledError):
+        # Swallow whatever the pinger ended with, not just the cancellation. If it
+        # died on its own the query is already failing or about to, and that is the
+        # exception worth raising; re-raising the pinger's here would replace the
+        # diagnosis with a note about the thing watching the clock.
+        with suppress(asyncio.CancelledError, Exception):
             await heartbeat_task
     return "\n".join(chunks)

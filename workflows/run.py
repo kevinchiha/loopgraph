@@ -105,9 +105,11 @@ def audit_failure_reason(e: BaseException) -> str:
 
     ActivityError's own message is "Activity task failed" and says nothing; what
     actually happened is on `__cause__`. For a timeout that is the deadline's
-    name, and the name is the whole diagnosis. HEARTBEAT means the model session
-    went quiet, because `stream_query` pings on every streamed message and only
-    silence stops them. START_TO_CLOSE means the opposite: the auditor streamed
+    name, and the name is the whole diagnosis. HEARTBEAT means the pings
+    themselves stopped. `stream_query` now pings every 30 seconds for the whole
+    call whatever the model is doing, so a model reasoning in silence no longer
+    trips this one; what does is the worker going away, or its event loop held
+    by something synchronous. START_TO_CLOSE is the other one: the auditor ran
     the entire half hour and never closed with a verdict packet. Opposite bugs
     wanting opposite fixes, so the string has to say which one happened.
     """

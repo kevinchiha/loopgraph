@@ -9,10 +9,11 @@ Temporal still answers for a closed workflow — went on returning `running` for
 run that had been dead for half an hour, and no card ever reached the owner.
 
 Which deadline blew is the whole diagnosis, so the reason has to name it. A
-HEARTBEAT timeout means the model session went quiet: `stream_query` heartbeats
-on every streamed message, so silence is the only thing that stops the pings.
-START_TO_CLOSE means the opposite — the auditor talked the entire time and never
-closed with a verdict packet. Those want different fixes.
+HEARTBEAT timeout means the pings stopped: `stream_query` heartbeats every 30
+seconds for the whole call, so a silent model no longer stops them and what is
+left is the worker dying or its loop blocking. START_TO_CLOSE is the other one:
+the auditor ran the entire time and never closed with a verdict packet. Those
+want different fixes.
 """
 
 from __future__ import annotations

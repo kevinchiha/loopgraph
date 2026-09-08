@@ -6,6 +6,17 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- A round is no longer killed for thinking. The executor and the supervisor tell
+  Temporal they are still alive every 30 seconds for as long as a model call runs,
+  where before the only thing that said so was the model producing output. More
+  than three minutes of quiet reasoning blew the heartbeat deadline, so the round
+  was killed, retried, killed again, and half an hour of finished implementation
+  went with it each time, with nothing wrong with the work. The trade: a session
+  that is genuinely stuck now runs to its outer limit, two hours for an executor
+  round and half an hour for an audit, instead of dying in three minutes. And
+  `HEARTBEAT` in a park reason has stopped meaning a quiet model. It now means the
+  worker itself went away.
+
 ## 0.3.0 - 2026-09-08
 
 - The dashboard says `waiting` on a run that is blocked on you, in the left rail and
