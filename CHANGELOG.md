@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-08
+
 - A round is no longer killed for thinking. The executor and the supervisor tell
   Temporal they are still alive every 30 seconds for as long as a model call runs,
   where before the only thing that said so was the model producing output. More
