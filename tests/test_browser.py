@@ -27,6 +27,7 @@ import importlib.util
 import inspect
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -51,6 +52,7 @@ from activities.browser import (DEFAULT_BROWSER_PORT, BrowserAttach, BrowserConf
                                 release_port, shots_dir, start_serve)
 from activities.execute_round import (NO_TELEGRAM, PROMPTS, assemble_prompt,
                                       execute_round, run_executor)
+from envfile import parse_env
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1912,6 +1914,141 @@ def test_the_command_reaches_the_connection_with_a_listener(lg, monkeypatch, mac
     with pytest.raises(AssertionError, match="connected to Temporal"):
         run_start(lg, monkeypatch, machine, f"LOOPGRAPH_BROWSER_PORT={listener}\n")
 
+
+# ---------- the switch in .env and the installer's question ----------
+#
+# AC-20. The browser is opt-in, so somebody has to turn it on, and the two
+# places they look are .env.example and the installer's questions. Reading
+# install.sh as text proves the question is there and proves nothing about the
+# answer: a membership test that reads `browser,gpu` as off, or a scripted
+# re-run that switches the browser off without being asked, are both green to a
+# grep. So the rows below cut section 2 out of the shipped file and run it, the
+# way tests/test_version.py runs section 6.
+
+ENV_EXAMPLE = (ROOT / ".env.example").read_text()
+INSTALL = (ROOT / "install.sh").read_text()
+BROWSER_QUESTION = "Enable the browser? (y/n)"
+
+
+def test_env_example_documents_the_switch_and_the_port_as_comments():
+    """Both lines ship commented out: the browser is opt-in and the port has a
+    default. That also keeps them out of parse_env, so `lg update` tells nobody
+    upgrading that there are new settings to add -- the changelog is where
+    people hear about the switch."""
+    assert "# COMPOSE_PROFILES=browser" in ENV_EXAMPLE
+    assert f"# LOOPGRAPH_BROWSER_PORT={DEFAULT_BROWSER_PORT}" in ENV_EXAMPLE
+    settings = parse_env(ENV_EXAMPLE)
+    assert "COMPOSE_PROFILES" not in settings
+    assert "LOOPGRAPH_BROWSER_PORT" not in settings
+
+
+def test_install_sh_asks_once_and_writes_the_profile_line():
+    """One question, and the line it builds lands in the heredoc that writes
+    .env. A question whose answer is computed and never written is the shape
+    this would fail in."""
+    assert INSTALL.count(BROWSER_QUESTION) == 1
+    heredoc = INSTALL.split('cat > "$ROOT/.env" <<EOF')[1].split("\nEOF\n")[0]
+    assert "$BROWSER_LINE" in heredoc
+
+
+def test_the_install_headers_the_version_test_splits_on_are_intact():
+    """tests/test_version.py finds section 6 by these two strings. Renumbering
+    or rewording either breaks that test rather than the script, and the break
+    reads as a skill-link bug."""
+    assert INSTALL.count("6. skill ---") == 1
+    assert INSTALL.count("7. up ----") == 1
+    assert INSTALL.split("6. skill ---")[1].split("7. up ----")[0].strip()
+
+
+def _install_questions_step(root, home, answer=None):
+    """Section 2 of install.sh, run for real; the COMPOSE_PROFILES line it built.
+
+    The section is cut out of the shipped file rather than retyped, so what runs
+    here is the shell a user downloads, under the flags install.sh sets on
+    itself. What it leans on from the rest of the script is stubbed above it:
+    the printer, the two prompts and the two paths. `answer` is what the person
+    types at the browser question, and None is the Enter that takes the default
+    -- which is also what --yes and a non-tty take.
+    """
+    body = INSTALL.split("2. questions ---")[1].split("3. telegram ---")[0]
+    typed = ("" if answer is None else
+             f"  {shlex.quote(BROWSER_QUESTION)}) printf '%s' {shlex.quote(answer)} ;;\n")
+    script = (
+        # The flags install.sh sets on itself: a section that survives a laxer
+        # shell than the user's proves nothing about the user's install.
+        "set -euo pipefail\n"
+        "YES=1\n"
+        f"ROOT={shlex.quote(str(root))}\n"
+        f"HOME={shlex.quote(str(home))}\n"
+        "say() { printf '%s\\n' \"$*\"; }\n"
+        "ask_secret() { printf '%s' \"$2\"; }\n"
+        "ask() { case \"$1\" in\n"
+        f"{typed}"
+        "  *) printf '%s' \"$2\" ;;\n"
+        "esac; }\n"
+        # The cut ends mid-way through the next header's dashes, so the line
+        # that reports the answer needs a newline in front of it or it lands
+        # inside that comment and never runs.
+        + body
+        + "\nprintf '%s\\n' \"$BROWSER_LINE\"\n")
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert done.stderr == "", done.stderr
+    assert done.returncode == 0
+    return done.stdout.splitlines()[-1]
+
+
+@pytest.fixture
+def installing(tmp_path):
+    """A checkout the questions read .env out of, and an empty home they are
+    allowed to make a projects directory under."""
+    root, home = tmp_path / "engine", tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    return root, home
+
+
+def test_a_fresh_install_defaults_the_browser_to_off(installing):
+    """No .env, so no previous answer, and the question defaults to n. Nothing
+    is built, and the written .env gets an empty line where the key would go."""
+    root, home = installing
+    assert _install_questions_step(root, home) == ""
+
+
+def test_answering_yes_on_a_fresh_install_writes_the_browser_profile(installing):
+    root, home = installing
+    assert _install_questions_step(root, home, "y") == "COMPOSE_PROFILES=browser"
+
+
+def test_yes_adds_browser_to_an_existing_profile_list(installing):
+    """COMPOSE_PROFILES is a comma-separated list and only `browser` is ours."""
+    root, home = installing
+    (root / ".env").write_text("COMPOSE_PROFILES=other\n", encoding="utf-8")
+    assert _install_questions_step(root, home, "y") == "COMPOSE_PROFILES=other,browser"
+
+
+def test_no_keeps_the_other_profiles_and_drops_browser(installing):
+    """The other half of the same rule: saying no takes `browser` out and
+    leaves everything the person runs of their own where it was."""
+    root, home = installing
+    (root / ".env").write_text("COMPOSE_PROFILES=other,browser\n", encoding="utf-8")
+    assert _install_questions_step(root, home, "n") == "COMPOSE_PROFILES=other"
+    (root / ".env").write_text("COMPOSE_PROFILES=other\n", encoding="utf-8")
+    assert _install_questions_step(root, home, "n") == "COMPOSE_PROFILES=other"
+    # Nothing left to write once `browser` goes: no key, an empty line in .env.
+    (root / ".env").write_text("COMPOSE_PROFILES=browser\n", encoding="utf-8")
+    assert _install_questions_step(root, home, "n") == ""
+
+
+def test_the_default_keeps_the_previous_answer(installing):
+    """What --yes and a non-tty take. `browser` is looked for as an entry of the
+    list and not compared to the whole value: a plain equality read
+    `other,browser` as off, and a scripted re-run then switched the browser off
+    and dropped the other profile with it."""
+    root, home = installing
+    (root / ".env").write_text("COMPOSE_PROFILES=browser\n", encoding="utf-8")
+    assert _install_questions_step(root, home) == "COMPOSE_PROFILES=browser"
+    (root / ".env").write_text("COMPOSE_PROFILES=other,browser\n", encoding="utf-8")
+    assert _install_questions_step(root, home) == "COMPOSE_PROFILES=other,browser"
 
 
 # ---------- the browser-container checklist ----------

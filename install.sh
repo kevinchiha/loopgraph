@@ -111,6 +111,33 @@ else
 ANTHROPIC_AUTH_TOKEN=$TOK"
 fi
 
+say "Browser (optional)"
+cat <<'TXT'
+A run that declares a web app in browser.yaml gets a real Chromium: the executor
+drives it while it works, the engine screenshots the declared pages, and the
+auditor looks at both. It is a separate container of about 1.5GB, so it is off
+unless you say yes. Change your mind later by editing COMPOSE_PROFILES in .env.
+TXT
+# COMPOSE_PROFILES is a comma-separated list. Only `browser` is ours; whatever
+# else is in it stays, whichever way the question goes.
+PREV_PROFILES="$(old_env COMPOSE_PROFILES)"
+PREV_BROWSER=n
+case ",$PREV_PROFILES," in *,browser,*) PREV_BROWSER=y ;; esac
+OTHER_PROFILES=""
+_rest="$PREV_PROFILES,"
+while [ -n "$_rest" ]; do
+  _p="${_rest%%,*}"; _rest="${_rest#*,}"
+  if [ -n "$_p" ] && [ "$_p" != browser ]; then
+    OTHER_PROFILES="${OTHER_PROFILES:+$OTHER_PROFILES,}$_p"
+  fi
+done
+PROFILES="$OTHER_PROFILES"
+case "$(ask "Enable the browser? (y/n)" "$PREV_BROWSER")" in
+  y|Y|yes|YES) PROFILES="${OTHER_PROFILES:+$OTHER_PROFILES,}browser" ;;
+esac
+BROWSER_LINE=""
+if [ -n "$PROFILES" ]; then BROWSER_LINE="COMPOSE_PROFILES=$PROFILES"; fi
+
 # -------------------------------------------------------------- 3. telegram ---
 TELEGRAM_ENV="$HOME/.config/loopgraph-telegram.env"
 HAVE_TELEGRAM=0
@@ -218,6 +245,7 @@ LOOPGRAPH_PROJECTS_DIR=$PROJECTS
 LOOPGRAPH_NPM_CACHE=$HOME/.npm
 LOOPGRAPH_UID=$(id -u)
 LOOPGRAPH_DOCKER=$DOCKER
+$BROWSER_LINE
 
 LOOPGRAPH_TELEGRAM_ENV=$TELEGRAM_ENV
 LOOPGRAPH_TELEGRAM_BOT=$BOT_NAME
