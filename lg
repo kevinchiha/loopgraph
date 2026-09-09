@@ -765,6 +765,45 @@ async def _restart_stack(root: str, docker: str, action: str, tag: str) -> int:
     return 1
 
 
+def relink_skill(root: str, home: str) -> str | None:
+    """Point this home's `~/.claude/skills/loopgraph` at this checkout's skill.
+
+    install.sh makes that path a symlink, and a symlink needs nothing from an
+    update: the merge rewrites SKILL.md under it and the agent reads the new one
+    on its next session. This is here for every machine that is anything else —
+    a link left behind by a clone that has since moved, or one nobody ever made
+    — because those go stale silently and stay stale through every update.
+
+    A real directory is the one case that is left alone. It is a copy somebody
+    made, possibly with their own edits in it, and deleting a user's writing to
+    fix a link is a trade nobody agreed to; the returned line says what to
+    remove instead. `home` is an argument rather than read from the environment
+    so a test can be given one under tmp_path.
+
+    Returns the line to print, or None when there was nothing to do.
+    """
+    src = os.path.join(root, "skills", "loopgraph")
+    if not os.path.isdir(src):
+        return None
+    dst = os.path.join(home, ".claude", "skills", "loopgraph")
+    # islink before exists, in that order: a link whose target is gone answers
+    # False to exists, and reading it as "nothing is there" would try to create
+    # a symlink on top of one and raise FileExistsError.
+    if os.path.islink(dst):
+        if os.path.realpath(dst) == os.path.realpath(src):
+            return None
+        os.remove(dst)
+        verb = "re-pointed"
+    elif os.path.exists(dst):
+        return (f"{dst} is a copy, not a link to {src}\n"
+                "  it did not follow this update; remove it and run lg update again")
+    else:
+        verb = "linked"
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.symlink(src, dst)
+    return f"{verb} {dst} -> {src}\n  restart your agent session to pick up the skill"
+
+
 async def cmd_update(args: argparse.Namespace) -> int:
     """Move a clean main to the newest release origin has.
 
@@ -854,6 +893,13 @@ async def cmd_update(args: argparse.Namespace) -> int:
     print(f"updated {old} → {tag}")
     notes = version.changelog_between(_changelog(root), old_tag, tag)
     print(notes or f"(no changelog entry for {tag})")
+
+    # After the merge, so the link is made to a skill that is already the new
+    # one, and before every branch below that can return early: a user who is
+    # sent off to edit .env still gets told their agent is reading a stale copy.
+    relinked = relink_skill(root, os.path.expanduser("~"))
+    if relinked:
+        print(relinked)
 
     def shown(path: str) -> str:
         """That file as the old commit had it, empty when it had none."""

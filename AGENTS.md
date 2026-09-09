@@ -104,6 +104,16 @@ behind `add_conditional_edges`, not a `while True` anyone reads. The shipped
 scope gate was vacuously green for every run on one machine for weeks, five
 rounds wrote it into a constraints file, and nothing in the engine could tell.
 
+**The skill an agent reads is a link, never a copy.** `~/.claude/skills/loopgraph`
+points into this checkout, and that is the whole reason a release ships a new
+`SKILL.md` for free: the merge rewrites the file the link already points at.
+Anything else goes stale in silence. install.sh used to ask only whether something
+was at that path, so a link left behind by a checkout someone had moved survived
+every re-run of the installer and every `lg update` after it, and the only way out
+was asking your agent to copy the file by hand. `relink_skill` in `lg` and section
+6 of install.sh now both ask where it points, repair a link, and leave a directory
+a user copied there alone.
+
 ## Releasing
 
 Write the user-visible note under `## Unreleased` in `CHANGELOG.md` in the same
@@ -123,6 +133,12 @@ No agent runs `release.sh`. It pushes.
 
 `tests/test_release.py` guards publishing: no credentials or personal paths in
 tracked files, and no real runs tracked. If it goes red, do not work around it.
+
+`install.sh` is not run whole by any test — it builds venvs and starts containers.
+Its skill-link step is, though: `tests/test_version.py` cuts that section out of
+the shipped file and runs it under bash against a home in `tmp_path`. It finds the
+section by splitting on the header text `6. skill ---` and `7. up ----`, so
+renumbering or rewording those two headers breaks the test rather than the script.
 
 The engine cannot test itself end to end in CI. The real check is running
 `lg start runs/example-hello /projects/loopgraph-example` and driving it to a

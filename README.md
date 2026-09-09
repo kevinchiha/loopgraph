@@ -171,7 +171,8 @@ lg update     # move to it
 ```
 
 `lg update` moves your checkout's `main` to the newest release, refreshes the host
-environment when the dependencies changed, and restarts the worker and dispatcher.
+environment when the dependencies changed, checks that the skill your agent reads
+still points into the checkout, and restarts the worker and dispatcher.
 It refuses, and changes nothing, in three cases you can hit:
 
 - You edited files in the engine checkout: commit or stash them first.
@@ -181,6 +182,14 @@ It refuses, and changes nothing, in three cases you can hit:
   open runs.
 
 The dashboard header shows the installed release and says when a newer one exists.
+
+The skill check is there because a stale skill is silent. `~/.claude/skills/loopgraph`
+is a symlink into the checkout, so it changes with every update on its own; if it
+has come loose — a link left behind by a checkout you moved, or one nobody ever
+made — `lg update` re-points it and says so. Restart your agent session afterwards
+to load it. The one thing it will not do is overwrite a directory you copied there
+yourself; it names the path and leaves your edits alone, and removing it and
+running `lg update` again links it.
 
 To go back to an earlier release, in the engine checkout: `git checkout vX.Y.Z`,
 then `<docker> compose up -d --build worker dispatcher` (a rollback always
@@ -192,7 +201,7 @@ open.
 ## Using it
 
 The installer links a skill into `~/.claude/skills/`, so your agent already knows
-how to drive the engine. You describe the work; it writes the run and starts it.
+how to drive the engine, and `lg update` keeps that link pointing here. You describe the work; it writes the run and starts it.
 
 Start with the example, which ships with the repo:
 

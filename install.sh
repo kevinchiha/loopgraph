@@ -256,12 +256,30 @@ case ":$PATH:" in
 esac
 
 # ------------------------------------------------------------------ 6. skill ---
+# "Is anything there?" is the wrong question. A link left behind by a clone that
+# has since moved, and a copy someone made by hand, both answer yes, and both
+# then sit there stale through every re-run of this script and every `lg update`
+# after it. Ask where it points instead. A symlink pointing elsewhere is repaired
+# without asking, because replacing a link destroys nothing; a real directory is
+# left alone, because the user may have written in it.
 SKILL_SRC="$ROOT/skills/loopgraph"
 SKILL_DST="$HOME/.claude/skills/loopgraph"
 if [ -d "$SKILL_SRC" ]; then
   say "Claude Code skill"
-  if [ -e "$SKILL_DST" ] || [ -L "$SKILL_DST" ]; then
-    echo "  $SKILL_DST already exists — leaving it alone"
+  # Both sides resolved, so a link written with a relative or equivalent path
+  # still counts as pointing here. A link whose target is gone cannot be cd'd
+  # into, comes out empty, and is repaired.
+  if [ -L "$SKILL_DST" ]; then
+    if [ "$(cd "$SKILL_DST" 2>/dev/null && pwd -P)" = "$(cd "$SKILL_SRC" && pwd -P)" ]; then
+      echo "  already linked to this checkout"
+    else
+      rm -f "$SKILL_DST"
+      ln -s "$SKILL_SRC" "$SKILL_DST"
+      echo "  re-pointed $SKILL_DST -> $SKILL_SRC (it pointed somewhere else)"
+    fi
+  elif [ -e "$SKILL_DST" ]; then
+    warn "$SKILL_DST is a copy, not a link, so it never follows an update."
+    warn "Remove it and re-run this script to link it to $SKILL_SRC."
   elif [ "$YES" = 1 ] || confirm "Link the loopgraph skill into ~/.claude/skills?"; then
     mkdir -p "$(dirname "$SKILL_DST")"
     ln -s "$SKILL_SRC" "$SKILL_DST"

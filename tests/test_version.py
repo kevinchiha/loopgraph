@@ -24,6 +24,7 @@ import importlib.util
 import inspect
 import json
 import re
+import shlex
 import subprocess
 import types
 from importlib.machinery import SourceFileLoader
@@ -683,7 +684,7 @@ def _temporal(lg, monkeypatch, answer) -> None:
     monkeypatch.setattr(lg, "_client", connect)
 
 
-def _update(lg, root, monkeypatch, capsys, runner=None) -> tuple[int, str, str]:
+def _update(lg, root, monkeypatch, capsys, runner=None, home=None) -> tuple[int, str, str]:
     """`lg update` against a checkout under tmp_path, as (code, stdout, stderr).
 
     Temporal is fenced off unless the test called _temporal: a check that stopped
@@ -691,7 +692,15 @@ def _update(lg, root, monkeypatch, capsys, runner=None) -> tuple[int, str, str]:
     localhost:7233 instead of failing. The wait between log polls goes the same
     way, as a no-op: the poll is sixty tries two seconds apart, and no test has
     two minutes to spend proving it.
+
+    HOME is fenced for the same reason and it matters more: the update writes a
+    symlink under ~/.claude/skills, so a test left pointing at the real home
+    would re-point the skill link of whoever is running the suite. `home` is
+    only for the tests that then read what was written there.
     """
+    home = Path(home) if home is not None else root.parent / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
     if not getattr(lg._client, "faked", False):
         async def never_asked():
             raise AssertionError("lg update reached Temporal with no fake client installed")
@@ -979,6 +988,141 @@ def test_update_never_runs_a_git_command_that_could_lose_work(
     assert git
     assert not [argv for argv in git if argv[1] in ("checkout", "reset", "stash", "pull")]
     assert all("--ff-only" in argv for argv in git if argv[1] == "merge")
+
+
+# ---------------------------------------------- lg update: the skill on disk ---
+
+# `~/.claude/skills/loopgraph` is how an agent reads this checkout's SKILL.md.
+# install.sh makes it a symlink, and a symlink follows every update by itself.
+# These are the states a machine ends up in when it is anything else.
+
+def _skill_checkout(tmp_path):
+    """A checkout with a skill to link, and a home with nothing linked yet."""
+    root = tmp_path / "engine"
+    (root / "skills" / "loopgraph").mkdir(parents=True)
+    (root / "skills" / "loopgraph" / "SKILL.md").write_text("# new\n", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    return root, home
+
+
+def _skill_dst(home):
+    return home / ".claude" / "skills" / "loopgraph"
+
+
+def test_relink_skill_says_nothing_when_the_link_already_points_here(tmp_path):
+    """The install.sh default. A symlink is already current the moment the merge
+    lands, so an update that announced it every time would be noise."""
+    root, home = _skill_checkout(tmp_path)
+    dst = _skill_dst(home)
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(root / "skills" / "loopgraph")
+    assert _lg().relink_skill(str(root), str(home)) is None
+
+
+def test_relink_skill_links_a_home_that_never_had_one(tmp_path):
+    """Someone who declined the installer's offer, or installed before the skill
+    existed. Nothing is at the destination, and neither are its parents."""
+    root, home = _skill_checkout(tmp_path)
+    dst = _skill_dst(home)
+    said = _lg().relink_skill(str(root), str(home))
+    assert said == (f"linked {dst} -> {root / 'skills' / 'loopgraph'}\n"
+                    "  restart your agent session to pick up the skill")
+    assert dst.is_symlink()
+    assert dst.resolve() == (root / "skills" / "loopgraph").resolve()
+
+
+def test_relink_skill_repoints_a_link_into_another_checkout(tmp_path):
+    """A symlink left over from an older clone. It resolves, it reads, and every
+    word in it is the version that other checkout is on."""
+    root, home = _skill_checkout(tmp_path)
+    stale = tmp_path / "old-engine" / "skills" / "loopgraph"
+    stale.mkdir(parents=True)
+    (stale / "SKILL.md").write_text("# old\n", encoding="utf-8")
+    dst = _skill_dst(home)
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(stale)
+    said = _lg().relink_skill(str(root), str(home))
+    assert said == (f"re-pointed {dst} -> {root / 'skills' / 'loopgraph'}\n"
+                    "  restart your agent session to pick up the skill")
+    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "# new\n"
+    # The other checkout is somebody's working tree, not ours to delete.
+    assert (stale / "SKILL.md").read_text(encoding="utf-8") == "# old\n"
+
+
+def test_relink_skill_repoints_a_link_whose_target_is_gone(tmp_path):
+    """A checkout that was moved or deleted. The link is still a link, so
+    replacing it costs nothing, but os.path.exists answers False for it."""
+    root, home = _skill_checkout(tmp_path)
+    dst = _skill_dst(home)
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(tmp_path / "deleted" / "skills" / "loopgraph")
+    said = _lg().relink_skill(str(root), str(home))
+    assert said.startswith(f"re-pointed {dst} -> ")
+    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "# new\n"
+
+
+def test_relink_skill_refuses_to_touch_a_copied_directory(tmp_path):
+    """A copy someone made by hand, or an agent wrote when asked to install the
+    skill. It may have edits in it, so this says what to do and writes nothing."""
+    root, home = _skill_checkout(tmp_path)
+    dst = _skill_dst(home)
+    dst.mkdir(parents=True)
+    (dst / "SKILL.md").write_text("# copied, and edited\n", encoding="utf-8")
+    said = _lg().relink_skill(str(root), str(home))
+    assert said == (f"{dst} is a copy, not a link to {root / 'skills' / 'loopgraph'}\n"
+                    "  it did not follow this update; remove it and run lg update again")
+    assert not dst.is_symlink()
+    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "# copied, and edited\n"
+
+
+def test_relink_skill_does_nothing_when_the_checkout_has_no_skill(tmp_path):
+    """A tree with no skills/loopgraph in it. Linking the destination at a path
+    that is not there would leave the machine worse off than untouched."""
+    root, home = tmp_path / "engine", tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    assert _lg().relink_skill(str(root), str(home)) is None
+    assert not _skill_dst(home).exists()
+
+
+def test_update_repoints_a_stale_skill_link_after_the_merge(
+        clone_repo, monkeypatch, capsys, tmp_path):
+    """The whole point, end to end: the user runs one command and the skill their
+    agent reads is the one this release shipped."""
+    lg = _lg()
+    (clone_repo.root / "skills" / "loopgraph").mkdir(parents=True)
+    clone_repo.commit("a skill", {"skills/loopgraph/SKILL.md": "# shipped\n"})
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    home = tmp_path / "home"
+    dst = _skill_dst(home)
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(tmp_path / "somewhere-else")
+    _temporal(lg, monkeypatch, ListingClient())
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, home=home)
+    assert (code, err) == (0, "")
+    assert f"re-pointed {dst} -> {clone_repo.root / 'skills' / 'loopgraph'}" in out
+    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "# shipped\n"
+
+
+def test_update_says_nothing_about_a_skill_link_that_is_already_right(
+        clone_repo, monkeypatch, capsys, tmp_path):
+    lg = _lg()
+    (clone_repo.root / "skills" / "loopgraph").mkdir(parents=True)
+    clone_repo.commit("a skill", {"skills/loopgraph/SKILL.md": "# shipped\n"})
+    clone_repo.tag("v0.1.0")
+    clone_repo.push()
+    _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
+    home = tmp_path / "home"
+    dst = _skill_dst(home)
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(clone_repo.root / "skills" / "loopgraph")
+    _temporal(lg, monkeypatch, ListingClient())
+    code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, home=home)
+    assert (code, err) == (0, "")
+    assert "skills/loopgraph" not in out
 
 
 # ------------------------------------- lg update: the venv, the .env, the stack ---
@@ -1527,3 +1671,95 @@ def test_the_installers_closing_text_names_lg_version_under_lg_where():
     before = lines[lines.index(line) - 1]
     assert before.startswith("  lg where")
     assert before.index("#") == line.index("#")
+
+
+# ------------------------------- install.sh: the skill link it leaves behind ---
+
+def _install_skill_step(root, home, yes="1", answer=1):
+    """Section 6 of install.sh, run for real, as (code, stdout).
+
+    The section is cut out of the shipped file rather than retyped, so what runs
+    here is the text a user downloads. What it leans on from the rest of the
+    script is stubbed above it: the two printers, the prompt, and the two paths.
+    `answer` is what confirm returns, so 0 is a user saying yes.
+    """
+    body = INSTALL.split("6. skill ---")[1].split("7. up ----")[0]
+    script = (
+        # bash with the same flags install.sh sets on itself: under `set -e` a
+        # test that ran the section in a laxer shell than the user's would pass
+        # on a line that aborts a real install.
+        "set -euo pipefail\n"
+        f"YES={yes}\n"
+        f"ROOT={shlex.quote(str(root))}\n"
+        f"HOME={shlex.quote(str(home))}\n"
+        "say() { printf '%s\\n' \"$*\"; }\n"
+        "warn() { printf '%s\\n' \"$*\"; }\n"
+        f"confirm() {{ return {answer}; }}\n"
+        + body)
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert done.stderr == "", done.stderr
+    return done.returncode, done.stdout
+
+
+@pytest.fixture
+def installable(tmp_path):
+    """A checkout with a skill in it, and an empty home to install into."""
+    root, home = tmp_path / "engine", tmp_path / "home"
+    (root / "skills" / "loopgraph").mkdir(parents=True)
+    (root / "skills" / "loopgraph" / "SKILL.md").write_text("# shipped\n", encoding="utf-8")
+    home.mkdir()
+    return root, home
+
+
+def test_install_links_the_skill_into_a_home_that_has_none(installable):
+    root, home = installable
+    code, out = _install_skill_step(root, home)
+    dst = home / ".claude" / "skills" / "loopgraph"
+    assert code == 0
+    assert dst.is_symlink()
+    assert dst.resolve() == (root / "skills" / "loopgraph").resolve()
+    assert "linked" in out
+
+
+def test_install_repoints_a_link_into_another_checkout(installable):
+    """The bug this section had: it asked whether anything was at the
+    destination, never whether it pointed here, so a link left over from an
+    older clone survived every re-run and every update after it."""
+    root, home = installable
+    stale = root.parent / "old-engine" / "skills" / "loopgraph"
+    stale.mkdir(parents=True)
+    (stale / "SKILL.md").write_text("# old\n", encoding="utf-8")
+    dst = home / ".claude" / "skills" / "loopgraph"
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(stale)
+    code, out = _install_skill_step(root, home)
+    assert code == 0
+    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "# shipped\n"
+    assert (stale / "SKILL.md").read_text(encoding="utf-8") == "# old\n"
+    assert "re-pointed" in out
+
+
+def test_install_leaves_a_link_that_is_already_right_alone(installable):
+    root, home = installable
+    dst = home / ".claude" / "skills" / "loopgraph"
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(root / "skills" / "loopgraph")
+    was = dst.readlink()
+    code, out = _install_skill_step(root, home)
+    assert code == 0
+    assert dst.readlink() == was
+    assert "already linked" in out
+
+
+def test_install_names_a_copied_directory_and_writes_nothing(installable):
+    """A copy someone made by hand. The installer says why it will go stale and
+    what to do, and leaves whatever the user wrote in it where it is."""
+    root, home = installable
+    dst = home / ".claude" / "skills" / "loopgraph"
+    dst.mkdir(parents=True)
+    (dst / "SKILL.md").write_text("# copied, and edited\n", encoding="utf-8")
+    code, out = _install_skill_step(root, home)
+    assert code == 0
+    assert not dst.is_symlink()
+    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "# copied, and edited\n"
+    assert "copy" in out and "Remove it" in out

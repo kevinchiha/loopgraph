@@ -6,6 +6,17 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- `lg update` now keeps the Claude Code skill current instead of leaving it to you.
+  `~/.claude/skills/loopgraph` is meant to be a symlink into your checkout, and one
+  that is follows every update by itself — but a link left behind by a checkout you
+  moved, or one nobody ever made, went stale silently and stayed stale through every
+  update after it. That is what made people ask their agent to go and copy the skill
+  by hand. `lg update` now re-points a link that has come loose and prints what it
+  did, with a reminder to restart your agent session so it loads. A directory you
+  copied there yourself is never overwritten: it is named, along with what to remove,
+  because your edits are not ours to delete. `./install.sh` repairs the same link on
+  a re-run rather than shrugging at whatever is in the way.
+
 ## 0.4.0 - 2026-09-09
 
 - Gates and detectors now run under bash with `pipefail`, so a pipeline is red when

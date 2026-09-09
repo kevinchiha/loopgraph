@@ -100,13 +100,21 @@ both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 
 ## 4. Prove it, then report
 
-"The script exited 0" is not verification. Run all three:
+"The script exited 0" is not verification. Run all four:
 
 ```bash
 lg where                                                # paths, ports, Telegram
+readlink ~/.claude/skills/loopgraph                     # must be <checkout>/skills/loopgraph
 <docker> compose ps                                     # worker must be Up
 lg start runs/example-hello /projects/loopgraph-example
 ```
+
+The `readlink` is there because the failure is silent. That path has to be a
+symlink into the checkout: then every `lg update` changes the skill the user's
+agent reads, for free. If `readlink` prints nothing, it is a copied directory
+instead, frozen at whatever version it was made from and never updated again.
+Delete it and re-run `./install.sh`, which will link it. Do not fix this by
+copying the new SKILL.md over the old one.
 
 The last one is the real test. It takes a few minutes, implements a `--hello`
 flag, gates it, audits it, and then holds at a decision. Tell them how to answer:
