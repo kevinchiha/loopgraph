@@ -1,4 +1,5 @@
-"""Everything browser-shaped. So far: the run's declaration, `browser.yaml`.
+"""Everything browser-shaped. So far: the run's declaration `browser.yaml`, the
+port the engine assigns a run's app, and the process that serves it.
 
 A run directory may hold a `browser.yaml` beside `brief.md` and `gates.yaml`,
 and having one at all is what tells the engine this run has a web app:
@@ -31,15 +32,27 @@ one pixel. The code is not shared because every message here names browser.yaml.
 The activities read the file through `read_browser_config`, which hands the error
 back as a value. A file edited into a broken state after `lg start` has to reach
 the executor's prompt as evidence rather than park the item.
+
+The serve is the engine's and never the model's. The engine picks the port, so
+two runs in one worker cannot land on one socket, hands it over as
+$LOOPGRAPH_PORT, runs the command in the worktree in its own process group, and
+kills that whole group when the round ends. A gate command is the one party that
+gets the browser endpoint without the app URL, which is what `gate_env` is for.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
-from dataclasses import dataclass
+import signal
+import socket
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+from activities.gate import _drain
 
 BROWSER_FILE = "browser.yaml"
 CAPTURE_CAP = 10
@@ -48,6 +61,16 @@ MAX_READY_TIMEOUT = 180
 DEFAULT_WIDTH = 1280
 DEFAULT_CAPTURE_TIMEOUT = 30
 MAX_CAPTURE_TIMEOUT = 60
+
+# The engine's own names and bounds, rather than the declaration's.
+ENDPOINT_ENV = "LOOPGRAPH_BROWSER_WS"
+DEFAULT_BROWSER_PORT = 8420
+HEARTBEAT_SECONDS = 20     # gate.py's step, well inside the 3-minute heartbeat_timeout
+OUTPUT_TAIL_LINES = 30     # of the serve's output, for the prompt blocks to show
+_POLL_SECONDS = 0.5        # between one look at the port and the next
+# `_drain` keeps a number of bytes rather than lines. 400 a line is generous, and
+# a line longer than that costs one of the 30, never the tail.
+_TAIL_BYTES = OUTPUT_TAIL_LINES * 400
 
 # A capture's name becomes <run_dir>/shots/i<N>-r<M>/<name>.png, so it has to be
 # a filename and nothing else. This is what keeps `../x` out of that path.
@@ -222,3 +245,233 @@ def read_browser_config(run_dir: str) -> dict | BrowserConfigError | None:
         # The prefix the checker's own messages carry, so whatever prints this
         # one prints it the same way.
         return BrowserConfigError(f"browser.yaml: {e}")
+
+
+# The ports the engine has handed out and not yet taken back. Module state, so
+# it covers one worker process and promises nothing beyond it.
+_reserved: set[int] = set()
+
+
+def browser_port() -> int:
+    """The port Chromium's remote debugging endpoint listens on.
+
+    One number for the whole stack: compose starts the container on it and every
+    client attaches to it, so the default here and the compose default are the
+    same 8420 or a machine that set neither has a browser nobody can find.
+
+    Anything that is not a number reads as unset rather than raising. A round
+    must not park over a typo in .env, and compose hands Chromium that same
+    string, so the container is not up either and the round says the browser did
+    not answer."""
+    port = os.environ.get("LOOPGRAPH_BROWSER_PORT", "")
+    return int(port) if port.isdigit() else DEFAULT_BROWSER_PORT
+
+
+def browser_endpoint() -> str:
+    """The CDP URL both models and the engine's own capture client attach to."""
+    return f"http://127.0.0.1:{browser_port()}"
+
+
+def _bind_free_port() -> int:
+    """A port the OS says is free, given straight back."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def pick_port() -> int:
+    """A free port, held until `release_port` gives it back.
+
+    The reservation is what bind-and-release cannot do on its own: between this
+    returning and the dev server calling bind the port is free again, so the OS
+    can offer the same number to the next serve starting in this worker, and the
+    two runs then race for one socket. Two workers picking at the same moment is
+    not this case; nothing here reaches across processes."""
+    while True:
+        port = _bind_free_port()
+        if port not in _reserved:
+            _reserved.add(port)
+            return port
+
+
+def release_port(port: int) -> None:
+    """Hand a port back. A port nobody reserved is not an error: every serve is
+    stopped, including one that never started."""
+    _reserved.discard(port)
+
+
+def app_env(port: int) -> dict[str, str]:
+    """What the serve command and both models get for this run's app.
+
+    Three keys and nothing else. It is a layer over the environment the worker
+    already has, not an environment of its own, and a copy of `os.environ` here
+    would hand a model the Telegram token `NO_TELEGRAM` is there to blank."""
+    return {"LOOPGRAPH_PORT": str(port),
+            "LOOPGRAPH_APP_URL": f"http://127.0.0.1:{port}",
+            ENDPOINT_ENV: browser_endpoint()}
+
+
+def gate_env(run_dir: str) -> dict[str, str] | None:
+    """What a gate command gets while the run declares a web app: the browser,
+    and never the app (AC-8).
+
+    `checkpoint_write_set` re-runs the same gates.yaml in its own activity with
+    no serve alive, so a gate that reached $LOOPGRAPH_APP_URL would be green in
+    the round and red at the commit, and the accepted item would park with its
+    work thrown away. Completing this dict with the app keys is the mistake.
+
+    Only whether the file is there is asked: a run whose browser.yaml does not
+    pass the check still runs its gates. None, for a run with no web app, is
+    what `_run_one` takes for no environment of its own."""
+    if not (Path(run_dir) / BROWSER_FILE).exists():
+        return None
+    return {ENDPOINT_ENV: browser_endpoint()}
+
+
+def _kill_serve(proc) -> None:
+    """Kill the serve and everything it started.
+
+    Not `gate._kill_group`, which asks the OS for the group with
+    `os.getpgid(proc.pid)`. A gate's shell is still running when its timeout
+    fires; a serve's shell often is not. A command that daemonises exits 0 and
+    leaves the real server behind it, and once that shell has been reaped there
+    is no process left to ask, so the group kill finds nothing and the server
+    keeps the port for the next round.
+
+    `start_new_session=True` made the shell the group leader, so its pid is the
+    group's number whether or not the shell itself still exists, and the group
+    lives as long as any member of it does."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Nothing is left in the group, which is the ordinary end of a serve
+        # whose command exited on its own.
+        pass
+
+
+async def _port_answers(port: int) -> bool:
+    """Whether anything accepts a connection on the port, closed again at once.
+
+    This is the whole of what ready means. A dev server that prints "listening"
+    before it binds, or prints nothing at all, or daemonises and leaves the shell
+    exiting 0 behind it, all answer here and nowhere else."""
+    try:
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+    except OSError:
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
+
+
+def _tail(out: bytearray, note: str = "") -> str:
+    """The last lines of what the process wrote, `note` first when there is one."""
+    lines = bytes(out).decode(errors="replace").splitlines()[-OUTPUT_TAIL_LINES:]
+    return "\n".join(([note] if note else []) + lines)
+
+
+@dataclass
+class Serve:
+    """One app server: what was run, where it was reachable, and how it went.
+
+    `output_tail` is the evidence the prompt blocks carry when `ready` is False.
+    The process and its drain are held for `stop`, which both activities call in
+    a finally whichever way the round ended."""
+
+    cmd: str
+    port: int
+    url: str
+    ready_timeout: int
+    ready: bool
+    output_tail: str
+    _proc: object | None = field(default=None, repr=False)
+    _drain: object | None = field(default=None, repr=False)
+
+    async def stop(self) -> None:
+        """Kill the group and hand the port back. Safe to call twice, and on a
+        serve that never came up."""
+        proc, drain = self._proc, self._drain
+        # Dropped before the kill, so a second call finds nothing to kill.
+        self._proc = self._drain = None
+        if proc is not None:
+            _kill_serve(proc)
+            # The two seconds `_run_one` gives its own drain, for its reason: a
+            # child that outlived the shell holds the pipe open and EOF never
+            # comes, and what the process wrote is in the buffer by now.
+            try:
+                await asyncio.wait_for(asyncio.shield(drain), timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                drain.cancel()
+        release_port(self.port)
+
+
+async def start_serve(cmd: str, workdir: str, port: int, ready_timeout: int,
+                      heartbeat=None) -> Serve:
+    """Serve `workdir` with `cmd` on `port`, and wait for the port to answer.
+
+    Nothing raises out of here. A serve that could not start, or never bound, is
+    a Serve with `ready` False and the output as evidence, because a web app the
+    engine could not bring up must reach the executor's prompt rather than park
+    the item."""
+    url = f"http://127.0.0.1:{port}"
+
+    def result(ready: bool, output_tail: str, proc=None, drain=None) -> Serve:
+        return Serve(cmd=cmd, port=port, url=url, ready_timeout=ready_timeout,
+                     ready=ready, output_tail=output_tail, _proc=proc, _drain=drain)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            # The shell a gate runs under, for the reason `_run_one` sets out.
+            "/bin/bash", "-o", "pipefail", "-c", cmd,
+            cwd=workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            # Own process group: `npm run dev` forks the real server, and killing
+            # the shell alone leaves that child holding the port for the round
+            # after this one.
+            start_new_session=True,
+            env={**os.environ, **app_env(port)},
+        )
+    except OSError as err:
+        # A worktree that is gone is the one that happens. Its first line names
+        # the path, and the prompt block prints the tail as one block of text.
+        return result(False, str(err).split("\n")[0])
+
+    out = bytearray()
+    drain = asyncio.create_task(_drain(proc.stdout, _TAIL_BYTES, out))
+    waiter = asyncio.create_task(proc.wait())
+    step = min(HEARTBEAT_SECONDS, ready_timeout)
+    elapsed = since_beat = 0.0
+    ready, note = False, ""
+    while True:
+        # The port first: a command that binds and exits non-zero in the same
+        # breath is still a server that answered.
+        if await _port_answers(port):
+            ready = True
+            break
+        # A shell that exited 0 is not a give-up. A command that daemonises does
+        # exactly that, and nothing but the port says whether it worked.
+        if waiter.done() and proc.returncode:
+            note = (f"serve command exited with code {proc.returncode} "
+                    "before the port answered")
+            break
+        if elapsed >= ready_timeout:
+            break
+        await asyncio.sleep(_POLL_SECONDS)
+        elapsed += _POLL_SECONDS
+        since_beat += _POLL_SECONDS
+        if heartbeat and since_beat >= step:
+            since_beat = 0.0
+            heartbeat(f"serve waiting ({int(elapsed)}s)")
+    waiter.cancel()
+    if ready:
+        return result(True, _tail(out), proc, drain)
+    _kill_serve(proc)
+    try:
+        await asyncio.wait_for(asyncio.shield(drain), timeout=2)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        drain.cancel()
+    return result(False, _tail(out, note))

@@ -8,20 +8,31 @@ sessions that cannot read each other's cookies, an origin the MCP server refuses
 to open — is the checklist below, run by hand.
 
 The declaration needs no browser at all: `browser.yaml` is text in, a dict or an
-error out, so those are ordinary parser checks.
+error out, so those are ordinary parser checks. Neither does the serve: the app
+under test in here is a real local `python -m http.server`, and what those tests
+watch is the engine's own half of it — the port it hands out, the shell it runs
+the command under, and the process group it kills.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
+import sys
+import time
 import tomllib
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 import yaml
 
-from activities.browser import (BrowserConfigError, load_browser_config,
-                                parse_browser_config, read_browser_config)
+from activities import browser
+from activities.browser import (DEFAULT_BROWSER_PORT, BrowserConfigError, app_env,
+                                browser_endpoint, browser_port, gate_env,
+                                load_browser_config, parse_browser_config, pick_port,
+                                read_browser_config, release_port, start_serve)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -300,6 +311,287 @@ def test_a_file_the_engine_cannot_read_is_an_error_value_too(tmp_path):
     # block and the owner's note print this one the same way as the rest.
     assert bad.message.startswith("browser.yaml: ")
     assert "\n" not in bad.message
+
+
+# ---------- the port and the environments ----------
+
+
+@pytest.fixture
+def reservations():
+    """Hand back whatever a test reserves.
+
+    `_reserved` is module state that outlives a test, and a number left in it is
+    a number `pick_port` will refuse for the rest of the session."""
+    held = set(browser._reserved)
+    yield browser._reserved
+    browser._reserved.clear()
+    browser._reserved.update(held)
+
+
+def test_two_picks_in_a_row_differ_even_when_the_os_offers_the_same_port(
+        monkeypatch, reservations):
+    """The window the reservation exists for. Between `pick_port` returning and
+    the dev server calling bind the port is free again, so the OS can offer the
+    same number to the next activity in this worker, which is then two servers
+    on one socket. Bind-and-release alone cannot see that."""
+    offered = iter([7000, 7000, 7001])
+    monkeypatch.setattr(browser, "_bind_free_port", lambda: next(offered))
+    assert pick_port() == 7000
+    assert pick_port() == 7001
+
+
+def test_release_port_frees_a_port_for_the_next_pick(monkeypatch, reservations):
+    """A serve that has stopped is not holding its port any more, and a worker
+    that ran all day would otherwise refuse every number it had ever used."""
+    monkeypatch.setattr(browser, "_bind_free_port", lambda: 7000)
+    assert pick_port() == 7000
+    release_port(7000)
+    assert pick_port() == 7000
+    # A serve that never started still gets stopped, so this has to be a no-op.
+    release_port(65000)
+
+
+def test_app_env_carries_exactly_the_three_keys():
+    """The serve command and both models get these three laid over the worker's
+    own environment. A dict of the whole environment here would hand a model the
+    Telegram token that `NO_TELEGRAM` is there to blank."""
+    env = app_env(4321)
+    assert env == {"LOOPGRAPH_PORT": "4321",
+                   "LOOPGRAPH_APP_URL": "http://127.0.0.1:4321",
+                   "LOOPGRAPH_BROWSER_WS": browser_endpoint()}
+    assert "TELEGRAM_BOT_TOKEN" not in env
+
+
+def test_gate_env_carries_only_the_browser_endpoint(tmp_path):
+    """AC-8. A gate gets the browser and never the app: `checkpoint_write_set`
+    re-runs the same gates.yaml in its own activity with no serve alive, so a
+    gate that reached $LOOPGRAPH_APP_URL would be green in the round and red at
+    the commit, and the accepted item would park with its work thrown away.
+
+    Whether the file parses is not the question either. A run that declares a web
+    app in a broken file still runs its gates."""
+    assert gate_env(str(tmp_path)) is None
+    (tmp_path / "browser.yaml").write_text("serve:\n  cmd: x\n  port: 3000\n")
+    assert gate_env(str(tmp_path)) == {"LOOPGRAPH_BROWSER_WS": browser_endpoint()}
+
+
+def test_browser_port_reads_the_env_and_falls_back_to_8420(monkeypatch):
+    """One port for the whole stack: compose starts Chromium on it and every
+    client attaches to it, so the default here and the compose default are the
+    same number or the container is unreachable on a machine that set neither."""
+    monkeypatch.setenv("LOOPGRAPH_BROWSER_PORT", "8431")
+    assert browser_port() == 8431
+    assert browser_endpoint() == "http://127.0.0.1:8431"
+    monkeypatch.delenv("LOOPGRAPH_BROWSER_PORT")
+    assert browser_port() == DEFAULT_BROWSER_PORT == 8420
+    assert browser_endpoint() == "http://127.0.0.1:8420"
+    # `LOOPGRAPH_BROWSER_PORT=` with nothing after it is what a hand-written .env
+    # looks like, and neither that nor a typo may take a round down: nothing
+    # browser-shaped raises out of a round.
+    monkeypatch.setenv("LOOPGRAPH_BROWSER_PORT", "")
+    assert browser_port() == 8420
+    monkeypatch.setenv("LOOPGRAPH_BROWSER_PORT", "no-such-port")
+    assert browser_port() == 8420
+
+
+# ---------- the serve process ----------
+#
+# Every serve in here is a real local process, so every test goes through
+# `serving`: one left behind holds a port and a pytest worker for the rest of
+# the session. Nothing is spawned but `python -m http.server`, `sleep` and
+# `echo`, and the only address touched is the loopback the serve is on.
+
+
+@asynccontextmanager
+async def serving(cmd, workdir, ready_timeout=5, heartbeat=None):
+    """A serve on a picked port, stopped whatever the test does with it."""
+    port = pick_port()
+    serve = await start_serve(cmd, str(workdir), port, ready_timeout, heartbeat=heartbeat)
+    try:
+        yield serve
+    finally:
+        await serve.stop()
+
+
+async def http_get(url):
+    """A GET written down a socket. urllib would read this machine's proxy
+    variables; the point here is that the URL the serve reports is the one the
+    app answers on."""
+    host, port = url.removeprefix("http://").split(":")
+    reader, writer = await asyncio.open_connection(host, int(port))
+    writer.write(f"GET / HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n".encode())
+    await writer.drain()
+    answer = await reader.read()
+    writer.close()
+    await writer.wait_closed()
+    return answer
+
+
+def assert_dead(pid):
+    """`kill -0` until the process is gone. SIGKILL to the group is delivered at
+    once but the kernel takes a moment to tear the process down, so reading the
+    answer immediately is a race."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"pid {pid} outlived the serve it was started from")
+
+
+def test_the_serve_runs_in_the_worktree(tmp_path):
+    """The app under test is the round's worktree, not whatever directory the
+    worker happens to be sitting in."""
+    async def main():
+        async with serving("pwd; exit 1", tmp_path) as serve:
+            assert serve.ready is False
+            assert str(tmp_path) in serve.output_tail
+    asyncio.run(main())
+
+
+def test_the_serve_runs_under_bash_with_pipefail(tmp_path):
+    """The same shell a gate gets. `false | true` exits 0 under a shell without
+    pipefail, so a serve run that way would sit out the whole ready_timeout
+    waiting for a command that had already failed."""
+    async def main():
+        started = time.monotonic()
+        async with serving("false | true", tmp_path, ready_timeout=5) as serve:
+            waited = time.monotonic() - started
+            assert "exited with code 1" in serve.output_tail
+            assert waited < 3, f"waited {waited:.1f}s, so the pipeline's exit went unread"
+        async with serving('echo "$0"; exit 1', tmp_path) as serve:
+            assert "/bin/bash" in serve.output_tail
+    asyncio.run(main())
+
+
+def test_a_real_local_server_comes_up_ready(tmp_path):
+    """The whole path, against a server that really listens: the command gets
+    the port, the socket is what readiness means, the URL is the app's, and
+    stopping hands the port back."""
+    cmd = f"{sys.executable} -m http.server $LOOPGRAPH_PORT --bind 127.0.0.1"
+    async def main():
+        async with serving(cmd, tmp_path, ready_timeout=30) as serve:
+            assert serve.ready is True, serve.output_tail
+            assert serve.url == f"http://127.0.0.1:{serve.port}"
+            assert (await http_get(serve.url)).startswith(b"HTTP/1.0 200")
+            port = serve.port
+        assert port not in browser._reserved
+    asyncio.run(main())
+
+
+def test_the_command_sees_the_app_env(tmp_path):
+    """A dev server is told which port to bind through the environment, so a
+    command that cannot read it cannot come up on the port the engine picked."""
+    async def main():
+        async with serving('echo "$LOOPGRAPH_APP_URL"; exit 1', tmp_path) as serve:
+            assert serve.url in serve.output_tail
+    asyncio.run(main())
+
+
+def test_a_command_that_never_listens_times_out_with_its_tail(tmp_path):
+    """AC-5. The round still runs, with the last of the output as the evidence
+    the executor's prompt block carries, and nothing of the serve is left."""
+    pid_file = tmp_path / "pid"
+    async def main():
+        async with serving(f"echo starting; sleep 30 & echo $! > {pid_file}; wait",
+                           tmp_path, ready_timeout=1) as serve:
+            assert serve.ready is False
+            assert "starting" in serve.output_tail
+    asyncio.run(main())
+    assert_dead(int(pid_file.read_text()))
+
+
+def test_a_command_that_exits_non_zero_gives_up_before_the_timeout(tmp_path):
+    """A command that has failed is not going to bind anything, and waiting out
+    a three-minute ready_timeout for it is three minutes of the round's budget.
+    A shell that exits 0 is not this case: a dev server that daemonises does
+    exactly that, which is why the port is the only readiness signal."""
+    async def main():
+        started = time.monotonic()
+        async with serving("echo boom; exit 3", tmp_path, ready_timeout=30) as serve:
+            waited = time.monotonic() - started
+            assert serve.ready is False
+            assert serve.output_tail.splitlines() == [
+                "serve command exited with code 3 before the port answered", "boom"]
+            assert waited < 3, f"waited {waited:.1f}s for a command that had already exited"
+    asyncio.run(main())
+
+
+def test_a_shell_that_exits_zero_is_not_a_give_up(tmp_path):
+    """The other half of the same rule. A command that daemonises leaves the
+    shell exiting 0 with the real server still coming up behind it, so an exit
+    code of 0 says nothing and only the port does. The second the server waits
+    is the whole test: without it the port answers in the same poll the shell
+    exits in, and a give-up on any exit at all would go unnoticed."""
+    pid_file = tmp_path / "pid"
+    cmd = (f"(sleep 1; exec {sys.executable} -m http.server $LOOPGRAPH_PORT "
+           f"--bind 127.0.0.1) & echo $! > {pid_file}; exit 0")
+    async def main():
+        async with serving(cmd, tmp_path, ready_timeout=30) as serve:
+            assert serve.ready is True, serve.output_tail
+    asyncio.run(main())
+    assert_dead(int(pid_file.read_text()))
+
+
+def test_a_serve_that_could_not_start_at_all_is_a_result_and_not_a_raise(tmp_path):
+    """Nothing browser-shaped raises out of a round. A worktree that is not there
+    reaches the prompt as a serve that failed, like every other way one fails."""
+    async def main():
+        async with serving("echo hi", tmp_path / "gone", ready_timeout=1) as serve:
+            assert serve.ready is False
+            assert "No such file or directory" in serve.output_tail
+            assert "\n" not in serve.output_tail
+    asyncio.run(main())
+
+
+def test_stop_kills_the_whole_group(tmp_path):
+    """AC-4. `npm run dev` forks the real server, so killing the shell alone
+    leaves it holding the port for the next round. The command here has both
+    shapes: a child that outlives the shell, and a shell that becomes the
+    server."""
+    pid_file = tmp_path / "pid"
+    cmd = (f"sleep 300 & echo $! > {pid_file}; "
+           f"exec {sys.executable} -m http.server $LOOPGRAPH_PORT --bind 127.0.0.1")
+    async def main():
+        async with serving(cmd, tmp_path, ready_timeout=30) as serve:
+            assert serve.ready is True, serve.output_tail
+    asyncio.run(main())
+    assert_dead(int(pid_file.read_text()))
+
+
+def test_the_heartbeat_is_called_while_waiting(tmp_path):
+    """AC-9. The activity's heartbeat_timeout is three minutes and a serve may
+    wait up to 180 seconds, so a wait that says nothing is a wait Temporal can
+    decide is a dead worker."""
+    beats = []
+    pid_file = tmp_path / "pid"
+    async def main():
+        async with serving(f"sleep 30 & echo $! > {pid_file}; wait", tmp_path,
+                           ready_timeout=2, heartbeat=beats.append) as serve:
+            assert serve.ready is False
+    asyncio.run(main())
+    assert "serve waiting (2s)" in beats, beats
+    assert_dead(int(pid_file.read_text()))
+
+
+def test_stop_is_idempotent(tmp_path):
+    """Both activities stop the serve in a finally, and a round that ended badly
+    can reach that finally with a serve that never came up or one already
+    stopped."""
+    cmd = f"{sys.executable} -m http.server $LOOPGRAPH_PORT --bind 127.0.0.1"
+    async def main():
+        # `serving` has already stopped both of these once by the time the second
+        # stop below runs.
+        async with serving(cmd, tmp_path, ready_timeout=30) as ready:
+            assert ready.ready is True, ready.output_tail
+        await ready.stop()
+        assert ready.port not in browser._reserved
+        async with serving("exit 1", tmp_path, ready_timeout=1) as never:
+            assert never.ready is False
+        await never.stop()
+    asyncio.run(main())
 
 
 # ---------- the browser-container checklist ----------
