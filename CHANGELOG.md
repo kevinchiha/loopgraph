@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.5.0 - 2026-09-09
+
 - `lg update` now keeps the Claude Code skill current instead of leaving it to you.
   `~/.claude/skills/loopgraph` is meant to be a symlink into your checkout, and one
   that is follows every update by itself — but a link left behind by a checkout you
