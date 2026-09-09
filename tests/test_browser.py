@@ -38,6 +38,7 @@ import pytest
 import yaml
 
 from activities import browser
+from activities.audit import assemble_audit_prompt, audit, run_supervisor
 from activities.browser import (DEFAULT_BROWSER_PORT, BrowserAttach, BrowserConfigError,
                                 Serve, app_env, attach_browser, audit_block,
                                 blocked_origins, browser_endpoint, browser_evidence,
@@ -1237,11 +1238,12 @@ def test_a_ready_app_and_an_answering_browser_get_the_executor_its_server_and_en
     assert options.strict_mcp_config is True
 
 
-def test_strict_mcp_config_is_a_literal_in_run_executor():
+@pytest.mark.parametrize("node", [run_executor, run_supervisor])
+def test_strict_mcp_config_is_a_literal_in_both_nodes(node):
     """AC-14. A target repo's `.mcp.json` must never contribute a server to a run
     that did not declare one, and a keyword computed somewhere else is a keyword
     nothing can pin."""
-    assert "strict_mcp_config=True" in inspect.getsource(run_executor)
+    assert "strict_mcp_config=True" in inspect.getsource(node)
 
 
 def test_the_heartbeat_handed_down_to_the_serve_is_the_activitys():
@@ -1389,6 +1391,245 @@ def test_without_browser_yaml_a_gate_sees_no_browser_endpoint(rundir, target, mo
         '- name: env\n  cmd: test -z "$LOOPGRAPH_BROWSER_WS"\n  timeout: 10\n')
     r = a_round(rundir, target, monkeypatch)
     assert [g["status"] for g in r["gate_results"]] == ["green"], r["gate_results"]
+
+
+# ---------- the audit that serves, captures and judges ----------
+#
+# The real `audit` under an ActivityEnvironment with the supervisor call faked,
+# the way the round above fakes the executor. The app is the same local
+# `python -m http.server`, and the two things that need a real Chromium are
+# faked at the `activities.browser` seam every caller goes through:
+# `attach_browser`, and `capture_all` where a test wants pictures (AC-26).
+
+APP_WITH_PAGES = (f"serve:\n  cmd: {APP_CMD}\n  ready_timeout: 30\n"
+                  "capture:\n  - name: home\n    path: /\n"
+                  "  - name: settings\n    path: /settings\n    width: 375\n")
+
+
+def a_round_result(worktree="/wt"):
+    """What `execute_round` hands the audit, with nothing in it to judge."""
+    return {"claims": [], "files": [], "gate_results": [], "worktree": str(worktree)}
+
+
+def never_called(complaint):
+    """A stand-in for a browser call this state must never make."""
+    async def refuse(*args, **kwargs):
+        raise AssertionError(complaint)
+    return refuse
+
+
+def an_audit(rundir, worktree, monkeypatch):
+    """The real `audit` with the supervisor standing in for Claude.
+
+    Returns the verdict packet with what the supervisor was handed folded into
+    it: its prompt, its `env` and its `mcp_servers`."""
+    from activities import audit as au
+
+    seen = {}
+
+    async def fake_supervisor(prompt, wt, log_path, env=None, mcp_servers=None):
+        seen["prompt"], seen["env"], seen["mcp_servers"] = prompt, env, mcp_servers
+        return {"verdict": "accept", "reasons": [], "directive": {}, "parse_ok": True}
+
+    monkeypatch.setattr(au, "run_supervisor", fake_supervisor)
+    # A real activity context, so the heartbeats the serve and the captures send work.
+    from temporalio.testing import ActivityEnvironment
+    out = asyncio.run(ActivityEnvironment().run(
+        au.audit, str(rundir), a_round_result(worktree), 1, 1, "the item", 1, "brief"))
+    return {**out, **seen}
+
+
+def supervisor_options(monkeypatch, **kw):
+    """The ClaudeAgentOptions one `run_supervisor` call built."""
+    from activities import audit as au
+
+    seen = {}
+
+    async def fake_stream(prompt, options, log_path):
+        seen["options"] = options
+        return '```json\n{"verdict": "accept", "reasons": [], "directive": {}}\n```'
+
+    monkeypatch.setenv("LOOPGRAPH_IN_CONTAINER", "1")
+    monkeypatch.setattr(au, "stream_query", fake_stream)
+    asyncio.run(au.run_supervisor("judge it", "/wt", "/nowhere/audit.log", **kw))
+    return seen["options"]
+
+
+def test_the_browser_block_sits_between_the_engine_checks_and_the_gates():
+    """AC-12. It is an engine check like the write-set mismatch above it, and it
+    belongs ahead of the gates: the pictures are what the supervisor judges the
+    gate results against."""
+    p = assemble_audit_prompt("BRIEF", "", a_round_result(), "d",
+                              browser_evidence=evidence(shots=SHOTS))
+    assert (p.index("# Write set (from git status)") < p.index("# Browser (engine check)")
+            < p.index("# Gate results"))
+
+
+def test_an_audit_prompt_without_browser_evidence_is_what_it_was():
+    """AC-1. A run with no browser.yaml gets the prompt it got before this phase:
+    no heading, and no blank line where the block would have gone."""
+    args = ("BRIEF", "CONS", a_round_result(), "d", "answers", "the item", 1, 1, "brief")
+    assert assemble_audit_prompt(*args) == assemble_audit_prompt(*args, browser_evidence=None)
+    assert "# Browser" not in assemble_audit_prompt(*args)
+
+
+def test_without_browser_yaml_the_audit_serves_nothing_and_says_nothing(
+        rundir, target, monkeypatch):
+    """AC-1. A run with no web app is audited the way it was before this phase:
+    nothing served, nothing in the prompt, and no tools or app keys."""
+    monkeypatch.setattr(browser, "start_serve",
+                        never_called("a run with no browser.yaml was served anyway"))
+    r = an_audit(rundir, target, monkeypatch)
+    assert "# Browser" not in r["prompt"]
+    assert r["env"] is None and r["mcp_servers"] is None
+
+
+def test_the_diff_is_read_before_the_serve_starts(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """AC-7. `diff_including_new_files` runs `git add --intent-to-add` over the
+    untracked files it has just listed, and a dev server writing into the same
+    worktree between the two turns that into a pathspec error out of the
+    activity."""
+    from activities import audit as au
+    (rundir / "browser.yaml").write_text("serve:\n  cmd: npm run dev\n")
+    order, read_diff, serve = [], au.diff_including_new_files, RecordingServe()
+
+    async def diff(worktree):
+        order.append("diff")
+        return await read_diff(worktree)
+
+    async def start(*args, **kwargs):
+        order.append("serve")
+        return await serve.start(*args, **kwargs)
+
+    monkeypatch.setattr(au, "diff_including_new_files", diff)
+    monkeypatch.setattr(browser, "start_serve", start)
+    an_audit(rundir, target, monkeypatch)
+    assert order == ["diff", "serve"]
+
+
+def test_a_serve_that_never_comes_up_is_audited_without_captures_or_tools(
+        rundir, target, monkeypatch, reservations):
+    """AC-7. An app the engine could not bring up is evidence in the supervisor's
+    prompt, never a parked item. There is nothing to attach to and nothing to
+    capture, and the round is still judged on its diff and its gates."""
+    (rundir / "browser.yaml").write_text(NO_LISTENER)
+    monkeypatch.setattr(browser, "attach_browser",
+                        never_called("attached a browser for an app that never came up"))
+    monkeypatch.setattr(browser, "capture_all",
+                        never_called("captured a page of an app that never came up"))
+    r = an_audit(rundir, target, monkeypatch)
+    assert r["verdict"] == "accept"
+    assert "\n\n# Browser (engine check)" in r["prompt"], "the block is not a section"
+    assert "the-app-said-this" in r["prompt"], "the supervisor cannot see what the command said"
+    assert r["mcp_servers"] is None, "no app to look at, so no browser tools"
+
+
+def test_an_unreachable_browser_is_audited_without_captures_or_tools(
+        rundir, target, monkeypatch, reservations):
+    """AC-27 on the audit side. The app is up and Chromium is not, and the two are
+    separate facts: no captures, no tools, and a supervisor told which of them
+    failed rather than left to guess."""
+    (rundir / "browser.yaml").write_text(APP_WITH_PAGES)
+
+    async def refused(ws):
+        return BrowserAttach(ws=ws, ok=False, error="connect ECONNREFUSED 127.0.0.1:8420")
+
+    monkeypatch.setattr(browser, "attach_browser", refused)
+    monkeypatch.setattr(browser, "capture_all",
+                        never_called("captured through a browser that did not answer"))
+    r = an_audit(rundir, target, monkeypatch)
+    assert r["mcp_servers"] is None
+    assert f"did not answer at {browser_endpoint()}," in flat(r["prompt"])
+    # The app is up whatever the browser did, so the serve command and the
+    # supervisor were told about it the same way.
+    assert r["env"] == app_env(int(r["env"]["LOOPGRAPH_PORT"])), r["env"]
+
+
+def test_an_invalid_browser_yaml_is_audited_without_a_serve(rundir, target, monkeypatch):
+    """A file edited into a broken state after `lg start` reaches the supervisor as
+    evidence. Nothing is served, so there is no port and no app environment."""
+    (rundir / "browser.yaml").write_text(SERVE_PORT_IS_NOT_A_KEY)
+    monkeypatch.setattr(browser, "start_serve",
+                        never_called("a file that did not pass the check was served anyway"))
+    r = an_audit(rundir, target, monkeypatch)
+    assert r["verdict"] == "accept"
+    assert "browser.yaml is invalid: serve.port is not a key" in r["prompt"]
+    assert r["mcp_servers"] is None
+    assert r["env"] is None
+
+
+def test_a_ready_serve_is_captured_then_judged_then_stopped(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """AC-7 and AC-10. The captures come off the same app instance the supervisor
+    then browses, which is why they are taken in this activity, and the server is
+    gone by the time it returns."""
+    (rundir / "browser.yaml").write_text(APP_WITH_PAGES)
+    asked = {}
+
+    async def capture_all(entries, app_url, shots_dir, endpoint, heartbeat=None):
+        asked.update(entries=entries, url=app_url, dir=shots_dir)
+        return [{"name": e["name"], "path": e["path"], "width": e["width"],
+                 "png": f"{shots_dir}/{e['name']}.png", "error": None} for e in entries]
+
+    monkeypatch.setattr(browser, "capture_all", capture_all)
+    r = an_audit(rundir, target, monkeypatch)
+    port = int(r["env"]["LOOPGRAPH_PORT"])
+    assert asked["url"] == f"http://127.0.0.1:{port}", "the captures are of another app"
+    assert asked["dir"].endswith("shots/i1-r1"), asked["dir"]
+    assert [e["name"] for e in asked["entries"]] == ["home", "settings"]
+    assert "- settings: /settings at 375px -> " in r["prompt"]
+    assert r["mcp_servers"] == {"playwright": mcp_server_entry(
+        playwright_output_dir(str(rundir)), browser_endpoint(), browser_port())}
+    assert_port_closed(port)
+    assert port not in browser._reserved
+
+
+def test_a_failed_capture_reaches_the_prompt_as_an_error_line(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """AC-11 and AC-12. A page the engine could not load is the supervisor's
+    business: it gets the row and the sentence saying what to do with it."""
+    (rundir / "browser.yaml").write_text(APP_WITH_PAGES)
+
+    async def capture_all(entries, app_url, shots_dir, endpoint, heartbeat=None):
+        return [{"name": "settings", "path": "/settings", "width": 375, "png": None,
+                 "error": "net::ERR_ABORTED at /settings"}]
+
+    monkeypatch.setattr(browser, "capture_all", capture_all)
+    r = an_audit(rundir, target, monkeypatch)
+    assert "capture failed: net::ERR_ABORTED at /settings" in r["prompt"]
+    assert "That is a finding unless the diff explains it." in flat(r["prompt"])
+
+
+def test_the_supervisor_is_denied_evaluate_and_run_code_unsafe_only_when_attached(monkeypatch):
+    """AC-15. The supervisor is there to look, so the two tools that run code it
+    wrote itself are denied by name. Nothing else about its options moves: the
+    read-only tool set, the settings it loads and the tools it was already denied
+    are the same with a browser and without one."""
+    entry = mcp_server_entry(playwright_output_dir("/app/runs/demo"), browser_endpoint(),
+                             DEFAULT_BROWSER_PORT)
+    looking = supervisor_options(monkeypatch, env=app_env(4321),
+                                 mcp_servers={browser.MCP_SERVER_NAME: entry})
+    blind = supervisor_options(monkeypatch)
+    assert [t for t in looking.disallowed_tools if t.startswith("mcp__")] == \
+        browser.SUPERVISOR_DENIED
+    assert [t for t in blind.disallowed_tools if t.startswith("mcp__")] == []
+    assert looking.disallowed_tools[:len(blind.disallowed_tools)] == blind.disallowed_tools
+    assert looking.tools == blind.tools == ["Read", "Glob", "Grep"]
+    assert looking.setting_sources == blind.setting_sources == []
+    assert looking.mcp_servers == {"playwright": entry} and blind.mcp_servers == {}
+    assert looking.env == {**NO_TELEGRAM, **app_env(4321)}
+    assert blind.env == NO_TELEGRAM
+
+
+def test_the_audit_hands_its_heartbeat_to_the_serve_and_the_captures():
+    """AC-9. The audit's heartbeat_timeout in `workflows/run.py` is three minutes,
+    a serve may wait out 180 seconds and a capture a minute, so both of them have
+    to keep saying something or Temporal decides the worker died."""
+    src = " ".join(inspect.getsource(audit).split())
+    for call in ("browser.start_serve(", "browser.capture_all("):
+        args = src.split(call)[1].split(")")[0]
+        assert "heartbeat=activity.heartbeat" in args, args
 
 
 # ---------- the browser-container checklist ----------

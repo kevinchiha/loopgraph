@@ -14,6 +14,7 @@ from pathlib import Path
 
 from temporalio import activity
 
+from activities import browser
 from activities.execute_round import NO_TELEGRAM, _git, parse_final_json
 from activities.owner import read_answers
 from activities.stream import log_name, stream_query
@@ -102,7 +103,11 @@ def format_blocked(entries) -> str:
 
 def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff: str,
                           owner_answers: str = "", work_item: str = "",
-                          item_no: int = 1, item_total: int = 1, kind: str = "brief") -> str:
+                          item_no: int = 1, item_total: int = 1, kind: str = "brief",
+                          *, browser_evidence: dict | None = None) -> str:
+    # Keyword-only, and named for what it holds rather than `browser`: the module
+    # is imported under that name and a parameter would shadow it here, so
+    # `browser.audit_block(...)` would be a lookup on a dict.
     contract = (PROMPTS / "supervisor.md").read_text()
     claims = "\n".join(f"- {flatten_claim(c)}" for c in round_result.get("claims", [])) or "(no claims)"
     # Flattened for the same reason as claims: a path can contain a newline, and
@@ -131,6 +136,12 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
                      "so this round could be judged at all. Treat it as a signal "
                      "about how closely the rest of the contract was followed, and "
                      "check the claims harder than usual.")
+    # One of the engine's own checks, and it sits with them: what the engine saw
+    # of the app it served for this audit, whether that is a list of pictures or
+    # the reason there are none. Nothing at all for a run with no browser.yaml,
+    # whose prompt is byte-for-byte what it was.
+    browser_block = "" if browser_evidence is None else "\n\n" + browser.audit_block(
+        browser_evidence)
     invented, undeclared = declared_vs_actual(round_result)
     mismatch = ""
     if invented or undeclared:
@@ -178,7 +189,7 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
         # decision is not its to make, and judging these is the supervisor's job:
         # settle what it can settle, card what it cannot.
         f"# Executor says these are the owner's call\n\n{blocked}\n\n"
-        f"# Write set (from git status)\n\n{files}{mismatch}{violation}\n\n"
+        f"# Write set (from git status)\n\n{files}{mismatch}{violation}{browser_block}\n\n"
         f"# Gate results\n\n{gates}\n\n"
         f"# Unified diff (capped at {DIFF_CAP} chars)\n\n```diff\n{diff}{truncated}\n```\n\n"
         f"# Worktree (read-only spot checks)\n\n{round_result.get('worktree', '')}\n"
@@ -187,7 +198,11 @@ def assemble_audit_prompt(brief: str, constraints: str, round_result: dict, diff
 
 # ---------- container-side effects ----------
 
-async def run_supervisor(prompt: str, worktree: str, log_path: str) -> dict:
+async def run_supervisor(prompt: str, worktree: str, log_path: str,
+                         env: dict[str, str] | None = None,
+                         mcp_servers: dict | None = None) -> dict:
+    """The audit pass, with the app's environment and browser tools when the run
+    has them. Both arrive only when the app came up and the browser answered."""
     if os.environ.get("LOOPGRAPH_IN_CONTAINER") != "1":
         raise RuntimeError("refusing to run Claude outside the worker container")
     from claude_agent_sdk import ClaudeAgentOptions
@@ -201,8 +216,12 @@ async def run_supervisor(prompt: str, worktree: str, log_path: str) -> dict:
         # and `disallowed_tools` denies the rest, and a deny beats bypass.
         tools=["Read", "Glob", "Grep"],
         allowed_tools=["Read", "Glob", "Grep"],
+        # The browser adds two tools that run code the supervisor wrote itself,
+        # and it is here to look. Denied by name, and only when it has the
+        # browser at all: nothing else about the list moves.
         disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
-                          "BashOutput", "KillShell", "Task", "WebFetch", "WebSearch"],
+                          "BashOutput", "KillShell", "Task", "WebFetch", "WebSearch"]
+        + (browser.SUPERVISOR_DENIED if mcp_servers else []),
         # Load nothing from disk. cwd is the worktree the executor just wrote to,
         # so without this the CLI reads .claude/settings.json and CLAUDE.md from
         # the tree under audit: the audited party could plant a hook that runs
@@ -210,7 +229,13 @@ async def run_supervisor(prompt: str, worktree: str, log_path: str) -> dict:
         # accept. The executor still loads its project's settings; it is the one
         # being supervised, not the supervisor.
         setting_sources=[],
-        env=NO_TELEGRAM,
+        # The app's keys go on over the blanked bot credentials and never the
+        # other way round, the same order `run_executor` uses.
+        env=NO_TELEGRAM | (env or {}),
+        mcp_servers=mcp_servers or {},
+        # With or without a browser: cwd is the tree under audit, and its own
+        # .mcp.json would otherwise hand the supervisor servers nobody declared.
+        strict_mcp_config=True,
     ), log_path)
     return parse_verdict(text)
 
@@ -254,9 +279,63 @@ async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: in
     brief = (run / "brief.md").read_text()
     constraints = (run / "constraints.md").read_text() if (run / "constraints.md").exists() else ""
     worktree = round_result["worktree"]
+    # Ahead of the serve, and it has to stay there: this marks the untracked
+    # files it has just listed intent-to-add, and a dev server writing into the
+    # same worktree between the two turns that into a pathspec error out of the
+    # activity.
     diff = (await diff_including_new_files(worktree))[:DIFF_CAP]
-    prompt = assemble_audit_prompt(brief, constraints, round_result, diff,
-                                   read_answers(run_dir), work_item, item_no, item_total, kind)
-    verdict = await run_supervisor(prompt, worktree, str(run / "logs" / log_name(item_no, round_no, "audit")))
+
+    # The same file the round read, read again here: the audit serves the
+    # worktree a second time so the pictures and the supervisor's own browsing
+    # are of the app as the executor left it.
+    cfg = browser.read_browser_config(run_dir)
+    config_error = cfg.message if isinstance(cfg, browser.BrowserConfigError) else None
+    app, servers = None, None
+
+    # The last statement before the try that stops it, for `execute_round`'s
+    # reason: anything raising in between leaks the process group and the
+    # reserved port.
+    port = serve = None
+    if isinstance(cfg, dict):
+        port = browser.pick_port()
+        serve = await browser.start_serve(cfg["serve"]["cmd"], worktree, port,
+                                          cfg["serve"]["ready_timeout"],
+                                          heartbeat=activity.heartbeat)
+    try:
+        evidence = None
+        if config_error:
+            evidence = browser.browser_evidence(None, None, [], config_error=config_error)
+        elif serve is not None:
+            app = browser.app_env(port)
+            endpoint = browser.browser_endpoint()
+            # Asked once, and kept apart from the serve's own `ready` (AC-27).
+            # Nothing to attach to when the app never came up.
+            attach = None
+            if serve.ready:
+                attach = await browser.attach_browser(endpoint)
+            shots = []
+            if serve.ready and attach.ok:
+                # No entries is its own state, and the block says so. Asking for
+                # zero captures would spend a Chromium connection on nothing.
+                if cfg["capture"]:
+                    shots_dir = browser.shots_dir(run_dir, item_no, round_no)
+                    shots = await browser.capture_all(cfg["capture"], serve.url, shots_dir,
+                                                      endpoint, heartbeat=activity.heartbeat)
+                output_dir = browser.playwright_output_dir(run_dir)
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                servers = {browser.MCP_SERVER_NAME: browser.mcp_server_entry(
+                    output_dir, endpoint, browser.browser_port())}
+            evidence = browser.browser_evidence(serve, attach, shots)
+        prompt = assemble_audit_prompt(brief, constraints, round_result, diff,
+                                       read_answers(run_dir), work_item, item_no, item_total, kind,
+                                       browser_evidence=evidence)
+        verdict = await run_supervisor(prompt, worktree,
+                                       str(run / "logs" / log_name(item_no, round_no, "audit")),
+                                       env=app, mcp_servers=servers)
+    finally:
+        # However the audit ended, including a supervisor call that died: a dev
+        # server left holding the port outlives the run that started it.
+        if serve is not None:
+            await serve.stop()
     verdict["diff_chars"] = len(diff)
     return verdict

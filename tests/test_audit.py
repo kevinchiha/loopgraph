@@ -80,10 +80,15 @@ def test_a_brief_item_prompt_is_unchanged():
 
 def test_kind_is_the_last_parameter_of_audit_and_the_prompt():
     """The workflow calls audit positionally; an argument put anywhere but last
-    shifts what the auditor is told about the item it is judging."""
+    shifts what the auditor is told about the item it is judging.
+
+    The last POSITIONAL one, because the prompt also takes `browser_evidence`,
+    which is keyword-only and so cannot shift anything."""
     assert list(inspect.signature(audit).parameters) == [
         "run_dir", "round_result", "round_no", "item_no", "work_item", "item_total", "kind"]
-    assert list(inspect.signature(assemble_audit_prompt).parameters)[-1] == "kind"
+    positional = [name for name, p in inspect.signature(assemble_audit_prompt).parameters.items()
+                  if p.kind is not p.KEYWORD_ONLY]
+    assert positional[-1] == "kind"
 
 
 def test_the_audit_activity_hands_the_kind_to_the_prompt():
@@ -92,7 +97,8 @@ def test_the_audit_activity_hands_the_kind_to_the_prompt():
     a brief item with the whole suite still green."""
     src = " ".join(inspect.getsource(audit).split())
     assert ("assemble_audit_prompt(brief, constraints, round_result, diff, "
-            "read_answers(run_dir), work_item, item_no, item_total, kind)") in src
+            "read_answers(run_dir), work_item, item_no, item_total, kind, "
+            "browser_evidence=evidence)") in src
 
 
 def _section(prompt: str, heading: str) -> list[str]:
