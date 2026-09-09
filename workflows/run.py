@@ -695,8 +695,9 @@ class LoopGraphRun:
             elif outcome["status"] == "halt":
                 entry.update(status="parked", reason=outcome["reason"])
                 self._ledger.update(status="stopped", reason=outcome["reason"])
-                # Not one of the five end conditions, but it is still why the
-                # sweep ended, and that is the one key `lg status` reads.
+                # Not one of the reasons `sweep_end_reason` returns, but it is
+                # still why the sweep ended, and that is the one key
+                # `lg status` reads.
                 self._ledger["sweep"]["ended"] = outcome["reason"]
                 await self._stopped_note(run_dir, outcome["reason"], items_run, None)
                 return self._ledger

@@ -58,7 +58,8 @@ def test_run_one_red_on_timeout(tmp_path):
 
 def test_output_tail_bounded(tmp_path):
     # `|| true` because the gate now runs under pipefail: head closes the pipe,
-    # yes dies of SIGPIPE, and the pipeline reports 141. The next test pins that.
+    # yes dies of SIGPIPE, and the pipeline reports 141.
+    # `test_a_stage_that_stops_reading_early_is_red_with_141` pins that.
     r = asyncio.run(_run_one({"name": "loud", "cmd": "yes | head -c 8000 || true", "green_exit": 0, "timeout": 5}, str(tmp_path)))
     assert r["status"] == "green" and len(r["output_tail"]) == 4000
 
@@ -88,8 +89,9 @@ def test_the_exit_code_is_the_rightmost_failing_stage(tmp_path):
 
 def test_the_gate_runs_under_bash(tmp_path):
     """A gate written against bash gets bash. The old runner used /bin/sh, which
-    is dash in the worker container, and the scope gate below lost its `read -d`
-    loop to exactly that."""
+    is dash in the worker container. The scope gate below hit the same trap from
+    the other side, through its own `#!/bin/sh` shebang: the runner's shell never
+    reached inside a script it called, then or now."""
     r = asyncio.run(_run_one({"name": "shell", "cmd": 'echo "$0"', "green_exit": 0, "timeout": 5}, str(tmp_path)))
     assert r["status"] == "green"
     assert r["output_tail"].strip() == "/bin/bash"
@@ -150,13 +152,13 @@ def test_a_stage_that_stops_reading_early_is_red_with_141(tmp_path):
 # red reads exactly like a gate that passed.
 #
 # Which of these tests actually guards that regression depends on the machine,
-# and it is not the one you would expect. The four behavioural tests run the
+# and it is not the one you would expect. The behavioural tests run the
 # script through its own shebang, so on a host whose /bin/sh is bash — this one,
 # and most developer machines — they pass the broken version happily. The bug
 # only shows where the run actually happens, in the worker container, where
 # /bin/sh is dash. So `test_scope_gate_is_bash_not_sh` is the guard, and it is a
 # one-line string comparison on purpose: it is the only check here that fails on
-# a host that cannot reproduce the failure. The behavioural four are still worth
+# a host that cannot reproduce the failure. The behavioural ones are still worth
 # their runtime — they cover the parsing the comments below describe, including
 # the filename with a space that once made this gate red forever.
 

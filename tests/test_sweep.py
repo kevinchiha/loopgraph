@@ -482,8 +482,8 @@ def test_an_accepted_item_resets_the_stall_count():
 
 
 def test_a_halt_in_a_sweep_stops_the_run_and_records_why():
-    """A supervisor `stop` is not one of the five end conditions, but it is why
-    the sweep ended, and `lg status` reads that off one key."""
+    """A supervisor `stop` is not one of the reasons `sweep_end_reason` returns,
+    but it is why the sweep ended, and `lg status` reads that off one key."""
     fake = ScriptedWorkflow(config=_sweep(), passes=[_pass(_det(count=5))],
                             verdicts=[ACCEPT, STOP])
     ledger = drive(fake)
