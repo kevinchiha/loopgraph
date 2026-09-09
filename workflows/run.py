@@ -304,11 +304,20 @@ def sweep_end_reason(passes: list[dict], sweep: dict, elapsed: float, items_run:
     depending on which check happened to run first. Detector failure comes
     before everything else, because a zero from a detector that died is not a
     zero: the run would converge on a number the repo never had.
+
+    A pass that reports nothing before any item has run comes next, ahead of
+    convergence, because `converged` claims the run did work and this one did
+    none. A clean repo and detectors that match nothing hand back the same zero,
+    so the reason says both readings and names the detectors as the thing to
+    check.
     """
     latest = passes[-1]
     if latest["total"] == 0 and not latest["complete"]:
         failed = ", ".join(d["name"] for d in latest["detectors"] if d["note"])
         return f"detectors failed: {failed}"
+    if latest["complete"] and latest["total"] == 0 and items_run == 0:
+        return ("nothing reported, no item ran: a clean repo and detectors that match "
+                "nothing look the same, so check the detectors")
     if latest["complete"] and latest["total"] == 0:
         return "converged: nothing reported"
     floor = sweep["yield_floor"]

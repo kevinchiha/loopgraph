@@ -294,18 +294,42 @@ def test_a_grouped_item_quotes_its_group_alone_and_the_ledger_quotes_none():
 
 # ---------- what ends a sweep ----------
 
+NO_ITEM_RAN = ("nothing reported, no item ran: a clean repo and detectors that match "
+               "nothing look the same, so check the detectors")
+
+# The three ways a card can speak from an item: `location_line`'s header
+# (`item 2 of 3`), and `_stopped_note`'s committed and parked lists.
+FROM_AN_ITEM = ("item ", "- item ", "- parked item ")
+
+
 def test_zero_on_a_complete_pass_ends_at_once():
-    """AC-17. There is nothing to build an item from, and a second pass saying
-    the same thing would prove nothing."""
+    """AC-17 and AC-6. There is nothing to build an item from, and a second pass
+    saying the same thing would prove nothing. Nothing converged either: no item
+    ran, and a clean repo and detectors that match nothing give the same zero, so
+    the reason says both and sends the owner to the detectors."""
     fake = ScriptedWorkflow(config=_sweep(), passes=[_pass(_det(count=0))])
     ledger = drive(fake)
-    assert ledger["sweep"]["ended"] == "converged: nothing reported"
-    assert ledger["reason"] == "converged: nothing reported"
+    assert ledger["sweep"]["ended"] == NO_ITEM_RAN
+    assert ledger["reason"] == NO_ITEM_RAN
     assert ledger["status"] == "stopped"
     assert "execute_round" not in _names(fake)
     stopped = next(c for c in fake.cards if c[0] == "run stopped")
-    assert stopped[3].startswith("why: converged: nothing reported")
-    assert "item " not in stopped[3], "no item ran, so there is nowhere to speak from"
+    assert stopped[3].startswith("why: nothing reported, no item ran:")
+    assert not [l for l in stopped[3].splitlines() if l.startswith(FROM_AN_ITEM)], \
+        "no item ran, so there is nowhere to speak from"
+
+
+def test_nothing_reported_after_an_item_is_still_convergence():
+    """AC-6. The new reason belongs to a sweep that never ran an item. Once one
+    has, a pass reporting nothing is the run finishing, and the owner gets the
+    merge card rather than a note sending them off to check the detectors."""
+    fake = ScriptedWorkflow(config=_sweep(),
+                            passes=[_pass(_det(count=5)), _pass(_det(count=0))])
+    ledger = drive(fake)
+    assert ledger["reason"] == "converged: nothing reported"
+    assert ledger["sweep"]["ended"] == ledger["reason"]
+    assert [c[0] for c in fake.cards] == ["merge-ready"]
+    assert fake.cards[0][3].endswith("\n\nsweep ended: converged: nothing reported")
 
 
 def test_two_complete_passes_at_or_under_the_floor_converge():
@@ -478,14 +502,15 @@ def test_end_conditions_are_checked_in_the_spec_order():
     which check happened to run first."""
     sweep = {"yield_floor": 2, "deadline_seconds": 60, "max_items": 2, "detectors": []}
     past = 999  # seconds elapsed, well past the deadline
+    busy = _pass(_det(count=9))
     assert sweep_end_reason([_pass(_det(note="exit 1"))], sweep, past, 0, 0) == \
         "detectors failed: vulture"
-    assert sweep_end_reason([_pass(_det(count=0))], sweep, past, 0, 0) == \
+    assert sweep_end_reason([_pass(_det(count=0))], sweep, past, 0, 0) == NO_ITEM_RAN
+    assert sweep_end_reason([busy, _pass(_det(count=0))], sweep, past, 1, 0) == \
         "converged: nothing reported"
     assert sweep_end_reason([_pass(_det(count=2)), _pass(_det(count=1))],
                             sweep, past, 1, 0) == \
         "converged: two passes at or under 2 (2, 1)"
-    busy = _pass(_det(count=9))
     assert sweep_end_reason([busy], sweep, past, 2, 3) == "deadline reached after 2 items"
     assert sweep_end_reason([busy], sweep, 0, 2, 3) == "item cap 2 reached"
     assert sweep_end_reason([busy], sweep, 0, 1, 3) == \
