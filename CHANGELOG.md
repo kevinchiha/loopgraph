@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-09
+
 - Gates and detectors now run under bash with `pipefail`, so a pipeline is red when
   any stage fails. Before, only the last stage counted, and a gate like
   `pytest -q | tee log` could not fail. Two shapes go red that used to pass: a
