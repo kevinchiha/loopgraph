@@ -6,6 +6,15 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- Gates and detectors now run under bash with `pipefail`, so a pipeline is red when
+  any stage fails. Before, only the last stage counted, and a gate like
+  `pytest -q | tee log` could not fail. Two shapes go red that used to pass: a
+  `| head` or `grep -q` after a chatty command, which now reports exit 141 because
+  the command before it dies of SIGPIPE, and a `grep` that matches nothing, which
+  exits 1; wrap a grep stage that may legitimately find nothing as
+  `{ grep ... || [ $? = 1 ]; }`, braces included, because `||` binds looser than
+  `|`.
+
 ## 0.3.2 - 2026-09-09
 
 - `lg start` refuses a path the container cannot reach, instead of starting a run

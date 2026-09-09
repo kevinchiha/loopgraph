@@ -5,6 +5,7 @@ import subprocess
 import pytest
 
 from activities.gate import _run_one, load_gates
+from graphs.round_graph import run_round
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -55,8 +56,85 @@ def test_run_one_red_on_timeout(tmp_path):
 
 
 def test_output_tail_bounded(tmp_path):
-    r = asyncio.run(_run_one({"name": "loud", "cmd": "yes | head -c 8000", "green_exit": 0, "timeout": 5}, str(tmp_path)))
+    # `|| true` because the gate now runs under pipefail: head closes the pipe,
+    # yes dies of SIGPIPE, and the pipeline reports 141. The next test pins that.
+    r = asyncio.run(_run_one({"name": "loud", "cmd": "yes | head -c 8000 || true", "green_exit": 0, "timeout": 5}, str(tmp_path)))
     assert r["status"] == "green" and len(r["output_tail"]) == 4000
+
+
+# ---------- the shell the gate runs under ----------
+
+
+def test_a_pipeline_is_red_when_an_early_stage_fails(tmp_path):
+    """The defect this file's runner shipped with. A POSIX shell reports a
+    pipeline's exit as its last stage's, so `pytest -q | tee log` exited 0 with
+    pytest red, and gate exit codes are the only thing the round loop bounds
+    itself on."""
+    r = asyncio.run(_run_one({"name": "pipe", "cmd": "false | true", "green_exit": 0, "timeout": 5}, str(tmp_path)))
+    assert r["status"] == "red" and r["exit_code"] == 1
+
+
+def test_the_exit_code_is_the_rightmost_failing_stage(tmp_path):
+    """Which failure the executor is handed when two stages fail. Under pipefail
+    bash reports the last one that failed, not the first, and the skill states
+    that rule. The trailing `| true` does two jobs: it exits 0 under /bin/sh, so
+    this is red on the old runner, and it puts a passing stage after both failing
+    ones, so a shell reporting the first failure would say 3 and be caught."""
+    cmd = 'sh -c "exit 3" | sh -c "exit 4" | true'
+    r = asyncio.run(_run_one({"name": "twice", "cmd": cmd, "green_exit": 0, "timeout": 5}, str(tmp_path)))
+    assert r["status"] == "red" and r["exit_code"] == 4
+
+
+def test_the_gate_runs_under_bash(tmp_path):
+    """A gate written against bash gets bash. The old runner used /bin/sh, which
+    is dash in the worker container, and the scope gate below lost its `read -d`
+    loop to exactly that."""
+    r = asyncio.run(_run_one({"name": "shell", "cmd": 'echo "$0"', "green_exit": 0, "timeout": 5}, str(tmp_path)))
+    assert r["status"] == "green"
+    assert r["output_tail"].strip() == "/bin/bash"
+
+
+def test_the_command_is_passed_as_written(tmp_path):
+    """Nothing is prepended to the command string. A `set -o pipefail` line in
+    front of it would move every line number bash prints in its own errors by
+    one, and that text lands in output_tail. A shebang, a blank line and a
+    comment are just comments to `-c`, and the reported cmd still matches
+    gates.yaml character for character."""
+    cmd = "#!/bin/sh\n\n# a comment\nfalse | true"
+    r = asyncio.run(_run_one({"name": "written", "cmd": cmd, "green_exit": 0, "timeout": 5}, str(tmp_path)))
+    assert r["status"] == "red" and r["exit_code"] == 1
+    assert r["cmd"] == cmd
+
+
+def test_a_red_pipeline_reaches_the_executor_as_written(tmp_path):
+    """What the executor reads about a newly-red pipeline: its own command, and
+    nothing about the shell it ran under. `_why` prints `command: {cmd}` into the
+    correction feedback and `lg status` shows the owner the same string, so a
+    wrapper leaking into it would send the executor after a fault in loopgraph."""
+    seen = []
+
+    async def exec_fn(prompt, feedback):
+        seen.append(feedback)
+        return {"claims": [], "files_changed": [], "summary": "x"}
+
+    async def gate_fn():
+        return [await _run_one({"name": "pipe", "cmd": "false | true", "green_exit": 0, "timeout": 5}, str(tmp_path))]
+
+    asyncio.run(run_round("do the thing", exec_fn, gate_fn, max_attempts=2))
+    correction = seen[1]
+    assert "GATE pipe FAILED (exit 1)" in correction
+    assert "command: false | true" in correction
+    assert "pipefail" not in correction and "/bin/bash" not in correction
+
+
+def test_a_stage_that_stops_reading_early_is_red_with_141(tmp_path):
+    """What pipefail costs, pinned so nobody meets it as a mystery. head closes
+    the pipe, yes dies of SIGPIPE, and the pipeline reports 141. The runner masks
+    no exit code: it cannot tell a truncated producer from a tool that crashed,
+    so the number and the command go to the executor and the gate's author
+    decides."""
+    r = asyncio.run(_run_one({"name": "cut", "cmd": "yes | head -c 8000", "green_exit": 0, "timeout": 5}, str(tmp_path)))
+    assert r["status"] == "red" and r["exit_code"] == 141
 
 
 # ---------- the shipped scope gate ----------

@@ -81,8 +81,15 @@ async def _drain(stream, keep: int, buf: bytearray) -> None:
 
 
 async def _run_one(gate: dict, workdir: str, heartbeat=None) -> dict:
-    proc = await asyncio.create_subprocess_shell(
-        gate["cmd"],
+    # bash with pipefail, because /bin/sh reports a pipeline's exit as its last
+    # stage's: `pytest -q | tee log` exited 0 with pytest red. The gate exit code
+    # is the round loop's only bound, so a gate that cannot go red leaves it with
+    # nothing holding it. The exec form rather than a `set -o pipefail` line
+    # prepended to the command: a prefix moves every line number bash prints in
+    # its own errors by one, and that text goes to the executor as correction
+    # feedback and to the owner in `lg status`.
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/bash", "-o", "pipefail", "-c", gate["cmd"],
         cwd=workdir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
