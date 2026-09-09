@@ -204,11 +204,21 @@ def read_browser_config(run_dir: str) -> dict | BrowserConfigError | None:
     None when there is no file, which is a run with no web app; the config when
     the file is valid; the message as a `BrowserConfigError` when it is not, so a
     file edited after `lg start` reaches the prompt as evidence rather than
-    parking the item."""
-    path = Path(run_dir) / BROWSER_FILE
-    if not path.exists():
-        return None
+    parking the item.
+
+    The filesystem gets the same treatment as the parser. A directory in the
+    file's place, a file nobody may read, a disk that has gone away: raising any
+    of those out of an activity would have Temporal retry it and park the item,
+    which is the whole thing this return type exists to avoid. Opening the file
+    is also the test for whether it is there, so there is no window between a
+    look and a read for a deletion to fall into."""
     try:
-        return load_browser_config(str(path))
+        return load_browser_config(str(Path(run_dir) / BROWSER_FILE))
+    except FileNotFoundError:
+        return None
     except ValueError as e:
         return BrowserConfigError(str(e))
+    except OSError as e:
+        # The prefix the checker's own messages carry, so whatever prints this
+        # one prints it the same way.
+        return BrowserConfigError(f"browser.yaml: {e}")

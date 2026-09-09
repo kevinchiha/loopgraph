@@ -271,6 +271,9 @@ def test_the_activities_read_a_bad_file_as_a_value_and_never_a_raise(tmp_path):
     prompt, so the activities branch on the error instead of parking the item.
     `lg start` still gets the raise, because it has a person to print it to."""
     assert read_browser_config(str(tmp_path)) is None
+    # No exists() check to race against: a file deleted between the look and the
+    # read reads as absent, which is what a run with no web app looks like.
+    assert read_browser_config(str(tmp_path / "no-such-run")) is None
     path = tmp_path / "browser.yaml"
     path.write_text(MINIMAL)
     assert read_browser_config(str(tmp_path)) == parse_browser_config(MINIMAL)
@@ -281,6 +284,22 @@ def test_the_activities_read_a_bad_file_as_a_value_and_never_a_raise(tmp_path):
     with pytest.raises(ValueError) as err:
         load_browser_config(str(path))
     assert str(err.value) == PORT_MESSAGE
+
+
+def test_a_file_the_engine_cannot_read_is_an_error_value_too(tmp_path):
+    """Never raising has to hold for the filesystem as well as for the parser.
+    An activity that raised here would be retried by Temporal and park the item,
+    which is the outcome the error-as-a-value design is there to avoid.
+
+    A directory in the file's place is the case that reproduces on any machine;
+    a mode-000 file and a disk that has gone away arrive the same way."""
+    (tmp_path / "browser.yaml").mkdir()
+    bad = read_browser_config(str(tmp_path))
+    assert isinstance(bad, BrowserConfigError)
+    # The prefix every other message carries, and one line, because the prompt
+    # block and the owner's note print this one the same way as the rest.
+    assert bad.message.startswith("browser.yaml: ")
+    assert "\n" not in bad.message
 
 
 # ---------- the browser-container checklist ----------
