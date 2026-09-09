@@ -6,6 +6,16 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- `lg start` refuses a path the container cannot reach, instead of starting a run
+  that dies on it. The engine only ever sees two host directories: this checkout,
+  as `/app`, and your projects tree, as `/projects`. Giving it the path your shell
+  tab-completes — `/home/you/projects/thing` rather than `/projects/thing` — started
+  a workflow that died seconds later on `FileNotFoundError`, reported to your phone
+  as `engine failure:` with no hint of what was wrong. The refusal now happens
+  before Temporal is contacted, and where the translation exists it hands it over:
+  "Use /projects/thing instead." A mistyped repository name or run slug is the same
+  error from the same git command, so it is caught in the same place.
+
 ## 0.3.1 - 2026-09-08
 
 - A round is no longer killed for thinking. The executor and the supervisor tell

@@ -74,6 +74,9 @@ leaves the run reading `running` forever, with no card to the owner.
 
 **Paths in a run's `gates.yaml` are container paths.** `/app/runs/<slug>` for the
 run directory, `/projects/<name>` for a target repo. Host paths silently fail.
+`lg start` is the one place that checks: `unreachable` refuses a run dir or a
+target repo under neither mount before it connects, because `lg` runs on the host
+where both mounts are ordinary directories. Nothing checks a gates.yaml.
 
 **Never hardcode a home directory.** `tests/test_release.py` fails the build if you
 do. Everything machine-specific comes from `.env`, which `install.sh` writes.

@@ -381,6 +381,61 @@ def _container(path: str) -> str:
     return "/app/" + path if path.startswith("runs/") else path
 
 
+# The engine root, mounted at /app. The projects tree is ui.CONTAINER_PROJECTS,
+# borrowed rather than copied: a second spelling of "/projects/" is a drift away
+# from the dashboard resolving a repository the CLI has just refused.
+CONTAINER_APP = "/app/"
+
+
+def unreachable(what: str, path: str, projects_dir: str | None, root: str) -> str:
+    """Why the container cannot reach `path`, or "" when it can.
+
+    Two host directories are mounted into the worker: this checkout, as `/app`,
+    and the tree named by LOOPGRAPH_PROJECTS_DIR, as `/projects`. A path under
+    neither does not exist in there. `_container` rewrites `runs/<slug>` and
+    nothing else, so an absolute host path — the one a shell tab-completes, and
+    the only one the owner has ever needed for that repository — reached Temporal
+    untouched, started a run, and died on the first git command with a bare
+    `FileNotFoundError`, delivered to the owner's phone as `engine failure:` with
+    neither the cause nor the fix in it.
+
+    Nothing here needs the container. `lg` runs on the host, where both mounted
+    trees are ordinary directories, so the same check that the worker fails is
+    one `isdir` away before the connection is even made — which is also what
+    catches a mistyped repository name or run slug, the identical error from the
+    identical git command.
+
+    `projects_dir` comes from .env and is `None` before the first install; a
+    `/projects/...` path then passes, because nothing on this machine maps it and
+    a refusal would be a guess. It is expanded and its trailing slash dropped:
+    install.sh writes what the owner typed without normalising it, and matching
+    on the raw string would refuse a correct setup.
+    """
+    import ui
+    tree = os.path.expanduser(projects_dir or "").rstrip("/")
+    for prefix, base in ((ui.CONTAINER_PROJECTS, tree), (CONTAINER_APP, root)):
+        if not path.startswith(prefix):
+            continue
+        if not base:
+            return ""
+        host = os.path.join(base, path[len(prefix):])
+        if os.path.isdir(host):
+            return ""
+        return f"{what} {path} is not on this machine: no directory {host}."
+    said = (f"{what} {path} is a path on this machine, and the engine runs in a "
+            f"container that cannot see it.")
+    # The whole translation, when there is one to give. Compared with the slash
+    # on, so `<dir>projects-old` is not read as a directory inside `<dir>projects`
+    # and answered with a container path that exists on neither side of the mount.
+    if tree and path.startswith(tree + "/"):
+        return f"{said} Use {ui.CONTAINER_PROJECTS}{path[len(tree) + 1:]} instead."
+    if tree:
+        return (f"{said} Only {tree} is mounted, as /projects, so the repo has to "
+                f"live under it.")
+    return (f"{said} Target repos are named /projects/<name>; "
+            f"LOOPGRAPH_PROJECTS_DIR is not set, so run ./install.sh.")
+
+
 # The engine could not finish. NOT the same as the owner saying no: the workflow
 # overwrites "merge-ready" with the owner's answer before it returns, so treating
 # that one status as the only success meant every finished run, including a clean
@@ -393,9 +448,17 @@ def exit_code_for(status: str) -> int:
 
 
 async def cmd_start(args: argparse.Namespace) -> int:
-    client = await _client()
     run_dir = _container(args.run_dir)
     target = _container(args.target_repo) if args.target_repo else run_dir + "/target"
+    # Before the connection, so a path the worker cannot reach costs nothing: no
+    # workflow, no card, no worktree, and a reason the owner can act on.
+    projects_dir = _dotenv().get("LOOPGRAPH_PROJECTS_DIR")
+    for what, path in (("run dir", run_dir), ("target repo", target)):
+        why = unreachable(what, path, projects_dir, ROOT)
+        if why:
+            print(why, file=sys.stderr)
+            return 1
+    client = await _client()
     wf_id = f"run-{run_dir.rsplit('/', 1)[-1]}-{uuid.uuid4().hex[:6]}"
     handle = await client.start_workflow(
         "LoopGraphRun",
