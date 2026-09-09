@@ -23,15 +23,18 @@ it. Nothing in here opens a page.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
 import tomllib
 import types
 from contextlib import asynccontextmanager
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -1742,6 +1745,173 @@ def test_the_supervisor_section_and_the_audit_block_agree_on_who_took_the_captur
     block = flat(audit_block(evidence(shots=SHOTS[:1])))
     phrase = "from the app as the executor left it"
     assert phrase in contract and phrase in block
+
+
+# ---------- lg start refusing a run the browser cannot serve ----------
+#
+# AC-21. A run whose browser.yaml the checker refuses, or one started while
+# nothing is listening where the browser container should be, spends a whole
+# executor round finding that out and reaches the owner as a prompt block
+# instead of an answer. `lg` runs on the host, where the run directory is an
+# ordinary directory and the browser port an ordinary socket, so both are one
+# look away before Temporal is contacted at all -- next to the two path
+# refusals `tests/test_lg_start.py` covers, in the same place and the same voice.
+
+
+@pytest.fixture
+def lg():
+    """`lg` has no .py extension, so it loads by path, under a name of its own."""
+    loader = SourceFileLoader("lg_cli_browser", str(ROOT / "lg"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("lg_cli_browser", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def machine(tmp_path):
+    """A host with an engine root holding one run directory, and one repository
+    in the projects tree. Those two trees are what /app and /projects are."""
+    (tmp_path / "engine" / "runs" / "demo").mkdir(parents=True)
+    (tmp_path / "projects" / "investigator").mkdir(parents=True)
+    return tmp_path
+
+
+@pytest.fixture
+def listener():
+    """A socket that accepts, standing in for the browser container. The check is
+    a bare TCP connect, so this is the whole of what it wants: no Chromium, no
+    CDP, nothing off this machine."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        yield sock.getsockname()[1]
+
+
+def declare(machine, text):
+    """The run's browser.yaml, written where `lg` reads it: /app/runs/demo on the
+    worker is <engine root>/runs/demo on the host."""
+    (machine / "engine" / "runs" / "demo" / "browser.yaml").write_text(text)
+
+
+def refuses_to_connect(monkeypatch, lg):
+    """Nothing answers on any port, and the addresses tried, in order.
+
+    A real closed port would do for most of this, except on the one machine that
+    has the browser container up on 8420 -- which is the machine a maintainer
+    runs the suite on, and the test about the default port would pass there for
+    the wrong reason."""
+    tried = []
+
+    def connect(address, timeout=None):
+        tried.append(address)
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(lg.socket, "create_connection", connect)
+    return tried
+
+
+def test_a_run_without_browser_yaml_is_not_asked_about_the_browser(lg, machine, monkeypatch):
+    """Most runs have no web app, and for those the browser is none of their
+    business: no file, no port, no question about a container they never
+    needed and no two seconds spent asking."""
+    def connect(*args, **kw):
+        raise AssertionError("a run with no browser.yaml went looking for the browser")
+    monkeypatch.setattr(lg.socket, "create_connection", connect)
+    assert lg.browser_preflight("/app/runs/demo", str(machine / "engine"), {}) == ""
+
+
+def test_an_invalid_browser_yaml_is_refused_with_the_checkers_text(lg, machine, monkeypatch):
+    """The checker's message and nothing wrapped round it, so the person who
+    typed the file reads what is wrong with it and no engine vocabulary. The
+    port is not asked about: a file that will not parse declares nothing the
+    container could serve."""
+    tried = refuses_to_connect(monkeypatch, lg)
+    declare(machine, SERVE_PORT_IS_NOT_A_KEY)
+    assert lg.browser_preflight("/app/runs/demo", str(machine / "engine"), {}) == PORT_MESSAGE
+    assert tried == []
+
+
+def test_a_valid_browser_yaml_with_nothing_listening_names_the_profile_and_the_compose_command(
+        lg, machine):
+    """The other half of the wasted round: the file is right and the container is
+    not up, which is one line in .env and one command away. Both are in the
+    refusal because neither is guessable from `nothing answers on 127.0.0.1`.
+    `sudo docker` is what install.sh writes for an owner outside the docker
+    group, so the command is read from .env rather than assumed."""
+    declare(machine, MINIMAL)
+    port = browser._bind_free_port()
+    why = lg.browser_preflight("/app/runs/demo", str(machine / "engine"),
+                               {"LOOPGRAPH_BROWSER_PORT": str(port),
+                                "LOOPGRAPH_DOCKER": "sudo docker"})
+    assert why == (
+        f"/app/runs/demo/browser.yaml declares an app, and nothing answers on "
+        f"127.0.0.1:{port}, where the browser container listens. Set "
+        f"COMPOSE_PROFILES=browser in .env and bring the stack up with "
+        f"sudo docker compose up -d.")
+
+
+def test_a_valid_browser_yaml_with_a_listener_passes(lg, machine, listener):
+    """A machine with the stack up. Anything that answers the connect is the
+    container as far as this check is concerned: what protocol it then speaks is
+    the round's problem, and the round says so in its own words."""
+    declare(machine, FULL)
+    assert lg.browser_preflight("/app/runs/demo", str(machine / "engine"),
+                                {"LOOPGRAPH_BROWSER_PORT": str(listener)}) == ""
+
+
+def test_the_default_port_is_8420(lg, machine, monkeypatch):
+    """A .env with nothing about the browser in it is the ordinary machine.
+    Compose starts Chromium on 8420 and every client attaches there, so the
+    number in .env.example, in the activity and in this refusal is one number or
+    the refusal sends the owner to look at the wrong port. A typo reads as unset
+    for the same reason `browser_port` does it: `lg start` must not die on one."""
+    declare(machine, MINIMAL)
+    tried = refuses_to_connect(monkeypatch, lg)
+    why = lg.browser_preflight("/app/runs/demo", str(machine / "engine"), {})
+    assert f"127.0.0.1:{DEFAULT_BROWSER_PORT}" in why and DEFAULT_BROWSER_PORT == 8420
+    assert why.endswith("bring the stack up with docker compose up -d.")
+    lg.browser_preflight("/app/runs/demo", str(machine / "engine"),
+                         {"LOOPGRAPH_BROWSER_PORT": "no-such-port"})
+    assert tried == [("127.0.0.1", 8420), ("127.0.0.1", 8420)]
+
+
+def run_start(lg, monkeypatch, machine, env_text) -> int:
+    """`lg start runs/demo /projects/investigator`, argparse included, on a
+    machine with no Temporal.
+
+    The pattern is `tests/test_lg_start.py`'s, where the same command's path
+    refusals are tested: `_client` raises rather than returning a fake, so the
+    connection is a failed test where the run should have been refused and the
+    proof the check let it through where it should not."""
+    async def no_client():
+        raise AssertionError("lg start connected to Temporal")
+    monkeypatch.setattr(lg, "_client", no_client)
+    monkeypatch.setattr(lg, "ROOT", str(machine / "engine"))
+    (machine / "engine" / ".env").write_text(
+        f"LOOPGRAPH_PROJECTS_DIR={machine}/projects\n" + env_text)
+    monkeypatch.setattr(sys, "argv", ["lg", "start", "runs/demo", "/projects/investigator"])
+    return lg.main()
+
+
+def test_the_command_refuses_before_connecting(lg, monkeypatch, machine, capsys):
+    """The whole point: no workflow, no card, no worktree and no round anybody
+    paid for. Exit 1 with the reason on stderr, the way the two refusals beside
+    it already do -- stdout of a start is the workflow id and the ledger."""
+    declare(machine, SERVE_PORT_IS_NOT_A_KEY)
+    code = run_start(lg, monkeypatch, machine, "")
+    out = capsys.readouterr()
+    assert code == 1
+    assert out.out == ""
+    assert out.err.strip() == PORT_MESSAGE
+
+
+def test_the_command_reaches_the_connection_with_a_listener(lg, monkeypatch, machine, listener):
+    """The check is not allowed to become the thing that stops a correct run.
+    The fake `_client` is the proof it was reached."""
+    declare(machine, MINIMAL)
+    with pytest.raises(AssertionError, match="connected to Temporal"):
+        run_start(lg, monkeypatch, machine, f"LOOPGRAPH_BROWSER_PORT={listener}\n")
+
 
 
 # ---------- the browser-container checklist ----------

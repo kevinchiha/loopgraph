@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tomllib
@@ -44,6 +45,10 @@ FETCH_TIMEOUT = 60.0
 STACK_TIMEOUT = 1800.0
 # Each captured compose read: the `ps` and one log poll.
 POLL_TIMEOUT = 60.0
+# The one connect that says whether the browser container is up, before a run
+# that declares a web app is started. Loopback, so anything that is going to
+# answer has answered by then.
+BROWSER_TIMEOUT = 2
 # Each git command `lg rm` runs against a target repository. Both only touch that
 # repository's own records — no network, no checkout — so a minute is already
 # generous; it is here so a repository on a filesystem that stopped answering
@@ -436,6 +441,60 @@ def unreachable(what: str, path: str, projects_dir: str | None, root: str) -> st
             f"LOOPGRAPH_PROJECTS_DIR is not set, so run ./install.sh.")
 
 
+def browser_preflight(run_dir: str, root: str, env: dict[str, str]) -> str:
+    """Why this run's web app cannot be served, or "" when it can.
+
+    A run that declares one in `<run_dir>/browser.yaml` needs two things that
+    have nothing to do with Temporal: a file the checker accepts, and the browser
+    container listening. Nothing in the round refuses either — a file that does
+    not parse and a container that is down are both recorded and written into the
+    executor's prompt — so the first anyone hears of either is a whole round the
+    model spent working blind, and a bill nobody meant to pay.
+
+    `lg` can answer both before it connects, the way `unreachable` answers for a
+    path: it runs on the host, where the run directory is an ordinary directory
+    under `root` and the browser port is an ordinary socket on 127.0.0.1.
+
+    The import is here rather than at the top because it is the one command that
+    wants it: `activities.browser` pulls in yaml and the gate module, and
+    `lg --help` should not.
+    """
+    from activities.browser import (BROWSER_FILE, DEFAULT_BROWSER_PORT,
+                                    load_browser_config)
+    if not run_dir.startswith(CONTAINER_APP):
+        return ""
+    host = os.path.join(root, run_dir[len(CONTAINER_APP):], BROWSER_FILE)
+    try:
+        load_browser_config(host)
+    except FileNotFoundError:
+        return ""  # no web app, which is most runs
+    except ValueError as e:
+        # The checker's own words and nothing round them: they name the key and
+        # what to write instead, and are already addressed to whoever typed it.
+        return str(e)
+    except OSError as e:
+        # A directory in the file's place, or one nobody may read. Same prefix
+        # the checker's messages carry, so it reads as one of them.
+        return f"{BROWSER_FILE}: {e}"
+    # Whatever is not a number reads as unset, the way activities.browser does
+    # it: compose hands Chromium that same string, so a typo means the container
+    # is not up either and the refusal below is the true one.
+    written = env.get("LOOPGRAPH_BROWSER_PORT", "")
+    port = int(written) if written.isdigit() else DEFAULT_BROWSER_PORT
+    try:
+        # A bare TCP connect, not a request: what the browser speaks on that port
+        # is the round's business, and this only has to tell an owner with no
+        # container up from one with it running.
+        socket.create_connection(("127.0.0.1", port), timeout=BROWSER_TIMEOUT).close()
+    except OSError:
+        docker = env.get("LOOPGRAPH_DOCKER", "docker")
+        return (f"{run_dir}/{BROWSER_FILE} declares an app, and nothing answers on "
+                f"127.0.0.1:{port}, where the browser container listens. Set "
+                f"COMPOSE_PROFILES=browser in .env and bring the stack up with "
+                f"{docker} compose up -d.")
+    return ""
+
+
 # The engine could not finish. NOT the same as the owner saying no: the workflow
 # overwrites "merge-ready" with the owner's answer before it returns, so treating
 # that one status as the only success meant every finished run, including a clean
@@ -452,12 +511,19 @@ async def cmd_start(args: argparse.Namespace) -> int:
     target = _container(args.target_repo) if args.target_repo else run_dir + "/target"
     # Before the connection, so a path the worker cannot reach costs nothing: no
     # workflow, no card, no worktree, and a reason the owner can act on.
-    projects_dir = _dotenv().get("LOOPGRAPH_PROJECTS_DIR")
+    env = _dotenv()
     for what, path in (("run dir", run_dir), ("target repo", target)):
-        why = unreachable(what, path, projects_dir, ROOT)
+        why = unreachable(what, path, env.get("LOOPGRAPH_PROJECTS_DIR"), ROOT)
         if why:
             print(why, file=sys.stderr)
             return 1
+    # After the paths: a run directory the worker cannot reach has no browser.yaml
+    # to read, and a path is the rule the owner can act on with no browser in the
+    # picture at all.
+    why = browser_preflight(run_dir, ROOT, env)
+    if why:
+        print(why, file=sys.stderr)
+        return 1
     client = await _client()
     wf_id = f"run-{run_dir.rsplit('/', 1)[-1]}-{uuid.uuid4().hex[:6]}"
     handle = await client.start_workflow(
