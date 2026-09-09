@@ -1,4 +1,5 @@
 import asyncio
+import os
 import pathlib
 import subprocess
 
@@ -170,8 +171,10 @@ def _repo_with(tmp_path, *names):
     return tmp_path
 
 
-def _run_gate(cwd):
-    return subprocess.run([str(SCOPE_GATE)], cwd=cwd, capture_output=True, text=True)
+def _run_gate(cwd, env=None):
+    """`env=None` inherits this process's environment, which is what every
+    caller but the git-failure test wants."""
+    return subprocess.run([str(SCOPE_GATE)], cwd=cwd, capture_output=True, text=True, env=env)
 
 
 def test_scope_gate_is_bash_not_sh():
@@ -203,3 +206,18 @@ def test_scope_gate_survives_a_filename_with_a_space(tmp_path):
     out = _run_gate(_repo_with(tmp_path, "two words.py"))
     assert out.returncode != 0
     assert "two words.py" in out.stdout
+
+
+def test_scope_gate_goes_red_when_git_status_fails(tmp_path):
+    """The gate has to be red when it could not look. `|| bad=1` reads the exit
+    of the `{ ... }` block, so without pipefail a failing `git status` hands the
+    block no input, the loop never runs, the block exits 0, and the gate prints
+    "write set in scope" having checked nothing. GIT_DIR names a path that does
+    not exist, so git exits 128 wherever pytest puts tmp_path, and the third
+    assertion is what says the red came from git: the first two are satisfied by
+    the script failing for any reason at all, a bad shebang included."""
+    env = {**os.environ, "GIT_DIR": str(tmp_path / "nowhere")}
+    out = _run_gate(_repo_with(tmp_path), env=env)
+    assert out.returncode != 0, f"gate passed while git was broken: {out.stdout!r}"
+    assert "write set in scope" not in out.stdout
+    assert "not a git repository" in out.stderr, out.stderr

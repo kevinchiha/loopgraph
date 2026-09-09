@@ -16,6 +16,14 @@
 # A rename is two records: the new name, then the source path on its own. Reading
 # the source as a record strips three characters off a bare path and reports a
 # mangled name, so `skip` drops it the way the engine's own parser does.
+#
+# pipefail, because `|| bad=1` below reads the exit of the `{ ... }` block and
+# not git's. When `git status` itself fails the block gets empty input, the loop
+# never runs, the block exits 0, and the gate prints "write set in scope" having
+# looked at nothing. The engine runs a gate's command under `bash -o pipefail`,
+# but that sets the option in the shell it starts, and a script run by its own
+# shebang is a fresh bash with the defaults.
+set -o pipefail
 bad=0
 git status --porcelain -z --untracked-files=all | {
   skip=0

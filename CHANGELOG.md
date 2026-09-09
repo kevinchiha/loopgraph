@@ -13,9 +13,10 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   the command before it dies of SIGPIPE, and a `grep` that matches nothing, which
   exits 1; wrap a grep stage that may legitimately find nothing as
   `{ grep ... || [ $? = 1 ]; }`, braces included, because `||` binds looser than
-  `|`. A sweep whose first pass reports nothing no longer says `converged`; it says
-  no item ran and names the detectors as the thing to check, because a clean repo
-  and detectors that match nothing look the same.
+  `|`. A sweep whose first pass reports nothing no longer says `converged`; it
+  says no item ran and names the detectors as the thing to check, because a clean
+  repo and detectors that match nothing look the same. The shipped scope gate
+  template sets `pipefail` itself.
 
 ## 0.3.2 - 2026-09-09
 
