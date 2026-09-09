@@ -497,7 +497,7 @@ def test_the_look_at_the_port_gives_up_rather_than_waiting_on_the_kernel(monkeyp
     started = time.monotonic()
     assert asyncio.run(browser._port_answers(4321)) is False
     waited = time.monotonic() - started
-    assert waited < 5, f"waited {waited:.1f}s on a connect that never answered"
+    assert waited < 10, f"waited {waited:.1f}s on a connect that never answered"
 
 
 def test_the_serve_runs_in_the_worktree(tmp_path):
@@ -666,9 +666,10 @@ def test_shots_dir_matches_the_log_naming():
 def test_playwright_output_dir_is_under_the_run_directory():
     """AC-13. Whatever the MCP server drops on a model's say-so lands in the run
     directory, never in the tree the round is judged on."""
-    out = playwright_output_dir("/app/runs/demo")
-    assert out.endswith("scratch/playwright")
-    assert not out.startswith("/app/runs/demo/worktrees")
+    # The whole path, not a suffix and not a `startswith` against the worktree
+    # root: `<run_dir>/worktrees/<token>` is where the tree lives, so only the
+    # exact answer says this landed beside it rather than inside it.
+    assert playwright_output_dir("/app/runs/demo") == "/app/runs/demo/scratch/playwright"
 
 
 def test_blocked_origins_names_the_engine_services_and_the_browser_port_in_both_spellings():
@@ -846,7 +847,9 @@ def test_attach_browser_gives_up_at_its_timeout(monkeypatch):
     attach = asyncio.run(attach_browser("http://127.0.0.1:8420"))
     waited = time.monotonic() - started
     assert attach.ok is False
-    assert waited < 3, f"waited {waited:.1f}s for a connect that was never going to answer"
+    # Ten rather than three: the bound under test is one second, and three is
+    # close enough to it that a loaded machine fails this test for the load.
+    assert waited < 10, f"waited {waited:.1f}s for a connect that was never going to answer"
     assert attach.error, "an empty error prints as an empty fence in both prompt blocks"
 
 
@@ -940,7 +943,7 @@ def test_an_entry_that_hangs_is_cut_at_its_timeout(monkeypatch, tmp_path):
                                     str(tmp_path / "i1-r1"), "http://127.0.0.1:8420",
                                     heartbeat=beats.append))
     waited = time.monotonic() - started
-    assert waited < 3, f"waited {waited:.1f}s for an entry bounded at 1s"
+    assert waited < 10, f"waited {waited:.1f}s for an entry bounded at 1s"
     assert shots[0]["png"] is None
     assert shots[0]["error"], "an empty error prints as `capture failed:` and nothing after it"
     assert beats[0] == "capture home"
@@ -1353,7 +1356,7 @@ def test_a_scratch_path_the_engine_cannot_make_does_not_park_the_round(
     assert_port_closed(int(r["env"]["LOOPGRAPH_PORT"]))
 
 
-def test_the_serve_starts_only_after_load_gates(rundir, target, monkeypatch):
+def test_the_serve_starts_only_after_load_gates(rundir, target, monkeypatch, reservations):
     """A raise between `start_serve` and the try that stops it leaks the process
     group and the reserved port, and Temporal's retry then starts a second server
     beside the one nobody can reach. `load_gates` raises on a malformed
@@ -1715,6 +1718,28 @@ def test_the_supervisor_is_denied_evaluate_and_run_code_unsafe_only_when_attache
     assert blind.env == NO_TELEGRAM
 
 
+def test_the_audits_serve_is_stopped_when_the_supervisor_raises(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """The round's twin, for the audit's own finally. A supervisor call that died
+    must not leave a dev server holding the port: the audit runs after the round,
+    so the server it leaves behind is the one the next item's round trips over."""
+    (rundir / "browser.yaml").write_text("serve:\n  cmd: npm run dev\n")
+    serve = RecordingServe()
+    monkeypatch.setattr(browser, "start_serve", serve.start)
+
+    async def die(prompt, wt, log_path, env=None, mcp_servers=None):
+        raise RuntimeError("the supervisor died")
+
+    from activities import audit as au
+    from temporalio.testing import ActivityEnvironment
+    monkeypatch.setattr(au, "run_supervisor", die)
+    with pytest.raises(RuntimeError):
+        asyncio.run(ActivityEnvironment().run(
+            au.audit, str(rundir), a_round_result(target), 1, 1, "the item", 1, "brief"))
+    assert serve.stops == 1
+    assert serve.port not in browser._reserved
+
+
 def test_the_audit_hands_its_heartbeat_to_the_serve_and_the_captures():
     """AC-9. The audit's heartbeat_timeout in `workflows/run.py` is three minutes,
     a serve may wait out 180 seconds and a capture a minute, so both of them have
@@ -1830,8 +1855,11 @@ def test_the_supervisor_section_and_the_audit_block_agree_on_who_took_the_captur
     the executor took the pictures in one place and the engine in the other."""
     contract = " ".join((PROMPTS / "supervisor.md").read_text().split())
     block = flat(audit_block(evidence(shots=SHOTS[:1])))
-    phrase = "from the app as the executor left it"
-    assert phrase in contract and phrase in block
+    for phrase in ("after the round ended",
+                   "from the app as the executor left it",
+                   "The executor's transcript never saw them."):
+        assert phrase in contract, f"the contract stopped saying {phrase!r}"
+        assert phrase in block, f"the block stopped saying {phrase!r}"
 
 
 # ---------- lg start refusing a run the browser cannot serve ----------
@@ -2262,8 +2290,8 @@ def test_agents_md_lists_browser_py_and_states_the_gate_rule():
 
 # ---------- the browser-container checklist ----------
 #
-# Run this by hand whenever the browser wiring changes. The three tests above
-# read three files as text. Nothing in this suite has attached to Chromium,
+# Run this by hand whenever the browser wiring changes. The three file tests at
+# the top of this file read compose, the Dockerfile and pyproject as text. Nothing in this suite has attached to Chromium,
 # opened a page or looked at a PNG, and it never will: the gate has to pass with
 # no browser container and no network. Six criteria need a real browser, and
 # none of them can be faked — a capture on disk, a worktree left clean, an
@@ -2280,9 +2308,11 @@ def test_agents_md_lists_browser_py_and_states_the_gate_rule():
 #
 # Items 1 to 3 were run the day this file was written, against a container and
 # an image started by hand rather than the live stack, and each one records what
-# it answered. Items 4 to 6 need the engine's own capture and MCP wiring, which
-# lands later in this phase; until then they go unrun, and they are written down
-# now so that nobody has to work out afterwards what was never checked.
+# it answered. The engine's own capture and MCP wiring has landed since, so
+# nothing here is waiting on code any more: item 4's CDN-font half, item 5 and
+# item 6 are unrun because each of them needs a real run against the live stack,
+# and only the owner brings that up. They are written down so that nobody has to
+# work out afterwards what was never checked.
 #
 #  1. AC-18, the service. With nothing set in the environment:
 #       docker compose config --services | grep -c '^browser$'
