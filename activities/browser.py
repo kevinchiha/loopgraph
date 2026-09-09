@@ -57,7 +57,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import signal
 import socket
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -65,7 +64,7 @@ from pathlib import Path
 
 import yaml
 
-from activities.gate import _drain
+from activities.gate import _drain, _kill_group
 
 BROWSER_FILE = "browser.yaml"
 CAPTURE_CAP = 10
@@ -351,27 +350,6 @@ def gate_env(run_dir: str) -> dict[str, str] | None:
     return {ENDPOINT_ENV: browser_endpoint()}
 
 
-def _kill_serve(proc) -> None:
-    """Kill the serve and everything it started.
-
-    Not `gate._kill_group`, which asks the OS for the group with
-    `os.getpgid(proc.pid)`. A gate's shell is still running when its timeout
-    fires; a serve's shell often is not. A command that daemonises exits 0 and
-    leaves the real server behind it, and once that shell has been reaped there
-    is no process left to ask, so the group kill finds nothing and the server
-    keeps the port for the next round.
-
-    `start_new_session=True` made the shell the group leader, so its pid is the
-    group's number whether or not the shell itself still exists, and the group
-    lives as long as any member of it does."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        # Nothing is left in the group, which is the ordinary end of a serve
-        # whose command exited on its own.
-        pass
-
-
 async def _port_answers(port: int) -> bool:
     """Whether anything accepts a connection on the port, closed again at once.
 
@@ -420,7 +398,7 @@ class Serve:
         # Dropped before the kill, so a second call finds nothing to kill.
         self._proc = self._drain = None
         if proc is not None:
-            _kill_serve(proc)
+            _kill_group(proc)
             # The two seconds `_run_one` gives its own drain, for its reason: a
             # child that outlived the shell holds the pipe open and EOF never
             # comes, and what the process wrote is in the buffer by now.
@@ -492,7 +470,7 @@ async def start_serve(cmd: str, workdir: str, port: int, ready_timeout: int,
     waiter.cancel()
     if ready:
         return result(True, _tail(out), proc, drain)
-    _kill_serve(proc)
+    _kill_group(proc)
     try:
         await asyncio.wait_for(asyncio.shield(drain), timeout=2)
     except (asyncio.TimeoutError, asyncio.CancelledError):

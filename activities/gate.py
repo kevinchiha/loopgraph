@@ -33,10 +33,18 @@ _GREEN_RE = re.compile(r"^exit (\d+)$")
 
 
 def _kill_group(proc) -> None:
-    """Kill the gate and everything it started. proc.kill() signals only the
-    shell, so a build's child processes survived the timeout and kept running."""
+    """Kill the command and everything it started. proc.kill() signals only the
+    shell, so a build's child processes survived the timeout and kept running.
+
+    The pid is the group's number, and is not looked up. Every caller starts its
+    shell with `start_new_session=True`, which makes that shell the group leader,
+    so its pid names the group whether or not the shell itself still exists.
+    `os.getpgid(proc.pid)` asked the OS instead and raised once the shell had
+    been reaped, which is exactly what a command that daemonises does: it exits 0
+    and leaves the real server behind it, and the group then outlived the kill
+    and kept the port."""
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         try:
             proc.kill()
