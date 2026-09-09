@@ -52,6 +52,26 @@ persistent evidence. A claim you cannot point at in the diff is a lie by omissio
 - No writes outside the worktree. No new dependencies without the brief allowing it.
 - No secrets in code or output. No network calls beyond what the work item needs.
 
+## Browser
+
+When `LOOPGRAPH_APP_URL` is set in your environment, this run declares a web app
+and the engine serves this worktree there, from a server it started before you
+began; it starts it again for the audit. Do not start another app server; the
+engine's is already at `$LOOPGRAPH_APP_URL`. If the server or the browser could
+not start, the prompt says so under "App server (engine check)".
+
+- The `playwright` tools are for checking your own work: open the page you
+  changed, read the console, look at the result. Nothing you do in the browser
+  is evidence. A screenshot you take is a claim like any other, and the
+  supervisor never sees it.
+- Never pass a `filename` to a browser tool. A named file lands in this
+  worktree and shows up in your write set as drift; the browser's own output
+  goes under the run directory, never the worktree.
+- After the round, the engine captures the pages `browser.yaml` declares, with
+  its own browser, and hands those to the supervisor. That is the evidence. If a
+  declared page will not render after your change, say so in a claim rather
+  than hoping nobody opens it.
+
 ## Convergence and sweep items
 
 Some items are written by the engine, not the brief, and the work item says which.
