@@ -5,6 +5,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends git nodejs npm 
 # Claude Agent SDK shells out to the claude CLI
 RUN npm install -g @anthropic-ai/claude-code
 
+# The browser tools. The MCP server the models drive and the Python client the
+# engine captures with both attach to Chromium in the browser container over
+# CDP, so neither needs a browser of its own: this image downloads no browser,
+# at build time or at run time.
+RUN npm install -g @playwright/mcp@0.0.80
+
 WORKDIR /app
 COPY pyproject.toml ./
 # Install exactly what pyproject declares, version floors included. A second

@@ -68,6 +68,30 @@ services:
     # engine looked like it was running. Bring the stack up deliberately with
     # `docker compose up -d`.
 
+  browser:
+    # Chromium for runs that declare a web app in browser.yaml. Behind a profile
+    # because the image is about 1.5GB and most runs never open a page:
+    # COMPOSE_PROFILES=browser in .env is the switch. Host network, like the
+    # worker, because the app it looks at is served on the worker's 127.0.0.1.
+    # Chromium is started with its own debugging port and the worker attaches
+    # over CDP, so neither side cares which Playwright version the other runs.
+    image: mcr.microsoft.com/playwright:v1.63.0-noble
+    profiles: [browser]
+    network_mode: host
+    ipc: host
+    init: true
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec /ms-playwright/chromium-*/chrome-linux*/chrome
+        --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage
+        --remote-debugging-address=127.0.0.1
+        --remote-debugging-port=${LOOPGRAPH_BROWSER_PORT:-8420}
+        --user-data-dir=/tmp/loopgraph-chromium
+        about:blank
+    # No restart policy, for the reason the worker has none.
+
   dispatcher:
     # The only thing that reads Telegram. Telegram allows one getUpdates per bot,
     # and text replies carry no run id, so runs polling for themselves fought over
