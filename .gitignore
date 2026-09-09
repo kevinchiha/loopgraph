@@ -22,6 +22,8 @@ runs/*
 runs/*/worktrees/
 runs/*/logs/
 runs/*/target/
+runs/*/shots/
+runs/*/scratch/
 # constraints.md is scratch too, though it does not look like it: `learn` appends
 # to it after every accepted item, so a tracked one accumulates whatever the last
 # person to run the example happened to learn. The example-hello copy shipped five

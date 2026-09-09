@@ -12,6 +12,12 @@ error out, so those are ordinary parser checks. Neither does the serve: the app
 under test in here is a real local `python -m http.server`, and what those tests
 watch is the engine's own half of it — the port it hands out, the shell it runs
 the command under, and the process group it kills.
+
+The attach and the captures are faked at the one boundary both clients go
+through, `playwright.async_api.async_playwright`. What those tests watch is the
+engine's half again: the bound it puts round an entry, the paths it writes to,
+the entry it hands the MCP server, and the words each model reads about all of
+it. Nothing in here opens a page.
 """
 
 from __future__ import annotations
@@ -19,9 +25,11 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import subprocess
 import sys
 import time
 import tomllib
+import types
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -29,10 +37,13 @@ import pytest
 import yaml
 
 from activities import browser
-from activities.browser import (DEFAULT_BROWSER_PORT, BrowserConfigError, app_env,
-                                browser_endpoint, browser_port, gate_env,
-                                load_browser_config, parse_browser_config, pick_port,
-                                read_browser_config, release_port, start_serve)
+from activities.browser import (DEFAULT_BROWSER_PORT, BrowserAttach, BrowserConfigError,
+                                Serve, app_env, attach_browser, audit_block,
+                                blocked_origins, browser_endpoint, browser_evidence,
+                                browser_port, capture_all, executor_block, gate_env,
+                                load_browser_config, mcp_server_entry, parse_browser_config,
+                                pick_port, playwright_output_dir, read_browser_config,
+                                release_port, shots_dir, start_serve)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -592,6 +603,453 @@ def test_stop_is_idempotent(tmp_path):
             assert never.ready is False
         await never.stop()
     asyncio.run(main())
+
+
+# ---------- the paths, the origins and the MCP entry ----------
+
+
+def test_shots_dir_matches_the_log_naming():
+    """`i<N>-r<M>`, the shape `stream.log_name` gives a round's logs, so the
+    shots of a round and its transcript are findable under one name."""
+    assert shots_dir("/app/runs/demo", 2, 3) == "/app/runs/demo/shots/i2-r3"
+    assert shots_dir("/app/runs/demo", 10, 1) == "/app/runs/demo/shots/i10-r1"
+
+
+def test_playwright_output_dir_is_under_the_run_directory():
+    """AC-13. Whatever the MCP server drops on a model's say-so lands in the run
+    directory, never in the tree the round is judged on."""
+    out = playwright_output_dir("/app/runs/demo")
+    assert out.endswith("scratch/playwright")
+    assert not out.startswith("/app/runs/demo/worktrees")
+
+
+def test_blocked_origins_names_the_engine_services_and_the_browser_port_in_both_spellings():
+    """AC-16. The engine's own loopback services and nothing else. A page is
+    reached by whichever spelling it was written with, so both are listed, and
+    the list holds no port an app under test could be on: it is the models'
+    browsers being kept off the dashboard and Temporal, not a firewall."""
+    origins = blocked_origins(DEFAULT_BROWSER_PORT).split(";")
+    assert len(origins) == 10
+    assert origins[0] == "http://127.0.0.1:7233"
+    assert origins[-1] == "http://localhost:8420"
+    assert {o.rsplit(":", 1)[1] for o in origins} == {"7233", "8233", "8400", "8317", "8420"}
+    # The browser port is last and comes from the argument, so a machine that
+    # moved Chromium blocks the port it actually moved it to.
+    assert blocked_origins(8431).endswith(";http://127.0.0.1:8431;http://localhost:8431")
+
+
+def test_the_mcp_entry_is_the_documented_shape():
+    """Three keys and no more. `--isolated` is what gives each session its own
+    cookie jar (AC-17); without it the server takes the shared default context
+    and one model's login is the other's. `--blocked-origins` rather than
+    `--allowed-origins`, which aborts every request to an origin it does not
+    list, fonts and CDN scripts included, so the supervisor's browser and the
+    engine's shots would show two different pages."""
+    entry = mcp_server_entry("/app/runs/demo/scratch/playwright", "http://127.0.0.1:8420", 8420)
+    assert set(entry) == {"type", "command", "args"}
+    assert entry["type"] == "stdio"
+    assert entry["command"] == "playwright-mcp"
+    args = entry["args"]
+    assert args[args.index("--cdp-endpoint") + 1] == "http://127.0.0.1:8420"
+    assert "--isolated" in args
+    assert args[args.index("--blocked-origins") + 1] == blocked_origins(8420)
+    assert args[args.index("--output-dir") + 1] == "/app/runs/demo/scratch/playwright"
+    # The browser is already running in its own container, and an allow list
+    # would block the app's own assets.
+    assert "--headless" not in args
+    assert "--allowed-origins" not in args
+
+
+# ---------- the attach and the captures ----------
+#
+# Both clients go through one boundary, `playwright.async_api.async_playwright`,
+# and every test below fakes it. The gate has to pass with no browser container
+# and no network, so nothing in here opens a page; what these watch is the
+# engine's half — the endpoint it hands over, the paths it writes, the bound it
+# puts round an entry, and the fact it reports when the container is not there.
+
+
+class FakePage:
+    def __init__(self, chrome):
+        self.chrome = chrome
+
+    async def goto(self, url, timeout=None):
+        self.chrome.goes.append((url, timeout))
+        await self.chrome.on_goto(url, timeout)
+
+    async def screenshot(self, path, full_page):
+        self.chrome.shots.append((path, full_page))
+        Path(path).write_bytes(b"\x89PNG not really")
+
+
+class FakeContext:
+    def __init__(self, chrome):
+        self.chrome = chrome
+
+    async def new_page(self):
+        return FakePage(self.chrome)
+
+    async def close(self):
+        self.chrome.open_contexts -= 1
+
+
+class FakeBrowser:
+    """A Chromium that never was: a context per capture, and a `goto` doing
+    whatever the test told it to do this time round."""
+
+    def __init__(self, on_goto=None):
+        self.on_goto = on_goto or _goes_fine
+        self.viewports = []
+        self.goes = []
+        self.shots = []
+        self.open_contexts = 0
+        self.closed = False
+
+    async def new_context(self, viewport):
+        self.viewports.append(viewport)
+        self.open_contexts += 1
+        return FakeContext(self)
+
+    async def close(self):
+        self.closed = True
+
+
+class FakePlaywright:
+    """`async_playwright()` for a test: the async context manager, its `chromium`
+    namespace, and the one call the engine makes on it."""
+
+    def __init__(self, connect):
+        self.chromium = types.SimpleNamespace(connect_over_cdp=connect)
+        self.stopped = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.stopped = True
+        return False
+
+
+async def _goes_fine(url, timeout):
+    return None
+
+
+def fake_playwright(monkeypatch, connect):
+    """Put a fake where the module's lazy import will find it. Both clients
+    import `async_playwright` inside the call, so patching the attribute on the
+    package is what reaches them."""
+    pw = FakePlaywright(connect)
+    monkeypatch.setattr("playwright.async_api.async_playwright", lambda: pw)
+    return pw
+
+
+def answers_with(chrome):
+    """A `connect_over_cdp` that hands back this fake browser."""
+    async def connect(endpoint):
+        chrome.endpoint = endpoint
+        return chrome
+    return connect
+
+
+def refuses(message):
+    """A `connect_over_cdp` that fails the way a container that is not up does."""
+    async def connect(endpoint):
+        raise RuntimeError(message)
+    return connect
+
+
+CAPTURES = [{"name": "home", "path": "/", "width": 1280, "timeout": 30},
+            {"name": "settings", "path": "/settings", "width": 375, "timeout": 30}]
+
+REFUSED = "connect ECONNREFUSED 127.0.0.1:8420\n=========== logs ===========\n<ws preparing>"
+
+
+def test_attach_browser_disconnects_as_soon_as_it_has_answered(monkeypatch):
+    """The check is a check. Chromium belongs to the stack and the supervisor's
+    own session is on it, so closing here drops this client and nothing else."""
+    chrome = FakeBrowser()
+    fake_playwright(monkeypatch, answers_with(chrome))
+    attach = asyncio.run(attach_browser("http://127.0.0.1:8420"))
+    assert attach == BrowserAttach(ws="http://127.0.0.1:8420", ok=True, error="")
+    assert chrome.endpoint == "http://127.0.0.1:8420"
+    assert chrome.closed is True
+
+
+def test_attach_browser_reports_a_dead_endpoint_as_its_own_fact(monkeypatch):
+    """AC-27. A container that is down is not a serve that failed, and both
+    prompt blocks say a different thing about it, so it reaches them as a value
+    of its own. Playwright's message runs to a log dozens of lines long and the
+    block prints it inside a fence, so one line of it is what is kept."""
+    fake_playwright(monkeypatch, refuses(REFUSED))
+    attach = asyncio.run(attach_browser("http://127.0.0.1:8420"))
+    assert attach.ok is False
+    assert attach.ws == "http://127.0.0.1:8420"
+    assert attach.error == "connect ECONNREFUSED 127.0.0.1:8420"
+
+
+def test_attach_browser_gives_up_at_its_timeout(monkeypatch):
+    """A container reachable but wedged would otherwise hold the round for as
+    long as the driver felt like waiting."""
+    async def never(endpoint):
+        await asyncio.Event().wait()
+    fake_playwright(monkeypatch, never)
+    monkeypatch.setattr(browser, "ATTACH_TIMEOUT", 1)
+    started = time.monotonic()
+    attach = asyncio.run(attach_browser("http://127.0.0.1:8420"))
+    waited = time.monotonic() - started
+    assert attach.ok is False
+    assert waited < 3, f"waited {waited:.1f}s for a connect that was never going to answer"
+    assert attach.error, "an empty error prints as an empty fence in both prompt blocks"
+
+
+def test_every_capture_fails_with_the_same_reason_when_the_browser_is_unreachable(
+        monkeypatch, tmp_path):
+    """The container going away between the attach check and the captures. Every
+    entry carries the one reason, nothing is written, and the audit still runs:
+    nothing browser-shaped raises out of a round."""
+    fake_playwright(monkeypatch, refuses(REFUSED))
+    shots = asyncio.run(capture_all(CAPTURES, "http://127.0.0.1:4321",
+                                    str(tmp_path / "i1-r1"), "http://127.0.0.1:8420"))
+    assert [s["name"] for s in shots] == ["home", "settings"]
+    assert all(s["png"] is None for s in shots)
+    assert all(s["error"] == "browser unreachable: connect ECONNREFUSED 127.0.0.1:8420"
+               for s in shots), shots
+    assert list((tmp_path / "i1-r1").iterdir()) == []
+
+
+def test_a_failing_entry_does_not_stop_the_next_one(monkeypatch, tmp_path):
+    """AC-11. A page that will not load is a finding for the supervisor, not the
+    end of the captures, and the round has already happened either way."""
+    outcomes = iter([RuntimeError("net::ERR_ABORTED at /\nCall log:\n  - navigating"), None])
+    async def flaky(url, timeout):
+        problem = next(outcomes)
+        if problem:
+            raise problem
+    chrome = FakeBrowser(on_goto=flaky)
+    fake_playwright(monkeypatch, answers_with(chrome))
+    into = tmp_path / "i1-r1"
+    shots = asyncio.run(capture_all(CAPTURES, "http://127.0.0.1:4321", str(into),
+                                    "http://127.0.0.1:8420"))
+    assert [s["name"] for s in shots] == ["home", "settings"]
+    assert shots[0] == {"name": "home", "path": "/", "width": 1280, "png": None,
+                        "error": "net::ERR_ABORTED at /"}
+    assert shots[1]["error"] is None
+    assert shots[1]["png"] == str(into / "settings.png")
+    assert (into / "settings.png").exists()
+    assert not (into / "home.png").exists()
+
+
+def test_each_capture_gets_its_own_context_at_its_own_width(monkeypatch, tmp_path):
+    """AC-10. Full page, at the width the entry asked for, and a context per
+    entry so nothing one page stored reaches the next. The connection is dropped
+    at the end; the container stays up for the supervisor's own session."""
+    chrome = FakeBrowser()
+    fake_playwright(monkeypatch, answers_with(chrome))
+    into = tmp_path / "i2-r1"
+    shots = asyncio.run(capture_all(CAPTURES, "http://127.0.0.1:4321", str(into),
+                                    "http://127.0.0.1:8420"))
+    assert chrome.viewports == [{"width": 1280, "height": 720}, {"width": 375, "height": 720}]
+    assert [url for url, _ in chrome.goes] == ["http://127.0.0.1:4321/",
+                                               "http://127.0.0.1:4321/settings"]
+    # The declared seconds, in the milliseconds Playwright takes.
+    assert [ms for _, ms in chrome.goes] == [30000, 30000]
+    assert chrome.shots == [(str(into / "home.png"), True), (str(into / "settings.png"), True)]
+    assert [s["png"] for s in shots] == [str(into / "home.png"), str(into / "settings.png")]
+    assert chrome.open_contexts == 0
+    assert chrome.closed is True
+
+
+def test_an_entry_that_hangs_is_cut_at_its_timeout(monkeypatch, tmp_path):
+    """AC-9. `goto` and `screenshot` carry their own timeouts and the driver has
+    hung with neither firing, so the bound goes round the whole entry or a
+    declared 30 seconds is not one. The heartbeat has to keep going while it
+    waits: the activity's heartbeat_timeout is three minutes, and a worker that
+    says nothing for that long is a dead worker to Temporal."""
+    beats = []
+    async def never(url, timeout):
+        await asyncio.Event().wait()
+    chrome = FakeBrowser(on_goto=never)
+    fake_playwright(monkeypatch, answers_with(chrome))
+    monkeypatch.setattr(browser, "HEARTBEAT_SECONDS", 0.2)
+    started = time.monotonic()
+    shots = asyncio.run(capture_all([dict(CAPTURES[0], timeout=1)], "http://127.0.0.1:4321",
+                                    str(tmp_path / "i1-r1"), "http://127.0.0.1:8420",
+                                    heartbeat=beats.append))
+    waited = time.monotonic() - started
+    assert waited < 3, f"waited {waited:.1f}s for an entry bounded at 1s"
+    assert shots[0]["png"] is None
+    assert shots[0]["error"], "an empty error prints as `capture failed:` and nothing after it"
+    assert beats[0] == "capture home"
+    assert len(beats) > 1, f"the pinger stopped while the capture was in flight: {beats}"
+    assert chrome.open_contexts == 0, "the context of a cut entry was left open"
+
+
+# ---------- the evidence and the prompt blocks ----------
+
+
+def served(ready=True, output_tail="npm ERR! port 4321 is already in use"):
+    return Serve(cmd="npm run dev", port=4321, url="http://127.0.0.1:4321",
+                 ready_timeout=90, ready=ready, output_tail=output_tail)
+
+
+def evidence(ready=True, browser_ok=True, shots=(), config_error=None,
+             output_tail="npm ERR! port 4321 is already in use"):
+    """The dict both blocks read, built the way the two activities build it: no
+    serve and no attach when the file did not pass, and no attach when there was
+    nothing to attach to."""
+    serve = None if config_error else served(ready, output_tail)
+    attach = None if config_error or not ready else BrowserAttach(
+        ws="http://127.0.0.1:8420", ok=browser_ok,
+        error="" if browser_ok else "connect ECONNREFUSED 127.0.0.1:8420")
+    return browser_evidence(serve, attach, list(shots), config_error=config_error)
+
+
+def flat(block):
+    """The block with its whitespace collapsed. Every sentence in these wraps,
+    and what is pinned is the wording, not where the line broke."""
+    return " ".join(block.split())
+
+
+SHOTS = [{"name": "home", "path": "/", "width": 1280,
+          "png": "/app/runs/demo/shots/i1-r1/home.png", "error": None},
+         {"name": "settings", "path": "/settings", "width": 375, "png": None,
+          "error": "net::ERR_ABORTED at /settings"}]
+
+
+def test_browser_evidence_keeps_ready_and_browser_ok_apart():
+    """AC-27. A run can have its app up and Chromium down. The two facts are
+    carried side by side and neither is derived from the other, because a prompt
+    that folded them together told a supervisor its tools were attached to a
+    container that was not running."""
+    ev = browser_evidence(served(), BrowserAttach(ws="http://127.0.0.1:8420", ok=False,
+                                                  error="connect ECONNREFUSED"), [])
+    assert ev["ready"] is True
+    assert ev["browser_ok"] is False
+    assert ev["cmd"] == "npm run dev"
+    assert ev["port"] == 4321
+    assert ev["url"] == "http://127.0.0.1:4321"
+    assert ev["ready_timeout"] == 90
+    assert ev["browser_ws"] == "http://127.0.0.1:8420"
+    assert ev["browser_error"] == "connect ECONNREFUSED"
+    assert ev["config_error"] is None
+    assert ev["shots"] == []
+    # The file did not pass the check, so there was no serve to have a port and
+    # nothing to attach to.
+    bad = browser_evidence(None, None, [], config_error="browser.yaml: capture must be a list")
+    assert bad["ready"] is False
+    assert bad["browser_ok"] is False
+    assert bad["port"] is None
+    assert bad["cmd"] is None
+    assert bad["config_error"] == "browser.yaml: capture must be a list"
+
+
+def test_the_executor_block_carries_the_command_the_port_the_timeout_and_the_tail():
+    """AC-5. The executor is told what the engine tried, where it waited and
+    what the command printed, because it is the one state of the three the work
+    item might be there to fix."""
+    block = executor_block(evidence(ready=False))
+    assert block.startswith("# App server (engine check)\n")
+    assert "`npm run dev`" in block
+    assert "127.0.0.1:4321" in block
+    assert "within 90s" in block
+    assert "```\nnpm ERR! port 4321 is already in use\n```" in block
+    assert "Do not start a server of your own." in block
+    assert "`blocked`" in block
+    # A command that printed nothing still gets a fence with something in it.
+    assert "```\n(no output)\n```" in executor_block(evidence(ready=False, output_tail=""))
+
+
+def test_the_executor_block_for_an_unreachable_browser_names_the_endpoint_and_the_error():
+    """AC-27. The app is up, so this is not the work item's business and saying
+    so keeps it out of `blocked`, where an owner would be asked to fix a
+    container the run cannot see."""
+    block = executor_block(evidence(browser_ok=False))
+    assert block.startswith("# App server (engine check)\n")
+    assert "http://127.0.0.1:8420" in block
+    assert "```\nconnect ECONNREFUSED 127.0.0.1:8420\n```" in block
+    assert "$LOOPGRAPH_APP_URL" in block
+    assert "do not put it in `blocked`" in block
+
+
+def test_the_executor_block_for_an_invalid_browser_yaml_carries_the_checkers_message():
+    """The file lives in the run directory, so the executor is told what is
+    wrong with it and told it is not its to fix."""
+    block = executor_block(evidence(config_error="browser.yaml: unknown key 'prot' under serve"))
+    assert "browser.yaml is invalid: browser.yaml: unknown key 'prot' under serve" in block
+    assert "only the owner can change it" in block
+
+
+def test_the_executor_block_is_empty_when_the_app_started_and_the_browser_answered():
+    """Nothing to say: the app is up, the tools are in its options, and the
+    contract in `prompts/executor.md` has already told it what they are for."""
+    assert executor_block(evidence()) == ""
+
+
+def test_the_audit_block_for_a_started_app_lists_every_capture_with_its_width_and_path():
+    """AC-12. The supervisor never sees the executor's transcript, so the only
+    way it learns a picture exists is this block."""
+    block = audit_block(evidence(shots=SHOTS[:1]))
+    assert block.startswith("# Browser (engine check)\n")
+    assert "- home: / at 1280px -> /app/runs/demo/shots/i1-r1/home.png" in block
+    # `prompts/supervisor.md` says the same thing about who took them.
+    assert "from the app as the executor left it" in flat(block)
+    assert "Read them." in block
+
+
+def test_the_audit_block_for_a_started_app_names_a_failed_capture_and_adds_the_finding_sentence():
+    """AC-11. A page the engine could not load is a finding unless the diff
+    explains it, and the sentence saying so is only there when one failed."""
+    block = audit_block(evidence(shots=SHOTS))
+    assert ("- settings: /settings at 375px -> capture failed: net::ERR_ABORTED at /settings"
+            in block)
+    assert "That is a finding unless the diff explains it." in block
+    assert "That is a finding" not in audit_block(evidence(shots=SHOTS[:1]))
+
+
+def test_the_audit_block_for_an_app_that_never_started_carries_the_tail_and_no_tools_sentence():
+    block = audit_block(evidence(ready=False))
+    assert block.startswith("# Browser (engine check)\n")
+    assert "```\nnpm ERR! port 4321 is already in use\n```" in block
+    assert "no browser tools this round" in flat(block)
+    assert "attached" not in block
+    assert "`reasons`" in block
+
+
+def test_the_audit_block_for_an_unreachable_browser_says_no_captures_no_tools_and_no_finding():
+    """AC-27. The engine's setup, not the executor's work: the supervisor is
+    told to say so in `reasons` and told not to hold it against the round."""
+    block = audit_block(evidence(browser_ok=False))
+    assert "http://127.0.0.1:8420" in block
+    assert "```\nconnect ECONNREFUSED 127.0.0.1:8420\n```" in block
+    assert "attached" not in block
+    assert "not a finding against the round" in block
+
+
+def test_the_audit_block_for_an_invalid_browser_yaml_carries_the_message():
+    block = audit_block(evidence(config_error="browser.yaml: capture must be a list"))
+    assert "browser.yaml is invalid: browser.yaml: capture must be a list" in block
+    assert "no pages were captured" in block
+    assert "attached" not in block
+
+
+def test_the_audit_block_with_no_declared_captures_does_not_tell_the_supervisor_to_read_them():
+    """Most runs want the app served and nothing on disk. A block that spoke of
+    captures anyway would have the supervisor hunting for files nobody wrote."""
+    block = audit_block(evidence(shots=[]))
+    assert "declares no pages to capture" in block
+    assert "Read them" not in block
+    assert "took these captures" not in block
+    assert "`playwright` tools are attached" in block
+
+
+def test_the_two_capture_paths_are_ignored_even_inside_a_shipped_example():
+    """Both are listed before any example declares a web app, the way
+    `runs/*/target/` was listed before anything produced one. A capture of a
+    client's page inside a shipped example must never be committable."""
+    for path in ("runs/example-hello/shots/i1-r1/home.png",
+                 "runs/example-hello/scratch/playwright/page-1.png"):
+        assert subprocess.run(["git", "check-ignore", "-q", path], cwd=ROOT).returncode == 0, \
+            f"{path} is not ignored"
 
 
 # ---------- the browser-container checklist ----------

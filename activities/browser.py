@@ -1,5 +1,6 @@
-"""Everything browser-shaped. So far: the run's declaration `browser.yaml`, the
-port the engine assigns a run's app, and the process that serves it.
+"""Everything browser-shaped: the run's declaration `browser.yaml`, the port the
+engine assigns a run's app, the process that serves it, the captures the engine
+takes when a round ends, and the words each model is told about all of it.
 
 A run directory may hold a `browser.yaml` beside `brief.md` and `gates.yaml`,
 and having one at all is what tells the engine this run has a web app:
@@ -38,6 +39,17 @@ two runs in one worker cannot land on one socket, hands it over as
 $LOOPGRAPH_PORT, runs the command in the worktree in its own process group, and
 kills that whole group when the round ends. A gate command is the one party that
 gets the browser endpoint without the app URL, which is what `gate_env` is for.
+
+Chromium is a fact of its own, asked once with `attach_browser` and carried next
+to the serve's. A run can have its app up and the container down, and folding
+the two together is what told a supervisor its tools were attached to a browser
+that was not running.
+
+The prompt blocks are the last thing in here, and they are as much the
+deliverable as the PNGs. `execute_round` and `audit` place them and word none of
+them: what a model is told about a serve that never came up, or a browser that
+did not answer, is the engine's contract with it, not a sentence each activity
+makes up for itself.
 """
 
 from __future__ import annotations
@@ -47,6 +59,7 @@ import os
 import re
 import signal
 import socket
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +78,16 @@ MAX_CAPTURE_TIMEOUT = 60
 # The engine's own names and bounds, rather than the declaration's.
 ENDPOINT_ENV = "LOOPGRAPH_BROWSER_WS"
 DEFAULT_BROWSER_PORT = 8420
+MCP_SERVER_NAME = "playwright"
+# The two tools that run code the model wrote. The supervisor is there to look,
+# so it gets the browser with these two denied by name; the executor keeps them.
+SUPERVISOR_DENIED = ["mcp__playwright__browser_evaluate",
+                     "mcp__playwright__browser_run_code_unsafe"]
+# The engine's own loopback services, kept out of both models' browsers: Temporal,
+# the Temporal UI, the dashboard, CLIProxyAPI. The browser port joins them in
+# `blocked_origins`, the one place the string is built.
+BLOCKED_PORTS = (7233, 8233, 8400, 8317)
+ATTACH_TIMEOUT = 10        # seconds for the one-off check that the container is there
 HEARTBEAT_SECONDS = 20     # gate.py's step, well inside the 3-minute heartbeat_timeout
 OUTPUT_TAIL_LINES = 30     # of the serve's output, for the prompt blocks to show
 _POLL_SECONDS = 0.5        # between one look at the port and the next
@@ -475,3 +498,391 @@ async def start_serve(cmd: str, workdir: str, port: int, ready_timeout: int,
     except (asyncio.TimeoutError, asyncio.CancelledError):
         drain.cancel()
     return result(False, _tail(out, note))
+
+
+def shots_dir(run_dir: str, item_no: int, round_no: int) -> str:
+    """Where this round's captures go: <run_dir>/shots/i<N>-r<M>.
+
+    The naming is `stream.log_name`'s, so a round's pictures and its transcript
+    are findable under one name. Not imported from there: a log filename and a
+    directory of PNGs are two different things that happen to be named alike."""
+    return str(Path(run_dir) / "shots" / f"i{item_no}-r{round_no}")
+
+
+def playwright_output_dir(run_dir: str) -> str:
+    """Where the MCP server drops what a model asks it to save (AC-13).
+
+    Under the run directory, because the worktree is what the round is judged
+    on. This only moves the server's default: a `filename` the model passes
+    still resolves against the server's working directory, which is the
+    worktree, so `prompts/executor.md` forbids passing one and the write-set
+    mismatch reports whatever slips through."""
+    return str(Path(run_dir) / "scratch" / "playwright")
+
+
+def blocked_origins(browser_port: int) -> str:
+    """The engine's own loopback services, in both spellings, for the MCP
+    server's `--blocked-origins` (AC-16).
+
+    Not `--allowed-origins`: the allow flag aborts every request to an origin it
+    does not list, fonts and CDN scripts and XHR included, so the supervisor's
+    browser would show a different page from the engine's own captures, which
+    filter nothing. A block list of ports no real app runs on needs no matching
+    filter on the capture side. Neither flag is a security boundary, and the
+    spec's non-goals say so."""
+    return ";".join(f"http://127.0.0.1:{port};http://localhost:{port}"
+                    for port in (*BLOCKED_PORTS, browser_port))
+
+
+def mcp_server_entry(output_dir: str, endpoint: str, browser_port: int) -> dict:
+    """The `playwright` server entry both models get.
+
+    `--isolated` is not optional and is not the default once `--cdp-endpoint` is
+    given: without it the server takes the shared default context, and two
+    sessions on one Chromium then read each other's cookies (AC-17). No
+    `--headless` and no `--browser` either — the browser is already running in
+    its own container and this only attaches to it."""
+    return {"type": "stdio",
+            "command": "playwright-mcp",
+            "args": ["--cdp-endpoint", endpoint, "--isolated",
+                     "--blocked-origins", blocked_origins(browser_port),
+                     "--output-dir", output_dir]}
+
+
+def _first_line(err: BaseException) -> str:
+    """The part of an exception a prompt block can print.
+
+    Playwright's messages carry a call log dozens of lines long and the blocks
+    print this inside a fence. The type's name is the fallback because a timeout
+    carries no message at all, and an empty fence tells a model nothing."""
+    return str(err).split("\n")[0] or type(err).__name__
+
+
+@dataclass
+class BrowserAttach:
+    """Whether the browser container answered, asked once before the captures.
+
+    Its own fact, next to the serve's `ready` (AC-27). A run can have its app up
+    and Chromium down, and the two states send a model to do different things."""
+
+    ws: str
+    ok: bool
+    error: str
+
+
+async def attach_browser(ws: str) -> BrowserAttach:
+    """Attach to the browser container, then let go.
+
+    Nothing raises: a container that did not answer is one more state the round
+    reports. The check is deliberately not folded into the serve's `ready`, and
+    not left to show up as one identical error per capture, because both of
+    those produced a prompt that told a model its tools were attached to a
+    browser that was not there."""
+    from playwright.async_api import async_playwright
+
+    async def connect() -> None:
+        async with async_playwright() as pw:
+            chrome = await pw.chromium.connect_over_cdp(ws)
+            # Straight back out. Chromium belongs to the stack, so this only
+            # drops the connection; the round's real clients attach after.
+            await chrome.close()
+
+    try:
+        await asyncio.wait_for(connect(), timeout=ATTACH_TIMEOUT)
+    except Exception as err:
+        return BrowserAttach(ws=ws, ok=False, error=_first_line(err))
+    return BrowserAttach(ws=ws, ok=True, error="")
+
+
+def _shot(entry: dict, png: str | None, error: str | None) -> dict:
+    """One row of what `capture_all` returns: what was asked for, and what came
+    of it. The audit block renders these in the order the file declared them."""
+    return {"name": entry["name"], "path": entry["path"], "width": entry["width"],
+            "png": png, "error": error}
+
+
+async def _capture_one(chrome, entry: dict, app_url: str, shots_dir: str, heartbeat) -> dict:
+    """One page, bounded by the entry's own timeout, and never a raise."""
+    name = entry["name"]
+    # Built from the directory and the name alone, and the name passed NAME_RE
+    # when the file was read, so nothing the owner wrote can put this outside
+    # the run directory.
+    png = str(Path(shots_dir) / f"{name}.png")
+
+    async def shoot() -> None:
+        # A context per entry: the viewport is this entry's width, and nothing
+        # one page stored reaches the next.
+        context = await chrome.new_context(viewport={"width": entry["width"], "height": 720})
+        try:
+            page = await context.new_page()
+            await page.goto(app_url + entry["path"], timeout=entry["timeout"] * 1000)
+            await page.screenshot(path=png, full_page=True)
+        finally:
+            await context.close()
+
+    async def keep_alive() -> None:
+        # stream_query's pinger, for its reason: the activity's heartbeat_timeout
+        # is three minutes and an entry may take a minute, so the wait has to
+        # keep saying something or Temporal decides the worker died.
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            heartbeat(f"capture {name}")
+
+    if heartbeat:
+        heartbeat(f"capture {name}")
+    beat = asyncio.create_task(keep_alive()) if heartbeat else None
+    try:
+        # goto and screenshot carry their own timeouts, but the bound has to go
+        # round the whole entry: a driver wedged between the two of them would
+        # otherwise outlive the seconds the file declared.
+        await asyncio.wait_for(shoot(), timeout=entry["timeout"])
+    except Exception as err:
+        return _shot(entry, png=None, error=_first_line(err))
+    finally:
+        if beat:
+            beat.cancel()
+            # Whatever the pinger ended with, the same way stream_query swallows
+            # its own: the entry's own result is the answer worth having.
+            with suppress(asyncio.CancelledError, Exception):
+                await beat
+    return _shot(entry, png=png, error=None)
+
+
+async def capture_all(entries: list[dict], app_url: str, shots_dir: str, endpoint: str,
+                      heartbeat=None) -> list[dict]:
+    """A full-page PNG per capture entry, in the order the file declared them.
+
+    Never raises and never stops early. The round has already happened by the
+    time this runs, so a page that will not load is a finding for the supervisor
+    rather than the end of the captures, and a container that has gone away
+    since `attach_browser` answered is a reason on every row."""
+    from playwright.async_api import async_playwright
+
+    try:
+        Path(shots_dir).mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        # Kept apart from the reason below rather than folded into it: a run
+        # directory nobody can write to is not a browser that did not answer.
+        return [_shot(entry, png=None, error=_first_line(err)) for entry in entries]
+
+    shots: list[dict] = []
+    try:
+        async with async_playwright() as pw:
+            chrome = await pw.chromium.connect_over_cdp(endpoint)
+            try:
+                for entry in entries:
+                    shots.append(await _capture_one(chrome, entry, app_url, shots_dir, heartbeat))
+            finally:
+                # A CDP attachment closes by disconnecting. The container stays
+                # up: the supervisor's own session is on the same Chromium.
+                await chrome.close()
+    except Exception as err:
+        # `attach_browser` answered a moment ago, so this is the container going
+        # away in between. What was already taken stays; the rest carry the one
+        # reason, and the caller gets a list either way.
+        reason = f"browser unreachable: {_first_line(err)}"
+        shots += [_shot(entry, png=None, error=reason) for entry in entries[len(shots):]]
+    return shots
+
+
+def browser_evidence(serve: Serve | None, attach: BrowserAttach | None, shots: list[dict],
+                     config_error: str | None = None) -> dict:
+    """Everything the two prompt blocks read, flat, in one dict.
+
+    `ready` is the serve's and `browser_ok` the attach's, and neither is worked
+    out from the other (AC-27). Both activities build this the same way, so the
+    executor and the supervisor are looking at one set of facts."""
+    return {"config_error": config_error,
+            "cmd": serve.cmd if serve else None,
+            "port": serve.port if serve else None,
+            "url": serve.url if serve else None,
+            "ready": bool(serve and serve.ready),
+            "ready_timeout": serve.ready_timeout if serve else None,
+            "output_tail": serve.output_tail if serve else None,
+            "browser_ws": attach.ws if attach else None,
+            "browser_ok": bool(attach and attach.ok),
+            "browser_error": attach.error if attach else None,
+            "shots": shots}
+
+
+# The prompt blocks. The text is the deliverable, so it lives here whole rather
+# than being assembled out of sentences at the call site: the two models are told
+# different things about one state, and reading the pair side by side is the only
+# way to keep that true. `execute_round` and `audit` place them and word nothing.
+
+_EXECUTOR_NOT_READY = """\
+# App server (engine check)
+
+This run declares a web app, and the engine tried to serve this worktree with
+`{cmd}` before you started. Nothing accepted a connection on 127.0.0.1:{port}
+within {ready_timeout}s, so there is no app to open and you have no browser
+tools this round. The last lines it printed:
+
+```
+{tail}
+```
+
+Do not start a server of your own. If the work item is what fixes this, say so
+in a claim the supervisor can check against the diff. If the command itself
+cannot work on this tree, put that in `blocked`: it is the run's configuration,
+and only the owner can change it."""
+
+_EXECUTOR_NO_BROWSER = """\
+# App server (engine check)
+
+This run declares a web app, and the engine is serving this worktree with
+`{cmd}` on {url}. The browser container did not answer at
+{ws}, so you have no browser tools this round:
+
+```
+{error}
+```
+
+The app is up and `$LOOPGRAPH_APP_URL` points at it. Do not start a server or a
+browser of your own. The browser is the engine's, not this tree's: nothing in
+the work item fixes it, so do not put it in `blocked`."""
+
+_EXECUTOR_BAD_CONFIG = """\
+# App server (engine check)
+
+This run declares a web app in `browser.yaml`, but the file did not pass the
+engine's check, so nothing was served and you have no browser tools this round:
+
+```
+browser.yaml is invalid: {message}
+```
+
+Do not start a server of your own. The file lives in the run directory, not in
+this tree, and only the owner can change it. If the work item cannot be checked
+without the app, say so in `blocked`."""
+
+_AUDIT_CAPTURES = """\
+# Browser (engine check)
+
+The engine served the worktree with `{cmd}` on {url} and took
+these captures itself after the round ended, from the app as the executor left
+it. Each is a full-page PNG at the width shown. The executor's transcript never
+saw them.
+
+{shot_lines}
+
+Read them. Your `playwright` tools are attached to the same app at
+{url}, for anything this list missed."""
+
+_AUDIT_CAPTURE_FAILED = """\
+A capture that failed means the page did not load for the engine within its
+timeout. That is a finding unless the diff explains it."""
+
+_AUDIT_NO_PAGES = """\
+# Browser (engine check)
+
+The engine served the worktree with `{cmd}` on {url}.
+`browser.yaml` declares no pages to capture, so there are no engine captures
+this round. Your `playwright` tools are attached to that app; open what the
+diff touches and look."""
+
+_AUDIT_NOT_READY = """\
+# Browser (engine check)
+
+The engine could not serve the worktree: `{cmd}` accepted no connection on
+127.0.0.1:{port} within {ready_timeout}s. No pages were captured and you have no
+browser tools this round. The last lines it printed:
+
+```
+{tail}
+```
+
+Judge the round on the diff and the gates, and say in `reasons` that the app
+did not start. The executor was told the same thing before it began."""
+
+_AUDIT_NO_BROWSER = """\
+# Browser (engine check)
+
+The engine served the worktree with `{cmd}` on {url}, but the
+browser container did not answer at {ws}, so no pages were captured and you
+have no browser tools this round:
+
+```
+{error}
+```
+
+Judge the round on the diff and the gates, and say in `reasons` that the
+browser container was unreachable. That is the engine's setup, not the
+executor's work, and not a finding against the round."""
+
+_AUDIT_BAD_CONFIG = """\
+# Browser (engine check)
+
+This run declares a web app in `browser.yaml`, but the file did not pass the
+engine's check, so nothing was served, no pages were captured and you have no
+browser tools this round:
+
+```
+browser.yaml is invalid: {message}
+```
+
+Judge the round on the diff and the gates, and say in `reasons` that
+`browser.yaml` is invalid. The file lives in the run directory; the executor was
+told the same thing before it began."""
+
+
+def _fields(evidence: dict) -> dict:
+    """The evidence as the templates name it. `(no output)` because a command
+    that printed nothing would otherwise leave an empty fence in the prompt."""
+    return {"cmd": evidence["cmd"],
+            "port": evidence["port"],
+            "url": evidence["url"],
+            "ready_timeout": evidence["ready_timeout"],
+            "tail": evidence["output_tail"] or "(no output)",
+            "ws": evidence["browser_ws"],
+            "error": evidence["browser_error"],
+            "message": evidence["config_error"]}
+
+
+def _shot_lines(shots: list[dict]) -> str:
+    """One line per capture, in file order, whether it worked or not. A page the
+    engine could not load is something the supervisor has to see."""
+    return "\n".join(
+        f"- {shot['name']}: {shot['path']} at {shot['width']}px -> "
+        + (f"capture failed: {shot['error']}" if shot["error"] else shot["png"])
+        for shot in shots)
+
+
+def executor_block(evidence: dict) -> str:
+    """What the executor is told about its app, or "" when there is nothing to
+    say: the app is up, the browser answered, and the tools are in its options.
+
+    Three states, and what the executor should do differs in each. Only the
+    serve failing can ever be the work item's business; the other two are the
+    run's configuration and the engine's own stack, and telling it so is what
+    keeps a round from spending its `blocked` on something it cannot fix."""
+    fields = _fields(evidence)
+    if evidence["config_error"]:
+        return _EXECUTOR_BAD_CONFIG.format(**fields)
+    if not evidence["ready"]:
+        return _EXECUTOR_NOT_READY.format(**fields)
+    if not evidence["browser_ok"]:
+        return _EXECUTOR_NO_BROWSER.format(**fields)
+    return ""
+
+
+def audit_block(evidence: dict) -> str:
+    """What the supervisor is told, in every state (AC-12).
+
+    Always something, unlike the executor's: the supervisor never sees the
+    executor's transcript, so this block is the only way it learns that pictures
+    exist, or that there was nothing to take one of."""
+    fields = _fields(evidence)
+    if evidence["config_error"]:
+        return _AUDIT_BAD_CONFIG.format(**fields)
+    if not evidence["ready"]:
+        return _AUDIT_NOT_READY.format(**fields)
+    if not evidence["browser_ok"]:
+        return _AUDIT_NO_BROWSER.format(**fields)
+    shots = evidence["shots"]
+    if not shots:
+        return _AUDIT_NO_PAGES.format(**fields)
+    block = _AUDIT_CAPTURES.format(shot_lines=_shot_lines(shots), **fields)
+    if any(shot["error"] for shot in shots):
+        block += "\n\n" + _AUDIT_CAPTURE_FAILED
+    return block

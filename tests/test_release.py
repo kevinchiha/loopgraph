@@ -57,8 +57,11 @@ def test_only_example_runs_are_tracked():
 
 
 def test_no_run_logs_or_worktrees_tracked():
+    # shots/ and scratch/ are the browser's: an engine capture of a page, and
+    # whatever the MCP server saved on a model's say-so.
+    output = ("logs", "worktrees", "target", "shots", "scratch")
     parts = {f.relative_to(ROOT).parts for f in tracked()}
-    bad = [p for p in parts if p[0] == "runs" and len(p) > 2 and p[2] in ("logs", "worktrees", "target")]
+    bad = [p for p in parts if p[0] == "runs" and len(p) > 2 and p[2] in output]
     assert not bad, f"run output is tracked: {bad}"
 
 
