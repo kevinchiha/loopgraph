@@ -145,10 +145,56 @@ def test_stdout_past_the_cap_is_cut_and_said_so(tmp_path):
     """Reading has to continue past the cap. Stopping at 1 MiB leaves the pipe
     full, the detector blocks on write, and a detector that would have exited 0
     is reported as a timeout instead."""
-    r = asyncio.run(run_detector(_detector("yes | head -c 1500000"), str(tmp_path)))
+    # `|| true` because the detector now runs under pipefail: head closes the
+    # pipe, yes dies of SIGPIPE, and the pipeline reports 141. What this pins is
+    # the cap, so the exit code is put back to 0 and left out of the way.
+    r = asyncio.run(run_detector(_detector("yes | head -c 1500000 || true"), str(tmp_path)))
     assert r["exit_code"] == 0
     assert r["note"] == "stdout cut at 1 MiB"
     assert r["count"] == STDOUT_CAP // 2, "yes prints two bytes a line"
+
+
+# ---------- the shell the detector runs under ----------
+
+
+def test_a_pipeline_that_fails_early_fails_the_detector(tmp_path):
+    """The same shell as the gate runner, for the same reason: /bin/sh reports a
+    pipeline's exit as its last stage's, so a detector whose real work died
+    mid-pipe came back exit 0 and the sweep counted its silence as a clean
+    tree."""
+    r = asyncio.run(run_detector(_detector("false | true"), str(tmp_path)))
+    assert r["exit_code"] == 1 and r["note"] == "exit 1"
+    assert r["count"] == 0 and r["groups"] == []
+    assert r["cmd"] == "false | true", "the wrapper leaked into the reported command"
+
+
+def test_the_detector_runs_under_bash(tmp_path):
+    """A detector written against bash gets bash. The old runner used /bin/sh,
+    which is dash in the worker container."""
+    r = asyncio.run(run_detector(_detector('echo "$0"'), str(tmp_path)))
+    assert r["exit_code"] == 0 and r["count"] == 1
+    assert r["lines"] == ["/bin/bash"]
+
+
+def test_a_grep_that_matches_nothing_fails_the_detector(tmp_path):
+    """What pipefail costs a sweep, pinned so nobody meets it as a mystery. grep
+    exits 1 when it matches nothing, and pipefail reports that past the sort, so
+    a detector over a clean tree now marks the pass incomplete instead of
+    reporting zero. The runner masks no exit code: it cannot tell a grep that
+    matched nothing from a tool that died with 1. The next test is the fix."""
+    r = asyncio.run(run_detector(_detector("grep -r ZZZ . | sort"), str(tmp_path)))
+    assert r["exit_code"] == 1 and r["note"] == "exit 1" and r["count"] == 0
+
+
+def test_the_grep_idiom_keeps_a_clean_tree_at_zero(tmp_path):
+    """The idiom the skill teaches, spelled here character for character so the
+    two cannot drift. The braces are not style: `||` binds looser than `|`, so
+    the braceless form parses as `grep ... || { [ $? = 1 ] | sort; }`, sort
+    never sees grep's lines and the command exits 0 whatever grep found. Not
+    `|| true`, which also swallows grep's 2 for a path it could not read."""
+    r = asyncio.run(run_detector(
+        _detector("{ grep -r ZZZ . || [ $? = 1 ]; } | sort"), str(tmp_path)))
+    assert r["exit_code"] == 0 and r["note"] == "" and r["count"] == 0
 
 
 def test_group_key_defaults_to_the_first_segment():

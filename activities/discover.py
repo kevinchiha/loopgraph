@@ -137,8 +137,14 @@ async def _head(stream, keep: int, buf: bytearray) -> None:
 async def run_detector(det: dict, cwd: str, heartbeat=None,
                        prefixes: list[str] | None = None) -> dict:
     """One detector, run through the shell in `cwd`, its candidates grouped by path."""
-    proc = await asyncio.create_subprocess_shell(
-        det["cmd"],
+    # bash with pipefail, and the exec form rather than a prepended `set -o
+    # pipefail` line, both for the reasons spelled out in gate.py's _run_one. A
+    # detector is not the round loop's bound, but two shell runners with
+    # different rules is a difference nobody remembers. The cost is that a grep
+    # matching nothing now exits 1 and marks the pass incomplete; the fix is
+    # `{ grep ... || [ $? = 1 ]; }` and the skill teaches it.
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/bash", "-o", "pipefail", "-c", det["cmd"],
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         # Its own pipe, drained from the start. A second pipe nobody reads fills
