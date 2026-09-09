@@ -594,6 +594,16 @@ async def attach_browser(ws: str) -> BrowserAttach:
     return BrowserAttach(ws=ws, ok=True, error="")
 
 
+# A capture fails in two different kinds of way. The page did not load, which is
+# the supervisor's business and may be a finding; or the engine never got as far
+# as asking, which is not. The engine's two reasons carry these prefixes, so
+# `audit_block` can tell them apart by a string the module owns rather than by
+# matching the prose of an exception nobody here wrote.
+BROWSER_GONE = "browser unreachable: "
+NO_SHOTS_DIR = "engine could not write shots: "
+ENGINE_FAILED = (BROWSER_GONE, NO_SHOTS_DIR)
+
+
 def _shot(entry: dict, png: str | None, error: str | None) -> dict:
     """One row of what `capture_all` returns: what was asked for, and what came
     of it. The audit block renders these in the order the file declared them."""
@@ -663,7 +673,8 @@ async def capture_all(entries: list[dict], app_url: str, shots_dir: str, endpoin
     except OSError as err:
         # Kept apart from the reason below rather than folded into it: a run
         # directory nobody can write to is not a browser that did not answer.
-        return [_shot(entry, png=None, error=_first_line(err)) for entry in entries]
+        return [_shot(entry, png=None, error=NO_SHOTS_DIR + _first_line(err))
+                for entry in entries]
 
     shots: list[dict] = []
     try:
@@ -680,7 +691,7 @@ async def capture_all(entries: list[dict], app_url: str, shots_dir: str, endpoin
         # `attach_browser` answered a moment ago, so this is the container going
         # away in between. What was already taken stays; the rest carry the one
         # reason, and the caller gets a list either way.
-        reason = f"browser unreachable: {_first_line(err)}"
+        reason = BROWSER_GONE + _first_line(err)
         shots += [_shot(entry, png=None, error=reason) for entry in entries[len(shots):]]
     return shots
 
@@ -826,6 +837,15 @@ Judge the round on the diff and the gates, and say in `reasons` that
 told the same thing before it began."""
 
 
+def _page_failed(shot: dict) -> bool:
+    """Whether this row is a page the engine could not load, rather than the
+    engine failing before it got to ask for one. Only the first is the
+    supervisor's business: a container that died after the attach check, or a
+    directory the engine could not create, is the engine's own trouble and
+    nothing the executor's diff could explain."""
+    return bool(shot["error"]) and not shot["error"].startswith(ENGINE_FAILED)
+
+
 def _fields(evidence: dict) -> dict:
     """The evidence as the templates name it. `(no output)` because a command
     that printed nothing would otherwise leave an empty fence in the prompt."""
@@ -836,7 +856,12 @@ def _fields(evidence: dict) -> dict:
             "tail": evidence["output_tail"] or "(no output)",
             "ws": evidence["browser_ws"],
             "error": evidence["browser_error"],
-            "message": evidence["config_error"]}
+            # The checker's messages all begin `browser.yaml: ` and both
+            # templates say `browser.yaml is invalid:` ahead of this, so the
+            # file would be named twice in one line. Stripped here, the one
+            # place both blocks fill their message from; the activities hand
+            # `BrowserConfigError.message` over untouched.
+            "message": (evidence["config_error"] or "").removeprefix("browser.yaml: ")}
 
 
 def _shot_lines(shots: list[dict]) -> str:
@@ -883,6 +908,6 @@ def audit_block(evidence: dict) -> str:
     if not shots:
         return _AUDIT_NO_PAGES.format(**fields)
     block = _AUDIT_CAPTURES.format(shot_lines=_shot_lines(shots), **fields)
-    if any(shot["error"] for shot in shots):
+    if any(_page_failed(shot) for shot in shots):
         block += "\n\n" + _AUDIT_CAPTURE_FAILED
     return block

@@ -817,6 +817,22 @@ def test_every_capture_fails_with_the_same_reason_when_the_browser_is_unreachabl
     assert list((tmp_path / "i1-r1").iterdir()) == []
 
 
+def test_a_shots_directory_the_engine_cannot_create_is_the_engines_own_failure(
+        monkeypatch, tmp_path):
+    """A run directory the engine cannot write to must not raise out of the
+    audit, and must not reach the supervisor as a page that would not load. The
+    prefix is what tells the two apart; the connect below is never reached, and
+    a row saying `browser unreachable` would mean it was."""
+    (tmp_path / "not-a-directory").write_text("")
+    fake_playwright(monkeypatch, refuses(REFUSED))
+    shots = asyncio.run(capture_all(CAPTURES, "http://127.0.0.1:4321",
+                                    str(tmp_path / "not-a-directory" / "i1-r1"),
+                                    "http://127.0.0.1:8420"))
+    assert [s["name"] for s in shots] == ["home", "settings"]
+    assert all(s["png"] is None for s in shots)
+    assert all(s["error"].startswith("engine could not write shots: ") for s in shots), shots
+
+
 def test_a_failing_entry_does_not_stop_the_next_one(monkeypatch, tmp_path):
     """AC-11. A page that will not load is a finding for the supervisor, not the
     end of the captures, and the round has already happened either way."""
@@ -975,7 +991,10 @@ def test_the_executor_block_for_an_invalid_browser_yaml_carries_the_checkers_mes
     """The file lives in the run directory, so the executor is told what is
     wrong with it and told it is not its to fix."""
     block = executor_block(evidence(config_error="browser.yaml: unknown key 'prot' under serve"))
-    assert "browser.yaml is invalid: browser.yaml: unknown key 'prot' under serve" in block
+    # The checker's own message names the file and the template says so ahead of
+    # it, so the prefix is stripped rather than printed twice.
+    assert "browser.yaml is invalid: unknown key 'prot' under serve" in block
+    assert "browser.yaml: unknown key" not in block
     assert "only the owner can change it" in block
 
 
@@ -1006,6 +1025,19 @@ def test_the_audit_block_for_a_started_app_names_a_failed_capture_and_adds_the_f
     assert "That is a finding" not in audit_block(evidence(shots=SHOTS[:1]))
 
 
+def test_the_audit_block_does_not_call_the_engines_own_failure_a_finding():
+    """The container going away after the attach check, and a shots directory
+    the engine could not create, are the engine's trouble. Both arrive as rows
+    that failed, and neither is something the executor's diff could explain, so
+    the sentence inviting a finding stays out of the block."""
+    for reason in ("browser unreachable: connect ECONNREFUSED 127.0.0.1:8420",
+                   "engine could not write shots: [Errno 13] Permission denied"):
+        engine_failed = [dict(shot, png=None, error=reason) for shot in SHOTS]
+        block = audit_block(evidence(shots=engine_failed))
+        assert f"capture failed: {reason}" in block
+        assert "That is a finding" not in block, reason
+
+
 def test_the_audit_block_for_an_app_that_never_started_carries_the_tail_and_no_tools_sentence():
     block = audit_block(evidence(ready=False))
     assert block.startswith("# Browser (engine check)\n")
@@ -1027,7 +1059,8 @@ def test_the_audit_block_for_an_unreachable_browser_says_no_captures_no_tools_an
 
 def test_the_audit_block_for_an_invalid_browser_yaml_carries_the_message():
     block = audit_block(evidence(config_error="browser.yaml: capture must be a list"))
-    assert "browser.yaml is invalid: browser.yaml: capture must be a list" in block
+    assert "browser.yaml is invalid: capture must be a list" in block
+    assert "browser.yaml: capture must be a list" not in block
     assert "no pages were captured" in block
     assert "attached" not in block
 
