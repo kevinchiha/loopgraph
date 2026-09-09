@@ -292,9 +292,9 @@ async def audit(run_dir: str, round_result: dict, round_no: int = 1, item_no: in
     config_error = cfg.message if isinstance(cfg, browser.BrowserConfigError) else None
     app, servers = None, None
 
-    # The last statement before the try that stops it, for `execute_round`'s
-    # reason: anything raising in between leaks the process group and the
-    # reserved port.
+    # The last two statements before the try that stops it, for
+    # `execute_round`'s reason: anything raising in between leaks the process
+    # group and the reserved port.
     port = serve = None
     if isinstance(cfg, dict):
         port = browser.pick_port()

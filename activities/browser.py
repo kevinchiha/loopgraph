@@ -90,6 +90,7 @@ ATTACH_TIMEOUT = 10        # seconds for the one-off check that the container is
 HEARTBEAT_SECONDS = 20     # gate.py's step, well inside the 3-minute heartbeat_timeout
 OUTPUT_TAIL_LINES = 30     # of the serve's output, for the prompt blocks to show
 _POLL_SECONDS = 0.5        # between one look at the port and the next
+_CONNECT_SECONDS = 1       # a look that gets no answer at all; see `_port_answers`
 # `_drain` keeps a number of bytes rather than lines. 400 a line is generous, and
 # a line longer than that costs one of the 30, never the tail.
 _TAIL_BYTES = OUTPUT_TAIL_LINES * 400
@@ -98,6 +99,8 @@ _TAIL_BYTES = OUTPUT_TAIL_LINES * 400
 # a filename and nothing else. This is what keeps `../x` out of that path.
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+
+# ---------- the declaration ----------
 
 @dataclass
 class BrowserConfigError:
@@ -167,8 +170,10 @@ def _serve(block) -> dict:
     _check_unknown(block, ("cmd", "ready_timeout"), "serve")
     cmd = block.get("cmd")
     # A string, not anything str() would take: `cmd: yes` is the boolean True, and
-    # coercing it would hand the shell "True" to run.
-    if not isinstance(cmd, str) or not cmd:
+    # coercing it would hand the shell "True" to run. Stripped, because a command
+    # of spaces runs, exits 0 at once, and leaves the round waiting out the whole
+    # ready_timeout for a port nothing was going to bind.
+    if not isinstance(cmd, str) or not cmd.strip():
         raise ValueError("browser.yaml: serve.cmd must be a non-empty string")
     return {"cmd": cmd,
             "ready_timeout": _seconds(block.get("ready_timeout", DEFAULT_READY_TIMEOUT),
@@ -240,7 +245,16 @@ def parse_browser_config(text: str) -> dict:
 def load_browser_config(path: str) -> dict:
     """Read and check the file at `path`. Raises ValueError on anything wrong,
     because `lg start` refuses the run and prints the text to a person."""
-    return parse_browser_config(Path(path).read_text())
+    try:
+        text = Path(path).read_text()
+    except UnicodeDecodeError as err:
+        # A ValueError already, so it went straight past every caller's handling
+        # and reached the prompt block and `lg start` as a bare codec message
+        # with nothing in it naming the file. Re-raised with the prefix the rest
+        # of the checker's messages carry.
+        raise ValueError("browser.yaml: not valid UTF-8: "
+                         + str(err).split("\n")[0]) from err
+    return parse_browser_config(text)
 
 
 def read_browser_config(run_dir: str) -> dict | BrowserConfigError | None:
@@ -268,6 +282,8 @@ def read_browser_config(run_dir: str) -> dict | BrowserConfigError | None:
         # one prints it the same way.
         return BrowserConfigError(f"browser.yaml: {e}")
 
+
+# ---------- the port and the serve ----------
 
 # The ports the engine has handed out and not yet taken back. Module state, so
 # it covers one worker process and promises nothing beyond it.
@@ -355,10 +371,17 @@ async def _port_answers(port: int) -> bool:
 
     This is the whole of what ready means. A dev server that prints "listening"
     before it binds, or prints nothing at all, or daemonises and leaves the shell
-    exiting 0 behind it, all answer here and nowhere else."""
+    exiting 0 behind it, all answer here and nowhere else.
+
+    Bounded, because not every failure is a refusal: a SYN to a loopback port
+    whose accept queue is full is dropped rather than answered, and the kernel
+    then retries it for over a minute. The wait loop heartbeats between one look
+    and the next, so a connect with no bound on it stops the heartbeat for long
+    enough that Temporal declares the worker dead."""
     try:
-        _, writer = await asyncio.open_connection("127.0.0.1", port)
-    except OSError:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout=_CONNECT_SECONDS)
+    except (OSError, asyncio.TimeoutError):
         return False
     writer.close()
     try:
@@ -380,7 +403,9 @@ class Serve:
 
     `output_tail` is the evidence the prompt blocks carry when `ready` is False.
     The process and its drain are held for `stop`, which both activities call in
-    a finally whichever way the round ended."""
+    a finally whichever way the round ended. The drain's field is `_drain_task`
+    and not `_drain`: `_drain` is gate.py's reader, imported at the top of this
+    module, and a field of that name shadows it in everything written here."""
 
     cmd: str
     port: int
@@ -389,14 +414,14 @@ class Serve:
     ready: bool
     output_tail: str
     _proc: object | None = field(default=None, repr=False)
-    _drain: object | None = field(default=None, repr=False)
+    _drain_task: object | None = field(default=None, repr=False)
 
     async def stop(self) -> None:
         """Kill the group and hand the port back. Safe to call twice, and on a
         serve that never came up."""
-        proc, drain = self._proc, self._drain
+        proc, drain = self._proc, self._drain_task
         # Dropped before the kill, so a second call finds nothing to kill.
-        self._proc = self._drain = None
+        self._proc = self._drain_task = None
         if proc is not None:
             _kill_group(proc)
             # The two seconds `_run_one` gives its own drain, for its reason: a
@@ -421,7 +446,7 @@ async def start_serve(cmd: str, workdir: str, port: int, ready_timeout: int,
 
     def result(ready: bool, output_tail: str, proc=None, drain=None) -> Serve:
         return Serve(cmd=cmd, port=port, url=url, ready_timeout=ready_timeout,
-                     ready=ready, output_tail=output_tail, _proc=proc, _drain=drain)
+                     ready=ready, output_tail=output_tail, _proc=proc, _drain_task=drain)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -477,6 +502,8 @@ async def start_serve(cmd: str, workdir: str, port: int, ready_timeout: int,
         drain.cancel()
     return result(False, _tail(out, note))
 
+
+# ---------- the paths, the attach and the captures ----------
 
 def shots_dir(run_dir: str, item_no: int, round_no: int) -> str:
     """Where this round's captures go: <run_dir>/shots/i<N>-r<M>.
@@ -689,6 +716,8 @@ async def capture_all(entries: list[dict], app_url: str, shots_dir: str, endpoin
         shots += [_shot(entry, png=None, error=reason) for entry in entries[len(shots):]]
     return shots
 
+
+# ---------- the evidence and the prompt blocks ----------
 
 def browser_evidence(serve: Serve | None, attach: BrowserAttach | None, shots: list[dict],
                      config_error: str | None = None) -> dict:

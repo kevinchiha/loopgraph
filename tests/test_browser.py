@@ -141,6 +141,11 @@ BAD_SHAPES = [
     ("serve: npm run dev\n", "browser.yaml: serve is required and must be a mapping"),
     ("serve:\n  ready_timeout: 5\n", "browser.yaml: serve.cmd must be a non-empty string"),
     ('serve:\n  cmd: ""\n', "browser.yaml: serve.cmd must be a non-empty string"),
+    # Whitespace is not a command either: the shell would run it, exit 0 at
+    # once, and the round would wait out the whole ready_timeout for a port
+    # nothing was ever going to bind.
+    ('serve:\n  cmd: "   "\n', "browser.yaml: serve.cmd must be a non-empty string"),
+    ('serve:\n  cmd: "\\t\\n"\n', "browser.yaml: serve.cmd must be a non-empty string"),
     ("serve:\n  cmd: yes\n", "browser.yaml: serve.cmd must be a non-empty string"),
     (MINIMAL + "capture: home\n", "browser.yaml: capture must be a list"),
     (MINIMAL + "capture: [home]\n", "browser.yaml: capture[0] must be a mapping"),
@@ -336,6 +341,22 @@ def test_a_file_the_engine_cannot_read_is_an_error_value_too(tmp_path):
     assert "\n" not in bad.message
 
 
+def test_a_file_that_is_not_utf_8_is_refused_with_the_prefix(tmp_path):
+    """`UnicodeDecodeError` is a `ValueError`, so it came back through the same
+    branch as the checker's own messages carrying none of their prefix. Both the
+    prompt block and `lg start` then showed a bare codec error with nothing in it
+    naming the file to go and fix."""
+    path = tmp_path / "browser.yaml"
+    path.write_bytes(b"serve:\n  cmd: \xff\xfe\n")
+    with pytest.raises(ValueError) as err:
+        load_browser_config(str(path))
+    assert str(err.value).startswith("browser.yaml: not valid UTF-8: ")
+    assert "\n" not in str(err.value)
+    bad = read_browser_config(str(tmp_path))
+    assert isinstance(bad, BrowserConfigError)
+    assert bad.message.startswith("browser.yaml: not valid UTF-8: ")
+
+
 # ---------- the port and the environments ----------
 
 
@@ -462,6 +483,21 @@ def assert_dead(pid):
             return
         time.sleep(0.05)
     raise AssertionError(f"pid {pid} outlived the serve it was started from")
+
+
+def test_the_look_at_the_port_gives_up_rather_than_waiting_on_the_kernel(monkeypatch):
+    """A SYN to a loopback port whose accept queue is full is not refused; the
+    kernel retries it for over a minute. The wait loop asks every half-second
+    and heartbeats between the asks, so an unbounded connect stops the
+    heartbeat for long enough that Temporal declares the worker dead."""
+    async def never(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(asyncio, "open_connection", never)
+    started = time.monotonic()
+    assert asyncio.run(browser._port_answers(4321)) is False
+    waited = time.monotonic() - started
+    assert waited < 5, f"waited {waited:.1f}s on a connect that never answered"
 
 
 def test_the_serve_runs_in_the_worktree(tmp_path):
