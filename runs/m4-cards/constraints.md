@@ -1,1 +1,0 @@
-- CLI tests must use run_toy() helper to exercise actual behavior, not mocked/stubbed implementations

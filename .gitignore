@@ -22,6 +22,14 @@ runs/*
 runs/*/worktrees/
 runs/*/logs/
 runs/*/target/
+# constraints.md is scratch too, though it does not look like it: `learn` appends
+# to it after every accepted item, so a tracked one accumulates whatever the last
+# person to run the example happened to learn. The example-hello copy shipped five
+# constraints telling every executor the scope gate was vacuously green, true when
+# they were written and false since the shebang was fixed, and two agents in one
+# live run spent claims re-litigating them. Both readers treat a missing file as
+# "(none yet)" and `append_constraint` creates it, so nothing needs it in git.
+runs/*/constraints.md
 
 # Playwright MCP drops console logs and screenshots here whenever a browser is
 # driven from this directory. Scratch, and it carries whatever site was open.
