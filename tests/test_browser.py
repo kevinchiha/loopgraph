@@ -1,4 +1,4 @@
-"""The browser container and the two clients that attach to it.
+"""The browser container, the two clients that attach to it, and `browser.yaml`.
 
 The suite runs with no browser container and no network, so what it can check
 here is the wiring: compose declares the service behind its profile, the worker
@@ -6,6 +6,9 @@ image carries the MCP server and the Python client, and neither of them pulls a
 browser down. Everything that needs a real Chromium — a capture on disk, two
 sessions that cannot read each other's cookies, an origin the MCP server refuses
 to open — is the checklist below, run by hand.
+
+The declaration needs no browser at all: `browser.yaml` is text in, a dict or an
+error out, so those are ordinary parser checks.
 """
 
 from __future__ import annotations
@@ -14,7 +17,11 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
+
+from activities.browser import (BrowserConfigError, load_browser_config,
+                                parse_browser_config, read_browser_config)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -52,6 +59,228 @@ def test_the_python_client_is_declared_in_pyproject():
     deps = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
     assert any(d.startswith("playwright>=") for d in deps), \
         f"no playwright floor in the dependencies: {deps}"
+
+
+# ---------- the declaration ----------
+
+MINIMAL = "serve:\n  cmd: npm run dev\n"
+
+FULL = ("serve:\n"
+        "  cmd: npm run dev -- --port $LOOPGRAPH_PORT\n"
+        "  ready_timeout: 90\n"
+        "capture:\n"
+        "  - name: home\n"
+        "    path: /\n"
+        "    width: 375\n"
+        "    timeout: 15\n"
+        "  - name: team_settings-2\n"
+        "    path: /settings/team\n"
+        "    width: 1600\n"
+        "    timeout: 60\n")
+
+PORT_MESSAGE = ("browser.yaml: serve.port is not a key: the engine assigns the port; "
+                "use $LOOPGRAPH_PORT in serve.cmd")
+
+NOT_A_NAME = "(YAML reads bare off/on/yes/no as booleans)"
+
+UNKNOWN_KEYS = [
+    ("port: 3000\n" + MINIMAL, "browser.yaml: unknown key 'port'"),
+    ("serve:\n  cmd: x\n  redy_timeout: 5\n", "browser.yaml: unknown key 'redy_timeout' under serve"),
+    (MINIMAL + "capture: [{name: home, path: /, height: 800}]\n",
+     "browser.yaml: unknown key 'height' under capture[0]"),
+]
+
+BARE_ON = [
+    ("on: true\n" + MINIMAL, f"browser.yaml: key True under the top level is not a name {NOT_A_NAME}"),
+    ("serve:\n  cmd: x\n  on: true\n", f"browser.yaml: key True under serve is not a name {NOT_A_NAME}"),
+    (MINIMAL + "capture: [{on: true, name: home, path: /}]\n",
+     f"browser.yaml: key True under capture[0] is not a name {NOT_A_NAME}"),
+]
+
+# The whole-file shapes. `cmd: yes` is the boolean True and `name: yes` the same,
+# so neither is coerced with str(): the shell would be handed "True" to run and
+# shots/ a file called True.png.
+BAD_SHAPES = [
+    ("- one\n- two\n", "browser.yaml: expected a mapping at the top level"),
+    ("", "browser.yaml: serve is required and must be a mapping"),
+    ("capture: []\n", "browser.yaml: serve is required and must be a mapping"),
+    ("serve: npm run dev\n", "browser.yaml: serve is required and must be a mapping"),
+    ("serve:\n  ready_timeout: 5\n", "browser.yaml: serve.cmd must be a non-empty string"),
+    ('serve:\n  cmd: ""\n', "browser.yaml: serve.cmd must be a non-empty string"),
+    ("serve:\n  cmd: yes\n", "browser.yaml: serve.cmd must be a non-empty string"),
+    (MINIMAL + "capture: home\n", "browser.yaml: capture must be a list"),
+    (MINIMAL + "capture: [home]\n", "browser.yaml: capture[0] must be a mapping"),
+    (MINIMAL + "capture: [{path: /}]\n", "browser.yaml: capture[0].name must be a non-empty string"),
+    (MINIMAL + "capture: [{name: yes, path: /}]\n",
+     "browser.yaml: capture[0].name must be a non-empty string"),
+    (MINIMAL + "capture: [{name: home}]\n",
+     "browser.yaml: capture[0].path must be a string starting with /"),
+    (MINIMAL + "capture: [{name: home, path: home}]\n",
+     "browser.yaml: capture[0].path must be a string starting with /"),
+    (MINIMAL + "capture: [{name: home, path: 5}]\n",
+     "browser.yaml: capture[0].path must be a string starting with /"),
+]
+
+BAD_NAMES = ["../home", "a b", "home.png", "shots/home"]
+
+# A bool is an int in Python, so an isinstance check alone would take
+# `width: yes` as one pixel and `ready_timeout: true` as one second.
+BAD_NUMBERS = [
+    ("serve:\n  cmd: x\n  ready_timeout: true\n",
+     "browser.yaml: serve.ready_timeout must be an integer from 1 to 180"),
+    ("serve:\n  cmd: x\n  ready_timeout: '60'\n",
+     "browser.yaml: serve.ready_timeout must be an integer from 1 to 180"),
+    (MINIMAL + "capture: [{name: home, path: /, width: yes}]\n",
+     "browser.yaml: capture[0].width must be an integer of at least 1"),
+    (MINIMAL + "capture: [{name: home, path: /, width: 0}]\n",
+     "browser.yaml: capture[0].width must be an integer of at least 1"),
+    (MINIMAL + "capture: [{name: home, path: /, timeout: yes}]\n",
+     "browser.yaml: capture[0].timeout must be an integer from 1 to 60"),
+]
+
+# The bound is the engine's, not the owner's: a valid file may cost the audit
+# 180 + 10 x 60 = 780s, which is what the 30-minute activity budget is sized on.
+PAST_THE_CAP = [
+    ("serve:\n  cmd: x\n  ready_timeout: 181\n",
+     "browser.yaml: serve.ready_timeout must be an integer from 1 to 180"),
+    ("serve:\n  cmd: x\n  ready_timeout: 0\n",
+     "browser.yaml: serve.ready_timeout must be an integer from 1 to 180"),
+    (MINIMAL + "capture: [{name: home, path: /, timeout: 61}]\n",
+     "browser.yaml: capture[0].timeout must be an integer from 1 to 60"),
+    (MINIMAL + "capture: [{name: home, path: /, timeout: 0}]\n",
+     "browser.yaml: capture[0].timeout must be an integer from 1 to 60"),
+]
+
+
+def refused(text, message):
+    with pytest.raises(ValueError) as err:
+        parse_browser_config(text)
+    assert str(err.value) == message
+
+
+def numbered(n: int) -> str:
+    """A file with `n` valid capture entries, for the cap."""
+    return MINIMAL + "capture:\n" + "".join(f"  - {{name: p{i}, path: /p{i}}}\n" for i in range(n))
+
+
+def test_a_minimal_file_gets_every_default():
+    """A dev server and nothing else is the whole of what most runs declare."""
+    assert parse_browser_config(MINIMAL) == {
+        "serve": {"cmd": "npm run dev", "ready_timeout": 60}, "capture": []}
+    # capture: with nothing under it reads as no captures, not as a broken list.
+    assert parse_browser_config(MINIMAL + "capture:\n")["capture"] == []
+    assert parse_browser_config(MINIMAL + "capture: [{name: home, path: /}]\n")["capture"] == [
+        {"name": "home", "path": "/", "width": 1280, "timeout": 30}]
+
+
+def test_every_key_is_accepted_with_its_value():
+    assert parse_browser_config(FULL) == {
+        "serve": {"cmd": "npm run dev -- --port $LOOPGRAPH_PORT", "ready_timeout": 90},
+        "capture": [{"name": "home", "path": "/", "width": 375, "timeout": 15},
+                    {"name": "team_settings-2", "path": "/settings/team",
+                     "width": 1600, "timeout": 60}]}
+
+
+def test_serve_port_is_refused_by_name():
+    """The engine picks the port and hands it over as $LOOPGRAPH_PORT. A port
+    written here looks honoured and is not, which is how two runs end up on one
+    socket, so it is refused ahead of the unknown-key pass rather than reading as
+    a key nobody knows."""
+    refused("serve:\n  cmd: x\n  port: 3000\n", PORT_MESSAGE)
+
+
+@pytest.mark.parametrize("text,message", UNKNOWN_KEYS)
+def test_an_unknown_key_is_named_with_its_section(text, message):
+    refused(text, message)
+
+
+@pytest.mark.parametrize("text,message", BARE_ON)
+def test_a_key_that_is_not_a_name_is_refused_before_the_unknown_key_pass(text, message):
+    """Under the unknown-key rule alone a bare `on:` reads as `unknown key True`,
+    naming a key the owner never wrote."""
+    refused(text, message)
+
+
+@pytest.mark.parametrize("text,message", BAD_SHAPES)
+def test_the_file_has_to_have_the_shape_the_engine_reads(text, message):
+    refused(text, message)
+
+
+def test_a_file_that_is_not_yaml_is_refused_with_the_prefix():
+    """A mis-indented file is the likeliest way a hand-written one goes wrong.
+    `lg start` prints this to whoever wrote it and the owner's note carries it,
+    so it stays one line and says which file to go and fix."""
+    with pytest.raises(ValueError) as err:
+        parse_browser_config("serve:\n  cmd: x\n   ready_timeout: 5\n")
+    message = str(err.value)
+    assert message.startswith("browser.yaml: not valid YAML: ")
+    assert "\n" not in message
+    assert len(message) > len("browser.yaml: not valid YAML: ")
+
+
+def test_an_eleventh_capture_is_refused():
+    """Every entry costs the audit up to a minute; ten is what the budget holds."""
+    assert len(parse_browser_config(numbered(10))["capture"]) == 10
+    refused(numbered(11), "browser.yaml: capture holds 11 entries; the cap is 10")
+
+
+def test_a_repeated_name_names_both_entries():
+    """The names become filenames in one directory, so the second one would
+    overwrite the first and the round would report a shot it does not have."""
+    refused(MINIMAL + "capture:\n"
+            "  - {name: home, path: /}\n"
+            "  - {name: about, path: /about}\n"
+            "  - {name: home, path: /home}\n",
+            "browser.yaml: capture[2].name 'home' repeats capture[0]")
+
+
+@pytest.mark.parametrize("name", BAD_NAMES)
+def test_a_name_that_is_not_a_filename_is_refused(name):
+    """`shots/i2-r1/<name>.png` is where this ends up, so `../home` would write
+    outside the run directory and `a b` is a filename nobody can type."""
+    refused(MINIMAL + f"capture: [{{name: {name!r}, path: /}}]\n",
+            f"browser.yaml: capture[0].name {name!r} may only use letters, digits, _ and -")
+
+
+def test_a_name_that_ends_in_a_newline_is_refused():
+    """`$` matches before a trailing newline as well as at the end, so checking
+    the name with match() would let one through into a filename."""
+    refused(MINIMAL + 'capture: [{name: "home\\n", path: /}]\n',
+            "browser.yaml: capture[0].name 'home\\n' may only use letters, digits, _ and -")
+
+
+@pytest.mark.parametrize("text,message", BAD_NUMBERS)
+def test_a_bool_is_not_an_int(text, message):
+    refused(text, message)
+
+
+@pytest.mark.parametrize("text,message", PAST_THE_CAP)
+def test_a_timeout_past_its_cap_is_refused_naming_the_bound(text, message):
+    refused(text, message)
+
+
+def test_the_bounds_themselves_are_allowed():
+    assert parse_browser_config("serve:\n  cmd: x\n  ready_timeout: 180\n"
+                                )["serve"]["ready_timeout"] == 180
+    assert parse_browser_config(MINIMAL + "capture: [{name: home, path: /, timeout: 60}]\n"
+                                )["capture"][0]["timeout"] == 60
+
+
+def test_the_activities_read_a_bad_file_as_a_value_and_never_a_raise(tmp_path):
+    """A file edited after `lg start` reaches the round as evidence for the
+    prompt, so the activities branch on the error instead of parking the item.
+    `lg start` still gets the raise, because it has a person to print it to."""
+    assert read_browser_config(str(tmp_path)) is None
+    path = tmp_path / "browser.yaml"
+    path.write_text(MINIMAL)
+    assert read_browser_config(str(tmp_path)) == parse_browser_config(MINIMAL)
+    path.write_text("serve:\n  cmd: x\n  port: 3000\n")
+    bad = read_browser_config(str(tmp_path))
+    assert isinstance(bad, BrowserConfigError)
+    assert bad.message == PORT_MESSAGE
+    with pytest.raises(ValueError) as err:
+        load_browser_config(str(path))
+    assert str(err.value) == PORT_MESSAGE
 
 
 # ---------- the browser-container checklist ----------
