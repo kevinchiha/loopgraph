@@ -70,9 +70,10 @@ services:
 
   browser:
     # Chromium for runs that declare a web app in browser.yaml. Behind a profile
-    # because the image is about 1.5GB and most runs never open a page:
-    # COMPOSE_PROFILES=browser in .env is the switch. Host network, like the
-    # worker, because the app it looks at is served on the worker's 127.0.0.1.
+    # because the image is about 1GB to download and 3.5GB on disk and most runs
+    # never open a page: COMPOSE_PROFILES=browser in .env is the switch. Host
+    # network, like the worker, because the app it looks at is served on the
+    # worker's 127.0.0.1.
     # Chromium is started with its own debugging port and the worker attaches
     # over CDP, so neither side cares which Playwright version the other runs.
     image: mcr.microsoft.com/playwright:v1.63.0-noble

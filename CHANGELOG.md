@@ -15,17 +15,17 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
   auditor, which gets a look-only browser on the same app for anything the list
   missed. A screenshot the executor takes is still just a claim; the ones the
   auditor sees were taken by code. Chromium lives in its own container behind a
-  compose profile, because it is about 1.5GB and most runs never open a page:
-  answer yes to the new question in `./install.sh`, or put `COMPOSE_PROFILES=browser`
-  in `.env` and `docker compose up -d`. A run with a `browser.yaml` and no browser
-  is refused by `lg start` before it starts, and so is a `browser.yaml` with a key
-  the engine does not know. A server that does not come up, a browser container
-  that does not answer, or a page that does not load, is written into the audit
-  as evidence rather than killing the round. Gates get the browser's endpoint and
-  never the app's URL, because the commit-time gate re-run has no server up.
-  Nothing the engine's browser writes lands in the worktree. Both models now
-  ignore any `.mcp.json` a target repository carries, browser or no browser: the
-  engine chooses their tools, not the tree under work.
+  compose profile, because it is about 1GB to download and 3.5GB on disk and most
+  runs never open a page: answer yes to the new question in `./install.sh`, or put
+  `COMPOSE_PROFILES=browser` in `.env` and `docker compose up -d`. A run with a
+  `browser.yaml` and no browser is refused by `lg start` before it starts, and so
+  is a `browser.yaml` with a key the engine does not know. A server that does not
+  come up, a browser container that does not answer, or a page that does not load,
+  is written into the audit as evidence rather than killing the round. Gates get
+  the browser's endpoint and never the app's URL, because the commit-time gate
+  re-run has no server up. Nothing the engine's browser writes lands in the
+  worktree. Both models now ignore any `.mcp.json` a target repository carries,
+  browser or no browser: the engine chooses their tools, not the tree under work.
 
 ## 0.5.0 - 2026-09-09
 

@@ -115,8 +115,9 @@ say "Browser (optional)"
 cat <<'TXT'
 A run that declares a web app in browser.yaml gets a real Chromium: the executor
 drives it while it works, the engine screenshots the declared pages, and the
-auditor looks at both. It is a separate container of about 1.5GB, so it is off
-unless you say yes. Change your mind later by editing COMPOSE_PROFILES in .env.
+auditor looks at both. It is a separate container, about 1GB to download and
+3.5GB on disk, so it is off unless you say yes. Change your mind later by
+editing COMPOSE_PROFILES in .env.
 TXT
 # COMPOSE_PROFILES is a comma-separated list. Only `browser` is ours; whatever
 # else is in it stays, whichever way the question goes.

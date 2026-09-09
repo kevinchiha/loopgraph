@@ -62,9 +62,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # ---------- the container and its clients ----------
 
 def test_the_browser_service_is_behind_the_profile_and_on_the_host_network():
-    """The image is about 1.5GB and most runs never open a page, so the service
-    exists only when COMPOSE_PROFILES asks for it. Host network because the app
-    it looks at is served on the worker's own 127.0.0.1."""
+    """The image is about 1GB to download and 3.5GB on disk and most runs never
+    open a page, so the service exists only when COMPOSE_PROFILES asks for it.
+    Host network because the app it looks at is served on the worker's own
+    127.0.0.1."""
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
     browser = compose["services"]["browser"]
     assert browser["profiles"] == ["browser"]
