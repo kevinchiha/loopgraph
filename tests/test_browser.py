@@ -31,6 +31,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import textwrap
 import time
 import tomllib
 import types
@@ -41,6 +42,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import version
 from activities import browser
 from activities.audit import assemble_audit_prompt, audit, run_supervisor
 from activities.browser import (DEFAULT_BROWSER_PORT, BrowserAttach, BrowserConfigError,
@@ -2049,6 +2051,130 @@ def test_the_default_keeps_the_previous_answer(installing):
     assert _install_questions_step(root, home) == "COMPOSE_PROFILES=browser"
     (root / ".env").write_text("COMPOSE_PROFILES=other,browser\n", encoding="utf-8")
     assert _install_questions_step(root, home) == "COMPOSE_PROFILES=other,browser"
+
+
+# ---------- what the skill, the changelog and AGENTS.md say ----------
+#
+# AC-24 and AC-25. Three readers, three files: the agent in another project
+# that writes a browser.yaml and never opens this repository, the user who
+# hears the feature exists once, and the maintainer who changes the gates next.
+#
+# The skill's example goes back through the engine's own checker rather than
+# being read by eye, because an agent copies it into a run directory and
+# `lg start` refuses whatever has drifted from the keys the checker knows. The
+# rows are read out of the file bullet alone and not the whole skill: `worker
+# bash -o pipefail -c` is already in the gates.yaml proving snippet, and a row
+# the old text satisfies pins nothing.
+
+SKILL = (ROOT / "skills/loopgraph/SKILL.md").read_text()
+AGENTS = (ROOT / "AGENTS.md").read_text()
+CHANGELOG = (ROOT / "CHANGELOG.md").read_text()
+BROWSER_BULLET = SKILL[SKILL.index("\n- `browser.yaml`"):
+                       SKILL.index("\n- **Gate-first, non-negotiable.**")]
+
+
+def _fenced(text: str, lang: str) -> str:
+    """The first ```<lang> block of `text`, dedented out of the list item it is
+    indented into."""
+    body = text.split(f"```{lang}\n", 1)[1].split("```", 1)[0]
+    return textwrap.dedent(body)
+
+
+def test_the_skills_browser_yaml_example_parses_through_the_engines_own_checker():
+    """AC-24. An agent copies this block into a run directory and never reads
+    activities/browser.py. A key the checker does not know stops `lg start` on
+    that agent's first run, so the example is proved against the checker rather
+    than against somebody's memory of it."""
+    config = parse_browser_config(_fenced(BROWSER_BULLET, "yaml"))
+    assert set(config) == {"serve", "capture"}
+    assert "$LOOPGRAPH_PORT" in config["serve"]["cmd"]
+    assert config["serve"]["ready_timeout"] == 60
+    assert config["capture"] == [
+        {"name": "home", "path": "/", "width": 1280, "timeout": 30}]
+
+
+@pytest.mark.parametrize("phrase", [
+    "The engine picks the port",
+    "$LOOPGRAPH_PORT",
+    "at most 10",
+    "serves the working tree as it is",
+    "preview of a build",
+    "worker bash -o pipefail -c",
+    "urllib.request",
+    "Gates never see `$LOOPGRAPH_APP_URL`",
+    "joins the round's write set",
+    "COMPOSE_PROFILES=browser",
+])
+def test_the_skills_browser_bullet_says_what_the_spec_requires(phrase):
+    """AC-24. One row per rule an agent gets wrong when nobody writes it down: a
+    port of its own, a capture list with no end, a build preview that shows the
+    tree as it was when the build ran, a probe with curl in it, a gate reaching
+    for the app, what the serve leaves in the worktree, and a browser container
+    nobody turned on. The bullet is read with its whitespace collapsed, because
+    every one of these sentences wraps."""
+    assert phrase in flat(BROWSER_BULLET), \
+        f"the browser.yaml bullet never says {phrase!r}"
+
+
+def test_the_skills_run_dir_sentence_counts_browser_yaml():
+    """The sentence over the file list promised three files, and the new bullet
+    is the fourth. A list that says three and shows four reads as a mistake in
+    the skill, and the file an agent then leaves out is the one it was told
+    about last."""
+    assert "`browser.yaml` only for a web app" in flat(SKILL)
+    assert "exactly these three files" not in flat(SKILL)
+    assert (SKILL.index("\n- `gates.yaml`")
+            < SKILL.index("\n- `browser.yaml`")
+            < SKILL.index("\n- **Gate-first, non-negotiable.**")), \
+        "the browser.yaml bullet is not between gates.yaml and Gate-first"
+
+
+def test_the_skills_recipe_never_calls_curl_inside_the_worker():
+    """The worker image is python:3.13-slim plus git, node and npm, with neither
+    curl nor wget: a recipe that says curl prints `curl: not found` for everyone
+    who follows it. The process group is the other half — `npm run dev` forks
+    the real server, so killing the shell alone leaves a listener on the probe's
+    port for the next person in that container."""
+    recipe = _fenced(BROWSER_BULLET, "bash")
+    assert "curl" not in recipe
+    assert "urllib.request" in recipe
+    assert "setsid" in recipe and "kill -- -$!" in recipe
+
+
+def test_the_changelog_has_the_note_under_unreleased():
+    """AC-25, and the release rule with it: the note ships in the same commit as
+    the change, under the heading `release.sh` renames. A note filed under the
+    last released version is a note nobody upgrading is ever shown, because
+    `changelog_between` only reads the sections above the version they have."""
+    unreleased = [lines for name, lines in version._sections(CHANGELOG) if name is None]
+    assert len(unreleased) == 1, "CHANGELOG.md should have one ## Unreleased section"
+    note = flat("\n".join(unreleased[0]))
+    for said in ("`browser.yaml`", "COMPOSE_PROFILES=browser"):
+        assert said in note, f"the Unreleased note never says {said}"
+
+
+def test_the_preconditions_block_is_still_one_fenced_block():
+    """Step 0's browser sentence is prose under the block, not a fourth command
+    in it. tests/test_version.py reads that block whole, and what an agent runs
+    before a run is `lg where`, `lg version` and `compose ps`: bringing a
+    container up is the user's call, the same as `lg update`."""
+    step_0 = "\n".join(_section(SKILL, "## 0. Preconditions (check, don't assume)"))
+    assert step_0.count("```") == 2
+    assert "A run with a browser.yaml also needs browser Up" in flat(step_0)
+
+
+def test_agents_md_lists_browser_py_and_states_the_gate_rule():
+    """The maintainer's two facts. A file nobody lists in Layout is a file
+    somebody re-invents, and the gate rule is the one this phase can lose by
+    accident: a later hand folding LOOPGRAPH_APP_URL into `gate_env` gets a gate
+    that is green in the round and red at the checkpoint's re-run, and the
+    accepted item parks with its work discarded."""
+    layout = _section(AGENTS, "## Layout")
+    assert any(line.startswith("- `activities/browser.py` —") for line in layout), \
+        "Layout never lists activities/browser.py"
+    rules = flat("\n".join(_section(AGENTS, "## Rules that bite if you ignore them")))
+    assert "Gates never get the app URL" in rules
+    assert "LOOPGRAPH_BROWSER_WS" in rules
 
 
 # ---------- the browser-container checklist ----------

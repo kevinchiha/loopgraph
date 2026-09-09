@@ -19,6 +19,12 @@ produces bug reports nobody can reproduce.
 - `workflows/run.py` — Temporal workflows. The orchestration between rounds.
 - `activities/` — everything with a side effect: executor, gates, audit,
   checkpoint, learning, notifications, and the record of what the owner answered.
+- `activities/browser.py` — everything for a run that declares a web app in its
+  `browser.yaml`: the file's check, the port, the serve process, the engine's
+  captures, and the `playwright` tool entry each model is handed. Chromium is
+  the `browser` compose service, behind the `browser` profile, and the worker
+  reaches it over CDP on `LOOPGRAPH_BROWSER_PORT`. Its real-browser checks are
+  the checklist in `tests/test_browser.py`, run by hand.
 - `graphs/round_graph.py` — the LangGraph loop inside one round.
 - `lg` — the host CLI: `start`, `status`, `approve`, `where`, `version`,
   `update`, `ui`, and `lg rm`, the only one that deletes anything — a run
@@ -113,6 +119,14 @@ every re-run of the installer and every `lg update` after it, and the only way o
 was asking your agent to copy the file by hand. `relink_skill` in `lg` and section
 6 of install.sh now both ask where it points, repair a link, and leave a directory
 a user copied there alone.
+
+**Gates never get the app URL.** A run with a `browser.yaml` serves its app once
+for the executor and again for the auditor, and both models get
+`LOOPGRAPH_APP_URL`. Gate commands do not, in the round or at the checkpoint:
+`checkpoint_write_set` re-runs the same `gates.yaml` in its own activity with no
+serve alive, so a gate that reached the app would be green in the round and red
+at commit, and the accepted item would park with its work discarded. Gates get
+`LOOPGRAPH_BROWSER_WS` only; a gate that needs a browser starts its own server.
 
 ## Releasing
 

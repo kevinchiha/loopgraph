@@ -30,6 +30,7 @@ cd <engine_root> && <docker> compose ps
   up -d`, wait ~10s and look again. Nothing in the stack restarts itself, so a
   container that died stays dead. A missing dispatcher is the quiet failure:
   cards still reach the user's phone, and nothing they answer ever comes back.
+  A run with a browser.yaml also needs browser Up; see step 1.
 - **The target repo must live under `projects_dir`.** That tree is the only thing
   mounted into the container, as `/projects`. If the user's project is somewhere
   else, say so and stop. Do not improvise a mount without asking.
@@ -40,7 +41,8 @@ cd <engine_root> && <docker> compose ps
 after installing.) The run dir already exists. Skip to step 2 with
 `runs/example-hello` and `/projects/loopgraph-example`. Do not write a new brief.
 
-`<engine_root>/runs/<YYYY-MM-DD>-<short-slug>/` with exactly these three files, plus
+`<engine_root>/runs/<YYYY-MM-DD>-<short-slug>/` with these files (the first three
+always, `browser.yaml` only for a web app), plus
 `run.yaml` for a sweep or to change the convergence defaults:
 
 - `brief.md` — the feature, the checkable done-when, and the write set (the exact
@@ -144,6 +146,60 @@ after installing.) The run dir already exists. Skip to step 2 with
   added line carrying trailing whitespace fails it, and the item parks with every
   gate green and a clean audit. It bites hardest when the write set holds
   generated output, so look at what the generator emits.
+
+- `browser.yaml` — optional, and only for a web app. With it the engine serves
+  the worktree with your command, the executor gets a real browser to check its
+  own work in, the engine screenshots the pages you list after each round, and
+  the auditor judges those screenshots and can open the app itself. Exactly
+  these keys, nothing else; a key the engine does not know stops `lg start`:
+  ```yaml
+  serve:
+    cmd: "npm run dev -- --port $LOOPGRAPH_PORT"   # required
+    ready_timeout: 60                               # seconds until the port must answer; at most 180
+  capture:                                          # at most 10 entries
+    - name: home          # letters, digits, _ and -; unique in this file
+      path: /             # must start with /
+      width: 1280         # pixels; a full-page screenshot at this width
+      timeout: 30         # seconds for the page to load; at most 60
+  ```
+  **The engine picks the port.** There is no `port` key; `cmd` must read
+  `$LOOPGRAPH_PORT` and listen on it, on 127.0.0.1. Two runs on the host network
+  would otherwise collide, and the second run's browser would be looking at the
+  first run's app. `$LOOPGRAPH_APP_URL` is the same thing as a URL. Gates never
+  see `$LOOPGRAPH_APP_URL`: the engine re-runs them at commit time with no
+  server up, so a gate that needed the app would pass in the round and fail the
+  commit. A gate that needs a browser gets `$LOOPGRAPH_BROWSER_WS` and starts
+  its own server.
+
+  `cmd` must be a dev server that serves the working tree as it is, so an edit
+  shows on the next load: `next dev`, `vite`, `flask --debug run`. A preview of
+  a build (`next start`, `vite preview`) shows the tree as it was when the build
+  ran, and the executor's edits never reach the auditor's eyes. `npm ci` belongs
+  at the front of `cmd` if the worktree needs it, the same as a gate. The serve
+  command runs in the worktree, and anything it writes there that the target
+  repo does not gitignore joins the round's write set, the same as a gate
+  command.
+
+  Ready means `127.0.0.1:$LOOPGRAPH_PORT` accepts a connection. After
+  `ready_timeout` the engine gives up, the round goes on without a browser, and
+  the auditor is told, with the server's last lines. So prove the command in
+  the container first, on the same tracked-files tree the gates were proven on:
+
+  ```bash
+  <docker> compose exec -T worker bash -o pipefail -c '
+    cd /tmp/gatetest && export LOOPGRAPH_PORT=8765 LOOPGRAPH_APP_URL=http://127.0.0.1:8765
+    setsid bash -c "<serve cmd>" & sleep 20
+    python -c "import urllib.request as u; print(u.urlopen(\"http://127.0.0.1:8765/\").status)"
+    kill -- -$!'
+  ```
+  A `200` there is what the auditor will get. The probe is Python because the
+  worker image has no `curl`. `HTTP Error 404` means the server is up and `/`
+  is not a page; `Connection refused` means it never bound the port. The browser
+  container must be up: `<docker> compose ps` shows `browser`. If it does not,
+  `COMPOSE_PROFILES=browser` goes in the engine's `.env` and the stack comes up
+  with `<docker> compose up -d`; `lg start` refuses the run until then. Captures
+  land in `runs/<slug>/shots/i<item>-r<round>/<name>.png`, and the engine's own
+  browser writes nothing into the worktree.
 
 - **Gate-first, non-negotiable.** Run every gate command yourself, in the order
   gates.yaml lists them and in the same directory, and confirm each exits 0
