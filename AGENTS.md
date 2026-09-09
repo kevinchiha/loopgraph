@@ -91,6 +91,19 @@ convergence or sweep item's commit is refused by `checkpoint_write_set` when the
 staged diff is above net zero, tests included. Both are code. The prompts only
 tell the models the checks exist, so they do not duplicate them.
 
+**The round loop's exit is a gate exit code, never a model's claim.**
+`graphs/round_graph.py::route` reads `status` off the gate results, and a round
+is done or escalated on nothing else. Where model output does steer the loop,
+the audit verdict that drives `_run_item`, the bound is two workflow-local
+integers, `spent` and `asks`, that no verdict can extend. An exit code is only
+a bound if the shell reports the right one, which is what pipefail is for.
+`_run_one` and `run_detector` run every command under `bash -o pipefail -c`,
+because `/bin/sh` reports a pipeline's last stage and `pytest -q | tee log` was
+green with pytest red. The defect is invisible in review, because the loop lives
+behind `add_conditional_edges`, not a `while True` anyone reads. The shipped
+scope gate was vacuously green for every run on one machine for weeks, five
+rounds wrote it into a constraints file, and nothing in the engine could tell.
+
 ## Releasing
 
 Write the user-visible note under `## Unreleased` in `CHANGELOG.md` in the same

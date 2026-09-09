@@ -221,3 +221,51 @@ def test_scope_gate_goes_red_when_git_status_fails(tmp_path):
     assert out.returncode != 0, f"gate passed while git was broken: {out.stdout!r}"
     assert "write set in scope" not in out.stdout
     assert "not a git repository" in out.stderr, out.stderr
+
+
+# ---------- what the docs say about the shell ----------
+#
+# Each of the skill's three edits carries at least one row no other edit
+# satisfies: `does not reach inside` and `rightmost failing stage` for the
+# gates.yaml paragraph, `worker bash -o pipefail -c` and
+# `what passes there passes in a run` for the proving snippet, and
+# `on the day the repo is clean` for the sweep sentence. A row every edit
+# satisfies pins only whichever of them comes first, and the other two could be
+# deleted with this test still green.
+
+RED_STEP = "Exit 0 is half the proof. Make every gate go RED before you trust it."
+
+
+@pytest.mark.parametrize("doc, phrase", [
+    ("skills/loopgraph/SKILL.md", "bash -o pipefail -c"),
+    ("skills/loopgraph/SKILL.md", "does not reach inside"),
+    ("skills/loopgraph/SKILL.md", "set -o pipefail"),
+    ("skills/loopgraph/SKILL.md", "rightmost failing stage"),
+    ("skills/loopgraph/SKILL.md", "141"),
+    ("skills/loopgraph/SKILL.md", "worker bash -o pipefail -c"),
+    ("skills/loopgraph/SKILL.md", "what passes there passes in a run"),
+    ("skills/loopgraph/SKILL.md", "on the day the repo is clean"),
+    # The closing `; }` is part of the row. `|| [ $? = 1 ]` on its own is what
+    # the braceless form contains, and that form detaches the rest of the
+    # pipeline, so the bare row would pin the broken idiom as happily as the fix.
+    ("skills/loopgraph/SKILL.md", "|| [ $? = 1 ]; }"),
+    ("skills/loopgraph/SKILL.md", RED_STEP),
+    ("AGENTS.md", "never a model's claim"),
+    ("AGENTS.md", "`spent` and `asks`"),
+    ("AGENTS.md", "pipefail"),
+    ("AGENTS.md", "add_conditional_edges"),
+])
+def test_the_docs_say_what_the_shell_reports(doc, phrase):
+    """AC-8 and AC-9. The shell decides what a pipeline's exit code is, and the
+    two documents someone reads before writing a gate are the only place that
+    fact reaches them: a rule that lives in `activities/gate.py` alone is a rule
+    the person writing the gate never sees. Every document is compared with its
+    whitespace collapsed, because each of these sentences wraps and the rule is
+    the wording, not the line breaks.
+
+    `RED_STEP` is the one row that was green before this phase too. pipefail
+    fixes a lost pipeline exit code and nothing else, so a gate that is
+    vacuously green for any other reason is still caught by breaking it and
+    watching it go red, and that step must not be dropped as fixed."""
+    text = " ".join((ROOT / doc).read_text().split())
+    assert phrase in text, f"{doc} never says {phrase!r}"

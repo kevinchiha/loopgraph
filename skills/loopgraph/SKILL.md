@@ -110,6 +110,27 @@ after installing.) The run dir already exists. Skip to step 2 with
   a bash extension, and under dash that script's loop dies on its first line and
   the gate exits 0 whatever changed.
 
+  The engine runs every `cmd` in `gates.yaml`, and every detector `cmd` in
+  `run.yaml`, under `bash -o pipefail -c`, so a pipeline is red when any stage
+  fails and not only when the last one does: `pytest -q | tee log` is red when
+  pytest is. The code you get back is the rightmost failing stage's. That does
+  not reach inside a script the gate calls: a `check-write-set.sh` with its own
+  pipeline needs its own `set -o pipefail`, and the shipped one has it. Two
+  shapes now go red that used to pass. A stage that stops reading early
+  (`| head`, `grep -q`) kills its producer with SIGPIPE and the command reports
+  exit 141, but only when the producer writes enough. Under a few kilobytes it
+  finishes first and the command exits 0; well past the 64 KiB pipe buffer it
+  always dies; around the buffer the same command flips between 0 and 141 run to
+  run. So a gate you proved green on a small tree can start failing as its
+  output grows, or for no visible reason at all. Write the producer's output to
+  a file and read the file; use `tail` when the end of the output is what you
+  want; and for a yes/no question drop `grep -q` for `grep ... > /dev/null`,
+  which reads to the end. And `grep` exits 1 when it matches nothing, so a grep
+  stage that may legitimately find nothing needs the no-match test folded in
+  with braces: `{ grep -rn TODO src/ || [ $? = 1 ]; } | sort -u`. Without the
+  braces `||` binds looser than `|`, the later stages never see grep's output,
+  and the command exits 0 whatever grep found.
+
   Traps worth knowing: Next.js 16 and later have no `next lint`; npm gates in a
   fresh worktree need `npm ci --prefer-offline --no-audit --silent &&` in front,
   and `npm ci` needs a lockfile the repo actually tracks (`git ls-files
@@ -150,7 +171,7 @@ after installing.) The run dir already exists. Skip to step 2 with
   be the only reason a gate passes for you. Build the same tree the run will get:
 
   ```bash
-  <docker> compose exec -T worker sh -c '
+  <docker> compose exec -T worker bash -o pipefail -c '
     rm -rf /tmp/gatetest && mkdir -p /tmp/gatetest
     git -C /projects/<repo> archive HEAD | tar -x -C /tmp/gatetest
     cd /tmp/gatetest && <each gate command, in order>'
@@ -158,6 +179,8 @@ after installing.) The run dir already exists. Skip to step 2 with
 
   That also settles the interpreter question, since it runs where the gates will
   run, and it tells you what a round actually costs in wall-clock time.
+  `bash -o pipefail -c` is the shell the engine runs gates and detectors under,
+  so what passes there passes in a run.
 
 ## 2. Start and watch
 
@@ -284,8 +307,14 @@ boolean, and the run refuses to start with a message saying so.
 A detector prints one candidate per line to stdout and exits 0. Only stdout is
 counted, so a warning on stderr is harmless; a non-zero exit or a timeout makes
 the pass incomplete and counts nothing from that detector, and the ledger keeps
-the tail of what it wrote to stderr so you can see why. A misspelt key anywhere
-in the file stops the run before it starts, with the key named in the reason.
+the tail of what it wrote to stderr so you can see why. `grep` exits 1 on no
+match, and under pipefail so does `grep ... | sort`, so a detector built on grep
+needs its no-match test folded in with braces,
+`{ grep -rn TODO src/ || [ $? = 1 ]; } | sort -u`, or the sweep ends
+`detectors failed:` on the day the repo is clean. The braces matter: `||` binds
+looser than `|`, so without them `sort` never sees grep's output and the
+detector reports raw grep lines with a green exit. A misspelt key anywhere in
+the file stops the run before it starts, with the key named in the reason.
 
 `groups` is optional. Each entry is a path prefix compared verbatim against the
 path at the start of every candidate line, which has one leading `./` taken off
