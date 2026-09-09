@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.3.2 - 2026-09-09
+
 - `lg start` refuses a path the container cannot reach, instead of starting a run
   that dies on it. The engine only ever sees two host directories: this checkout,
   as `/app`, and your projects tree, as `/projects`. Giving it the path your shell
