@@ -520,6 +520,22 @@ def playwright_output_dir(run_dir: str) -> str:
     return str(Path(run_dir) / "scratch" / "playwright")
 
 
+def make_output_dir(run_dir: str) -> str:
+    """`playwright_output_dir`, made, and never a raise.
+
+    Both activities call this and neither of them may die of it: an activity
+    that raises parks the item (AC-6, AC-7). Swallowing the error is safe
+    because nothing depends on the directory being here yet. Each activity has
+    already made its `logs` directory a couple of statements up, so the run
+    directory is writable; and @playwright/mcp makes its own --output-dir the
+    first time a model saves anything, so the worst this loses is the making of
+    a directory the server would make itself."""
+    output_dir = playwright_output_dir(run_dir)
+    with suppress(OSError):
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
 def blocked_origins(browser_port: int) -> str:
     """The engine's own loopback services, in both spellings, for the MCP
     server's `--blocked-origins` (AC-16).
@@ -804,7 +820,9 @@ browser tools this round. The last lines it printed:
 ```
 
 Judge the round on the diff and the gates, and say in `reasons` that the app
-did not start. The executor was told the same thing before it began."""
+did not start. The engine serves the tree again for each audit, from the
+worktree as the executor left it. If the executor's round had an app and this
+one does not, look at the diff first."""
 
 _AUDIT_NO_BROWSER = """\
 # Browser (engine check)

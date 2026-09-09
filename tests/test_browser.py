@@ -1058,6 +1058,19 @@ def test_the_audit_block_for_an_app_that_never_started_carries_the_tail_and_no_t
     assert "`reasons`" in block
 
 
+def test_the_not_ready_audit_block_sends_the_supervisor_to_the_diff():
+    """The two serves read two different trees. The round's ran against the
+    worktree as the reset left it; the audit's runs against it as the executor
+    left it. So an app that came up for the executor and not here is the
+    executor's change breaking the dev server, and a block saying the executor
+    heard the same thing before it began would tell the supervisor the failure
+    predates the round."""
+    block = flat(audit_block(evidence(ready=False)))
+    assert "was told the same thing" not in block
+    assert "look at the diff first" in block
+    assert "from the worktree as the executor left it" in block
+
+
 def test_the_audit_block_for_an_unreachable_browser_says_no_captures_no_tools_and_no_finding():
     """AC-27. The engine's setup, not the executor's work: the supervisor is
     told to say so in `reasons` and told not to hold it against the round."""
@@ -1284,6 +1297,23 @@ def test_the_round_is_served_after_the_reset_and_stopped_after_the_loop(
     port = int(r["env"]["LOOPGRAPH_PORT"])
     assert_port_closed(port)
     assert port not in browser._reserved
+
+
+def test_a_scratch_path_the_engine_cannot_make_does_not_park_the_round(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """AC-6. Making the MCP server's output directory was the one browser-shaped
+    statement that could raise out of the activity, and a raise here parks the
+    item over a directory the server makes itself on first write. A file sitting
+    where `scratch/playwright` should be is the cheapest way to break it."""
+    (rundir / "browser.yaml").write_text(f"serve:\n  cmd: {APP_CMD}\n  ready_timeout: 30\n")
+    (rundir / "scratch").mkdir()
+    (rundir / "scratch" / "playwright").write_text("not a directory\n")
+
+    r = a_round(rundir, target, monkeypatch)
+    assert r["status"] == "green"
+    assert r["mcp_servers"] == {"playwright": mcp_server_entry(
+        playwright_output_dir(str(rundir)), browser_endpoint(), browser_port())}
+    assert_port_closed(int(r["env"]["LOOPGRAPH_PORT"]))
 
 
 def test_the_serve_starts_only_after_load_gates(rundir, target, monkeypatch):
@@ -1593,6 +1623,22 @@ def test_a_ready_serve_is_captured_then_judged_then_stopped(
         playwright_output_dir(str(rundir)), browser_endpoint(), browser_port())}
     assert_port_closed(port)
     assert port not in browser._reserved
+
+
+def test_a_scratch_path_the_engine_cannot_make_does_not_park_the_audit(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """AC-7. The round's twin: the audit points the supervisor's MCP server at
+    the same directory, so the same raise would park the item after the round
+    had already been run."""
+    (rundir / "browser.yaml").write_text(f"serve:\n  cmd: {APP_CMD}\n  ready_timeout: 30\n")
+    (rundir / "scratch").mkdir()
+    (rundir / "scratch" / "playwright").write_text("not a directory\n")
+
+    r = an_audit(rundir, target, monkeypatch)
+    assert r["verdict"] == "accept"
+    assert r["mcp_servers"] == {"playwright": mcp_server_entry(
+        playwright_output_dir(str(rundir)), browser_endpoint(), browser_port())}
+    assert_port_closed(int(r["env"]["LOOPGRAPH_PORT"]))
 
 
 def test_a_failed_capture_reaches_the_prompt_as_an_error_line(

@@ -332,8 +332,7 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
                 attach = await browser.attach_browser(browser.browser_endpoint())
             evidence = browser.browser_evidence(serve, attach, [])
             if serve.ready and attach.ok:
-                output_dir = browser.playwright_output_dir(run_dir)
-                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                output_dir = browser.make_output_dir(run_dir)
                 servers = {browser.MCP_SERVER_NAME: browser.mcp_server_entry(
                     output_dir, browser.browser_endpoint(), browser.browser_port())}
         if evidence:
