@@ -271,3 +271,18 @@ def test_the_docs_say_what_the_shell_reports(doc, phrase):
     watching it go red, and that step must not be dropped as fixed."""
     text = " ".join((ROOT / doc).read_text().split())
     assert phrase in text, f"{doc} never says {phrase!r}"
+
+
+def test_run_one_lays_env_over_the_inherited_environment(tmp_path):
+    """What the browser endpoint rides in on. The dict is a layer over the
+    worker's own environment, never a replacement: a gate handed only
+    LOOPGRAPH_BROWSER_WS would have lost PATH, and `pytest` would not be a
+    command any more. No dict at all is what every gate got before, and still is
+    for a run with no browser.yaml."""
+    g = {"name": "env", "cmd": 'echo "$X"; test -n "$PATH"', "green_exit": 0, "timeout": 5}
+    r = asyncio.run(_run_one(g, str(tmp_path), env={"X": "y"}))
+    assert r["status"] == "green", r["output_tail"]
+    assert r["output_tail"].strip() == "y"
+    r = asyncio.run(_run_one(g, str(tmp_path)))
+    assert r["status"] == "green", r["output_tail"]
+    assert r["output_tail"].strip() == ""

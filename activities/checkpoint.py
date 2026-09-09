@@ -16,6 +16,7 @@ from pathlib import Path
 
 from temporalio import activity
 
+from activities import browser
 from activities.execute_round import _git, parse_porcelain
 from activities.gate import _run_one, load_gates
 
@@ -77,7 +78,8 @@ async def _already_committed(worktree: str, message: str) -> str | None:
 
 
 async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict], message: str,
-                               max_net: int | None = None) -> dict:
+                               max_net: int | None = None,
+                               gate_env: dict[str, str] | None = None) -> dict:
     if not files:
         return {"committed": False, "reason": "empty write set"}
 
@@ -93,7 +95,11 @@ async def checkpoint_write_set(worktree: str, files: list[str], gates: list[dict
                 "note": "already committed by an earlier attempt"}
 
     hb = activity.heartbeat if activity.in_activity() else None
-    gate_results = [await _run_one(g, worktree, heartbeat=hb) for g in gates]
+    # `gate_env` is the browser endpoint and never the app's, because the round's
+    # serve was stopped when execute_round returned: a gate that reached
+    # $LOOPGRAPH_APP_URL would be green in the round and red here, and the
+    # accepted item would park with its work thrown away (AC-8).
+    gate_results = [await _run_one(g, worktree, heartbeat=hb, env=gate_env) for g in gates]
     red = [g["name"] for g in gate_results if g["status"] == "red"]
     if red:
         return {"committed": False, "reason": f"gates red at checkpoint: {', '.join(red)}",
@@ -160,7 +166,7 @@ async def checkpoint(run_dir: str, worktree: str, files: list[str], round_no: in
     gates = load_gates(str(Path(run_dir) / "gates.yaml"))
     return await checkpoint_write_set(worktree, files, gates,
                                       build_commit_message(round_no, summary, files, item_no),
-                                      max_net=max_net)
+                                      max_net=max_net, gate_env=browser.gate_env(run_dir))
 
 
 async def merge_branch(target_repo: str, base_branch: str, branch: str) -> dict:

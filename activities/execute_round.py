@@ -21,6 +21,7 @@ from pathlib import Path
 
 from temporalio import activity
 
+from activities import browser
 from activities.gate import _run_one, load_gates
 from activities.owner import read_answers
 from activities.stream import log_name, stream_query
@@ -217,8 +218,16 @@ async def undo_self_commit(worktree: str, start_head: str) -> bool:
     return True
 
 
-async def run_executor(prompt: str, feedback: str | None, worktree: str, log_path: str) -> dict:
-    """One headless Claude produce (or correct) pass inside the worktree."""
+async def run_executor(prompt: str, feedback: str | None, worktree: str, log_path: str,
+                       env: dict[str, str] | None = None,
+                       mcp_servers: dict | None = None) -> dict:
+    """One headless Claude produce (or correct) pass inside the worktree.
+
+    `env` is the run's app environment when it has one, laid over the blanked bot
+    credentials and never the other way round: `app_env` carries none of those
+    keys, so only the order says the executor cannot get the token back.
+    `mcp_servers` is the `playwright` entry, and it arrives only when the app came
+    up and the browser container answered."""
     if os.environ.get("LOOPGRAPH_IN_CONTAINER") != "1":
         raise RuntimeError("refusing to run Claude outside the worker container")
     from claude_agent_sdk import ClaudeAgentOptions
@@ -228,7 +237,11 @@ async def run_executor(prompt: str, feedback: str | None, worktree: str, log_pat
         cwd=worktree,
         permission_mode="bypassPermissions",
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-        env=NO_TELEGRAM,
+        env=NO_TELEGRAM | (env or {}),
+        mcp_servers=mcp_servers or {},
+        # With or without a browser: the worktree is the target repo, and its own
+        # .mcp.json would otherwise hand this executor servers nobody declared.
+        strict_mcp_config=True,
     ), log_path)
     try:
         payload = parse_final_json(text)
@@ -271,18 +284,70 @@ async def execute_round(run_dir: str, target_repo: str, work_item: str, round_no
 
     gates = load_gates(str(run / "gates.yaml"))
 
+    # A run with a browser.yaml has a web app. The file is read once, and an
+    # unreadable one is an error value that reaches the executor's prompt rather
+    # than a raise that parks the item. Gates get the browser endpoint whether or
+    # not the file passed the check, and never the app's own keys (AC-8).
+    cfg = browser.read_browser_config(run_dir)
+    config_error = cfg.message if isinstance(cfg, browser.BrowserConfigError) else None
+    gates_env = browser.gate_env(run_dir)
+    app, servers = None, None
+
     async def exec_fn(p: str, fb: str | None) -> dict:
-        return await run_executor(p, fb, worktree, log_path)
+        return await run_executor(p, fb, worktree, log_path, env=app, mcp_servers=servers)
 
     async def gate_fn() -> list[dict]:
         results = []
         for g in gates:
             activity.heartbeat(f"gate {g['name']}")
-            results.append(await _run_one(g, worktree, heartbeat=activity.heartbeat))
+            results.append(await _run_one(g, worktree, heartbeat=activity.heartbeat,
+                                          env=gates_env))
         return results
 
     start_head = (await _git("rev-parse", "HEAD", cwd=worktree)).strip()
-    final = await run_round(prompt, exec_fn, gate_fn)
+
+    # The last two statements before the try that stops it, and deliberately so:
+    # anything that raises between them and the finally leaks the process group
+    # and the reserved port, and Temporal's retry then starts a second server
+    # beside the one nobody can reach. The serve reads the tree as the reset left
+    # it, which is the checkpoint the round starts from.
+    port = serve = None
+    if isinstance(cfg, dict):
+        port = browser.pick_port()
+        serve = await browser.start_serve(cfg["serve"]["cmd"], worktree, port,
+                                          cfg["serve"]["ready_timeout"],
+                                          heartbeat=activity.heartbeat)
+    try:
+        evidence = None
+        if config_error:
+            evidence = browser.browser_evidence(None, None, [], config_error=config_error)
+        elif serve is not None:
+            app = browser.app_env(port)
+            # Asked once, and kept apart from the serve's own `ready`: a run can
+            # have its app up and Chromium down, and a prompt that folded the two
+            # together told a model its tools were attached to a browser that was
+            # not there (AC-27). Nothing to attach to when the app never came up.
+            attach = None
+            if serve.ready:
+                attach = await browser.attach_browser(browser.browser_endpoint())
+            evidence = browser.browser_evidence(serve, attach, [])
+            if serve.ready and attach.ok:
+                output_dir = browser.playwright_output_dir(run_dir)
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                servers = {browser.MCP_SERVER_NAME: browser.mcp_server_entry(
+                    output_dir, browser.browser_endpoint(), browser.browser_port())}
+        if evidence:
+            # Joined the way every other section of the prompt is, and before the
+            # loop, so every attempt of the round carries it. Empty when the app
+            # is up and the browser answered: the tools are in the options and the
+            # contract has already said what they are for.
+            block = browser.executor_block(evidence)
+            if block:
+                prompt += "\n\n" + block
+        final = await run_round(prompt, exec_fn, gate_fn)
+    finally:
+        if serve is not None:
+            await serve.stop()
 
     self_committed = await undo_self_commit(worktree, start_head)
 

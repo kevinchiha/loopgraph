@@ -80,7 +80,12 @@ async def _drain(stream, keep: int, buf: bytearray) -> None:
             del buf[:-keep]
 
 
-async def _run_one(gate: dict, workdir: str, heartbeat=None) -> dict:
+async def _run_one(gate: dict, workdir: str, heartbeat=None,
+                   env: dict[str, str] | None = None) -> dict:
+    """Run one gate. `env` is laid over the worker's own environment, never used
+    in place of it: a gate handed nothing but the browser endpoint would have
+    lost PATH. None is what a run with no browser.yaml gets, and it inherits
+    exactly what this process has, which is what every gate got before."""
     # bash with pipefail, because /bin/sh reports a pipeline's exit as its last
     # stage's: `pytest -q | tee log` exited 0 with pytest red. The gate exit code
     # is the round loop's only bound, so a gate that cannot go red leaves it with
@@ -97,6 +102,7 @@ async def _run_one(gate: dict, workdir: str, heartbeat=None) -> dict:
         # the shell alone left `npm run build`'s children running after the gate
         # was declared timed out.
         start_new_session=True,
+        env={**os.environ, **env} if env else None,
     )
     # Poll instead of a bare wait_for so long gates (next build, npm ci) keep
     # heartbeating — a silent 10-minute gate would be declared dead by Temporal.

@@ -23,6 +23,7 @@ it. Nothing in here opens a page.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import re
 import subprocess
@@ -44,6 +45,7 @@ from activities.browser import (DEFAULT_BROWSER_PORT, BrowserAttach, BrowserConf
                                 load_browser_config, mcp_server_entry, parse_browser_config,
                                 pick_port, playwright_output_dir, read_browser_config,
                                 release_port, shots_dir, start_serve)
+from activities.execute_round import NO_TELEGRAM, execute_round, run_executor
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1083,6 +1085,310 @@ def test_the_two_capture_paths_are_ignored_even_inside_a_shipped_example():
                  "runs/example-hello/scratch/playwright/page-1.png"):
         assert subprocess.run(["git", "check-ignore", "-q", path], cwd=ROOT).returncode == 0, \
             f"{path} is not ignored"
+
+
+# ---------- the round that serves the app ----------
+#
+# The real `execute_round` under an ActivityEnvironment with the round loop
+# faked, which is the pattern `tests/test_review_fixes.py` uses for the rest of
+# that call site. The app under test is the same local `python -m http.server`
+# the serve tests use, and the browser container is faked at `attach_browser`:
+# the real one needs a Chromium the gate does not have, and would spend its
+# whole ATTACH_TIMEOUT finding that out (AC-26).
+
+APP_CMD = f"{sys.executable} -m http.server $LOOPGRAPH_PORT --bind 127.0.0.1"
+
+NO_LISTENER = "serve:\n  cmd: echo the-app-said-this; sleep 30\n  ready_timeout: 1\n"
+SERVE_PORT_IS_NOT_A_KEY = "serve:\n  cmd: npm run dev\n  port: 3000\n"
+
+
+def git(repo, *args):
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                        "PATH": "/usr/bin:/bin"})
+
+
+@pytest.fixture
+def target(tmp_path):
+    """The repo the run works on. Its one file is what a directory listing served
+    out of the worktree shows, so a test can tell which tree came up."""
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "cli.py").write_text("x = 1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    return repo
+
+
+@pytest.fixture
+def rundir(tmp_path):
+    run = tmp_path / "runs" / "demo"
+    (run / "logs").mkdir(parents=True)
+    (run / "brief.md").write_text("# Feature\n\ndo the thing\n")
+    (run / "gates.yaml").write_text('- name: always-green\n  cmd: "true"\n  timeout: 10\n')
+    return run
+
+
+@pytest.fixture
+def browser_answers(monkeypatch):
+    """The browser container, answering."""
+    async def attach(ws):
+        return BrowserAttach(ws=ws, ok=True, error="")
+    monkeypatch.setattr(browser, "attach_browser", attach)
+
+
+class RecordingServe:
+    """A serve that is up the moment it is asked for and counts its stops."""
+
+    def __init__(self):
+        self.cmd, self.port, self.url = "npm run dev", 0, ""
+        self.ready_timeout, self.ready, self.output_tail = 60, True, ""
+        self.stops = 0
+
+    async def start(self, cmd, workdir, port, ready_timeout, heartbeat=None):
+        self.port, self.url = port, f"http://127.0.0.1:{port}"
+        return self
+
+    async def stop(self):
+        self.stops += 1
+        release_port(self.port)
+
+
+def assert_port_closed(port):
+    """Poll until nothing answers. SIGKILL reaches the group at once but the
+    kernel takes a moment to close the listening socket, so one look is a race."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not asyncio.run(browser._port_answers(port)):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"something still answers on port {port}")
+
+
+def a_round(rundir, target, monkeypatch, during=None):
+    """The real `execute_round` with the round loop standing in for Claude.
+
+    Returns the activity's result with what the loop saw folded into it: the
+    prompt, and the `env` and `mcp_servers` the executor would have been handed.
+    `during` is awaited where the executor's work would happen, so a test can
+    look at the serve while it is still up."""
+    from activities import execute_round as er
+
+    seen = {}
+
+    async def fake_executor(prompt, feedback, worktree, log_path, env=None, mcp_servers=None):
+        seen["prompt"], seen["env"], seen["mcp_servers"] = prompt, env, mcp_servers
+        return {"claims": [], "files_changed": [], "summary": "did it"}
+
+    async def fake_round(prompt, exec_fn, gate_fn, max_attempts=3):
+        result = await exec_fn(prompt, None)
+        if during:
+            await during(seen)
+        return {"status": "green", "attempt": 1, "result": result,
+                "gate_results": await gate_fn()}
+
+    monkeypatch.setattr(er, "run_executor", fake_executor)
+    monkeypatch.setattr(er, "run_round", fake_round)
+    # A real activity context, so the heartbeats the serve and the gates send work.
+    from temporalio.testing import ActivityEnvironment
+    out = asyncio.run(ActivityEnvironment().run(
+        er.execute_round, str(rundir), str(target), "do the thing", 1, None, 1, "ab12cd", None))
+    return {**out, **seen}
+
+
+def executor_options(monkeypatch, **kw):
+    """The ClaudeAgentOptions one `run_executor` call built."""
+    from activities import execute_round as er
+
+    seen = {}
+
+    async def fake_stream(prompt, options, log_path):
+        seen["options"] = options
+        return '```json\n{"claims": [], "files_changed": [], "summary": "s"}\n```'
+
+    monkeypatch.setenv("LOOPGRAPH_IN_CONTAINER", "1")
+    monkeypatch.setattr(er, "stream_query", fake_stream)
+    asyncio.run(er.run_executor("do it", None, "/wt", "/nowhere/run.log", **kw))
+    return seen["options"]
+
+
+def test_without_browser_yaml_the_executor_gets_no_server_and_the_same_env_as_before(monkeypatch):
+    """AC-1. A run with no web app is handed what it was handed before this
+    phase. `strict_mcp_config` is the one exception, and it is unconditional."""
+    options = executor_options(monkeypatch)
+    assert options.mcp_servers == {}
+    assert options.env == NO_TELEGRAM
+    assert options.strict_mcp_config is True
+
+
+def test_a_ready_app_and_an_answering_browser_get_the_executor_its_server_and_env(monkeypatch):
+    """AC-3 and AC-13. The three app keys go on over NO_TELEGRAM, which stays
+    first: the bot credentials are blanked there and a layer above must never be
+    able to write them back."""
+    entry = mcp_server_entry("/app/runs/demo/scratch/playwright", browser_endpoint(),
+                             DEFAULT_BROWSER_PORT)
+    options = executor_options(monkeypatch, env=app_env(4321),
+                               mcp_servers={browser.MCP_SERVER_NAME: entry})
+    assert options.mcp_servers == {"playwright": entry}
+    assert options.env == {**NO_TELEGRAM, **app_env(4321)}
+    assert options.env["TELEGRAM_BOT_TOKEN"] == ""
+    assert options.strict_mcp_config is True
+
+
+def test_strict_mcp_config_is_a_literal_in_run_executor():
+    """AC-14. A target repo's `.mcp.json` must never contribute a server to a run
+    that did not declare one, and a keyword computed somewhere else is a keyword
+    nothing can pin."""
+    assert "strict_mcp_config=True" in inspect.getsource(run_executor)
+
+
+def test_the_heartbeat_handed_down_to_the_serve_is_the_activitys():
+    """AC-9. A serve waiting out a 180-second ready_timeout in silence would be
+    declared dead by the 3-minute heartbeat_timeout in `workflows/run.py`, the
+    same way `run_gates` hands its own heartbeat down to `_run_one`."""
+    src = " ".join(inspect.getsource(execute_round).split())
+    call = src.split("browser.start_serve(")[1].split(")")[0]
+    assert "heartbeat=activity.heartbeat" in call, call
+
+
+def test_the_round_is_served_after_the_reset_and_stopped_after_the_loop(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """AC-6. The serve reads the tree at the checkpoint, so it starts after the
+    reset, and it is stopped however the loop ended, so the next round finds the
+    port free rather than held by a dev server nobody can see."""
+    (rundir / "browser.yaml").write_text(f"serve:\n  cmd: {APP_CMD}\n  ready_timeout: 30\n")
+
+    async def during(seen):
+        answer = await http_get(seen["env"]["LOOPGRAPH_APP_URL"])
+        assert answer.startswith(b"HTTP/1.0 200"), answer[:200]
+        assert b"cli.py" in answer, "the serve is not reading the round's worktree"
+
+    r = a_round(rundir, target, monkeypatch, during=during)
+    assert r["status"] == "green"
+    assert r["mcp_servers"] == {"playwright": mcp_server_entry(
+        playwright_output_dir(str(rundir)), browser_endpoint(), browser_port())}
+    assert Path(playwright_output_dir(str(rundir))).is_dir(), \
+        "the MCP server was pointed at an output directory nobody made"
+    port = int(r["env"]["LOOPGRAPH_PORT"])
+    assert_port_closed(port)
+    assert port not in browser._reserved
+
+
+def test_the_serve_starts_only_after_load_gates(rundir, target, monkeypatch):
+    """A raise between `start_serve` and the try that stops it leaks the process
+    group and the reserved port, and Temporal's retry then starts a second server
+    beside the one nobody can reach. `load_gates` raises on a malformed
+    gates.yaml, which is the last thing before the serve that can."""
+    (rundir / "gates.yaml").write_text("name: not-a-list\n")
+    (rundir / "browser.yaml").write_text(f"serve:\n  cmd: {APP_CMD}\n")
+    started = []
+
+    async def never(*args, **kwargs):
+        started.append(args)
+        return None
+
+    monkeypatch.setattr(browser, "start_serve", never)
+    with pytest.raises(ValueError):
+        a_round(rundir, target, monkeypatch)
+    assert started == [], "a serve was started before gates.yaml was read"
+
+
+def test_a_serve_that_never_comes_up_still_runs_the_round_and_says_so_in_the_prompt(
+        rundir, target, monkeypatch, reservations):
+    """AC-5 and AC-6. An app the engine could not bring up is evidence in the
+    executor's prompt, never a parked item, and the round runs as it always did."""
+    (rundir / "browser.yaml").write_text(NO_LISTENER)
+    r = a_round(rundir, target, monkeypatch)
+    assert r["status"] == "green"
+    assert r["files"] == [] and r["branch"] == "lg-demo-ab12cd"
+    assert "\n\n# App server (engine check)" in r["prompt"], "the block is not a section"
+    assert "the-app-said-this" in r["prompt"], "the executor cannot see what the command said"
+    assert r["mcp_servers"] is None, "no app to look at, so no browser tools"
+    # The engine picked a port and told the command about it either way, so the
+    # executor is told the same three things, one of which does not answer.
+    assert r["env"] == app_env(int(r["env"]["LOOPGRAPH_PORT"])), r["env"]
+
+
+def test_an_unreachable_browser_leaves_the_executor_without_tools_and_says_so(
+        rundir, target, monkeypatch, reservations):
+    """AC-27. The app is up and the container is not, and those are two separate
+    facts. Handing the tools over anyway points a model at a browser that is not
+    there; saying nothing leaves it wondering where its tools went."""
+    (rundir / "browser.yaml").write_text(f"serve:\n  cmd: {APP_CMD}\n  ready_timeout: 30\n")
+
+    async def refused(ws):
+        return BrowserAttach(ws=ws, ok=False, error="connect ECONNREFUSED 127.0.0.1:8420")
+
+    monkeypatch.setattr(browser, "attach_browser", refused)
+    r = a_round(rundir, target, monkeypatch)
+    assert r["status"] == "green"
+    assert r["mcp_servers"] is None
+    assert r["env"]["LOOPGRAPH_APP_URL"] == f"http://127.0.0.1:{r['env']['LOOPGRAPH_PORT']}"
+    assert f"did not answer at {browser_endpoint()}," in flat(r["prompt"])
+
+
+def test_an_invalid_browser_yaml_serves_nothing_and_says_so(rundir, target, monkeypatch):
+    """A file edited into a broken state after `lg start` reaches the executor as
+    evidence. Nothing is served, so there is no port and no app environment."""
+    (rundir / "browser.yaml").write_text(SERVE_PORT_IS_NOT_A_KEY)
+
+    async def never(*args, **kwargs):
+        raise AssertionError("a file that did not pass the check was served anyway")
+
+    monkeypatch.setattr(browser, "start_serve", never)
+    r = a_round(rundir, target, monkeypatch)
+    assert r["status"] == "green"
+    assert "browser.yaml is invalid: serve.port is not a key" in r["prompt"]
+    assert r["mcp_servers"] is None
+    assert r["env"] is None
+
+
+def test_the_serve_is_stopped_when_the_round_loop_raises(
+        rundir, target, monkeypatch, browser_answers, reservations):
+    """What the finally is for. A round loop that died, or an activity Temporal
+    cancelled, must not leave a dev server holding the port for the next round."""
+    (rundir / "browser.yaml").write_text("serve:\n  cmd: npm run dev\n")
+    serve = RecordingServe()
+    monkeypatch.setattr(browser, "start_serve", serve.start)
+
+    async def die(prompt, exec_fn, gate_fn, max_attempts=3):
+        raise RuntimeError("the round loop died")
+
+    from activities import execute_round as er
+    from temporalio.testing import ActivityEnvironment
+    monkeypatch.setattr(er, "run_round", die)
+    with pytest.raises(RuntimeError):
+        asyncio.run(ActivityEnvironment().run(
+            er.execute_round, str(rundir), str(target), "do the thing", 1, None, 1,
+            "ab12cd", None))
+    assert serve.stops == 1
+    assert serve.port not in browser._reserved
+
+
+@pytest.mark.parametrize("declaration", [NO_LISTENER, SERVE_PORT_IS_NOT_A_KEY])
+def test_gates_see_the_browser_endpoint_and_never_the_app_url(
+        rundir, target, monkeypatch, reservations, declaration):
+    """AC-8. Whether the file passes the check, and whether the app came up, is
+    not the question: a gate gets the browser endpoint while browser.yaml exists.
+    `checkpoint_write_set` re-runs the same gates.yaml with no serve alive, so a
+    gate that reached the app would be green here and red at the commit."""
+    (rundir / "gates.yaml").write_text(
+        '- name: env\n  cmd: test -n "$LOOPGRAPH_BROWSER_WS" && test -z "$LOOPGRAPH_PORT"'
+        ' && test -z "$LOOPGRAPH_APP_URL"\n  timeout: 10\n')
+    (rundir / "browser.yaml").write_text(declaration)
+    r = a_round(rundir, target, monkeypatch)
+    assert [g["status"] for g in r["gate_results"]] == ["green"], r["gate_results"]
+
+
+def test_without_browser_yaml_a_gate_sees_no_browser_endpoint(rundir, target, monkeypatch):
+    """AC-1. A run with no web app hands its gates nothing of its own, which is
+    what `_run_one` does with no environment at all."""
+    (rundir / "gates.yaml").write_text(
+        '- name: env\n  cmd: test -z "$LOOPGRAPH_BROWSER_WS"\n  timeout: 10\n')
+    r = a_round(rundir, target, monkeypatch)
+    assert [g["status"] for g in r["gate_results"]] == ["green"], r["gate_results"]
 
 
 # ---------- the browser-container checklist ----------

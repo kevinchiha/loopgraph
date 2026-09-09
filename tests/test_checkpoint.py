@@ -140,14 +140,17 @@ def test_only_the_staged_diff_is_counted(worktree):
     assert r["leftovers"] == ["base.py"]
 
 
-def test_the_checkpoint_activity_forwards_max_net(tmp_path, monkeypatch):
+def test_the_checkpoint_activity_forwards_max_net_and_the_gate_environment(tmp_path, monkeypatch):
     # A wrapper that takes the argument and drops it leaves every cap dead with a
-    # green suite, so the forwarding is pinned on its own.
+    # green suite, so the forwarding is pinned on its own. `gate_env` is the same
+    # shape of mistake: dropped, the commit-time gates lose the browser endpoint
+    # the round's gates had, and only a run with a real web app would ever notice.
     import activities.checkpoint as cp
     seen = {}
 
-    async def recorder(wt, files, gates, message, max_net=None):
+    async def recorder(wt, files, gates, message, max_net=None, gate_env=None):
         seen["max_net"] = max_net
+        seen["gate_env"] = gate_env
         return {"committed": True}
 
     monkeypatch.setattr(cp, "checkpoint_write_set", recorder)
@@ -155,8 +158,10 @@ def test_the_checkpoint_activity_forwards_max_net(tmp_path, monkeypatch):
     # it unguarded, so calling the activity bare would die before it forwards.
     monkeypatch.setattr(cp.activity, "heartbeat", lambda *a, **k: None)
     monkeypatch.setattr(cp, "load_gates", lambda path: [])
+    (tmp_path / "browser.yaml").write_text("serve:\n  cmd: npm run dev\n")
     asyncio.run(cp.checkpoint(str(tmp_path), str(tmp_path), ["base.py"], 1, "s", 1, max_net=0))
     assert seen["max_net"] == 0
+    assert seen["gate_env"] == {"LOOPGRAPH_BROWSER_WS": cp.browser.browser_endpoint()}
 
 
 def test_a_retry_reports_the_numbers_the_first_attempt_did(worktree):
@@ -277,11 +282,17 @@ def test_a_file_removed_with_plain_rm_still_commits(worktree):
     assert _names_and_status(worktree) == [("D", "helpers.py")]
 
 
-def test_max_net_is_the_last_parameter_of_both_functions():
+def test_the_checkpoint_activity_keeps_max_net_on_the_end_of_its_arguments():
+    """The workflow passes the activity's arguments positionally and Temporal
+    replays a waiting run from recorded history, so an argument that moved would
+    replay as a different call. `checkpoint_write_set` is a plain function every
+    caller reaches by keyword, so `gate_env` sits after `max_net` there; the
+    activity's own list is the one that may never be reordered."""
     from activities.checkpoint import checkpoint
-    for fn in (checkpoint_write_set, checkpoint):
-        last = list(inspect.signature(fn).parameters.values())[-1]
-        assert last.name == "max_net" and last.default is None
+    last = list(inspect.signature(checkpoint).parameters.values())[-1]
+    assert last.name == "max_net" and last.default is None
+    inner = inspect.signature(checkpoint_write_set).parameters
+    assert inner["max_net"].default is None and inner["gate_env"].default is None
 
 
 def test_merge_branch_without_any_git_identity(tmp_path):
@@ -313,3 +324,41 @@ def test_merge_branch_refuses_dirty_repo(worktree):
     import activities.checkpoint as cp
     r = asyncio.run(cp.merge_branch(worktree, "main", "whatever"))
     assert not r["merged"] and "uncommitted" in r["reason"]
+
+
+def test_the_checkpoints_gate_re_run_sees_the_browser_endpoint_and_never_the_app_url(
+        worktree, tmp_path_factory):
+    """AC-8. The commit-time re-run is the second place the run's gates.yaml
+    runs, and no serve is alive here: the round's one was stopped when
+    execute_round returned. A gate that reached $LOOPGRAPH_APP_URL would be green
+    in the round and red at the commit, and the accepted item would park with its
+    work thrown away. So the browser endpoint is handed over and the two app keys
+    never are.
+
+    The run directory is its own tmp dir rather than one inside the worktree,
+    which git would then report as an untracked leftover of the commit."""
+    from temporalio.testing import ActivityEnvironment
+
+    from activities.checkpoint import checkpoint
+
+    run_dir = tmp_path_factory.mktemp("rundir")
+    (run_dir / "browser.yaml").write_text("serve:\n  cmd: npm run dev\n")
+    (run_dir / "gates.yaml").write_text(
+        '- name: env\n'
+        '  cmd: test -n "$LOOPGRAPH_BROWSER_WS" && test -z "$LOOPGRAPH_PORT"'
+        ' && test -z "$LOOPGRAPH_APP_URL"\n  timeout: 10\n')
+    with open(f"{worktree}/base.py", "a") as f:
+        f.write("y = 2\n")
+    r = asyncio.run(ActivityEnvironment().run(
+        checkpoint, str(run_dir), worktree, ["base.py"], 1, "with a web app", 1, None))
+    assert r["committed"], r
+
+    # No browser.yaml is a run with no web app, and its gates see none of it.
+    (run_dir / "browser.yaml").unlink()
+    (run_dir / "gates.yaml").write_text(
+        '- name: env\n  cmd: test -z "$LOOPGRAPH_BROWSER_WS"\n  timeout: 10\n')
+    with open(f"{worktree}/base.py", "a") as f:
+        f.write("z = 3\n")
+    r = asyncio.run(ActivityEnvironment().run(
+        checkpoint, str(run_dir), worktree, ["base.py"], 2, "with no web app", 1, None))
+    assert r["committed"], r
