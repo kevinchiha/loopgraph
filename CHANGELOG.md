@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.6.0 - 2026-09-10
+
 - A run can declare a web app, and the engine gives everyone a real browser. Put a
   `browser.yaml` in the run directory naming the dev-server command and the pages
   to look at; the engine picks a free port, serves the worktree on it, and hands
