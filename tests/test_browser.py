@@ -2252,16 +2252,20 @@ def test_the_skills_recipe_never_calls_curl_inside_the_worker():
     assert "setsid" in recipe and "kill -- -$!" in recipe
 
 
-def test_the_changelog_has_the_note_under_unreleased():
+def test_the_changelog_note_shipped_with_the_browser_release():
     """AC-25, and the release rule with it: the note ships in the same commit as
-    the change, under the heading `release.sh` renames. A note filed under the
-    last released version is a note nobody upgrading is ever shown, because
-    `changelog_between` only reads the sections above the version they have."""
-    unreleased = [lines for name, lines in version._sections(CHANGELOG) if name is None]
-    assert len(unreleased) == 1, "CHANGELOG.md should have one ## Unreleased section"
-    note = flat("\n".join(unreleased[0]))
+    the change, under the heading `release.sh` renames. It rode `## Unreleased`
+    until 0.6.0 went out, and this reads the section that heading became, so the
+    check outlives the release instead of turning red the day it succeeds. A
+    note nobody upgrading is shown is the failure either way: `changelog_between`
+    only reads the sections above the version they have."""
+    named = {name: lines for name, lines in version._sections(CHANGELOG) if name}
+    assert "0.6.0" in named, "CHANGELOG.md lost the 0.6.0 section"
+    note = flat("\n".join(named["0.6.0"]))
     for said in ("`browser.yaml`", "COMPOSE_PROFILES=browser"):
-        assert said in note, f"the Unreleased note never says {said}"
+        assert said in note, f"the 0.6.0 note never says {said}"
+    # One Unreleased heading, still, because that is where the next note goes.
+    assert len([1 for name, _ in version._sections(CHANGELOG) if name is None]) == 1
 
 
 def test_the_preconditions_block_is_still_one_fenced_block():
