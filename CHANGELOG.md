@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.7.0 - 2026-09-10
+
 - An item gets eight rounds instead of three before it parks, and the number is
   now a setting: `LOOPGRAPH_MAX_ROUNDS` in `.env`. The worker takes it from the
   environment the container started with, and each run records the number it

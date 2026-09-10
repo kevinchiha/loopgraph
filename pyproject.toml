@@ -1,6 +1,6 @@
 [project]
 name = "loopgraph-engine"
-version = "0.6.0"
+version = "0.7.0"
 description = "Durable agent-orchestration: Temporal owns the graph, LangGraph owns the loop, gates are code."
 requires-python = ">=3.13"
 dependencies = [
