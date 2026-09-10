@@ -2308,11 +2308,11 @@ def test_agents_md_lists_browser_py_and_states_the_gate_rule():
 #
 # Items 1 to 3 were run the day this file was written, against a container and
 # an image started by hand rather than the live stack, and each one records what
-# it answered. The engine's own capture and MCP wiring has landed since, so
-# nothing here is waiting on code any more: item 4's CDN-font half, item 5 and
-# item 6 are unrun because each of them needs a real run against the live stack,
-# and only the owner brings that up. They are written down so that nobody has to
-# work out afterwards what was never checked.
+# it answered. The engine's own capture and MCP wiring landed later in the
+# phase, and item 4's CDN-font half, item 5 and item 6 were run 2026-09-10
+# against the live stack with a real run (runs/2026-09-10-browser-smoke, a
+# one-page site that loads Inter from a CDN, one work item, accepted on round
+# 1). Each records what it answered.
 #
 #  1. AC-18, the service. With nothing set in the environment:
 #       docker compose config --services | grep -c '^browser$'
@@ -2380,7 +2380,10 @@ def test_agents_md_lists_browser_py_and_states_the_gate_rule():
 #     The first half was run 2026-09-09 with item 3's session: browser_navigate
 #     to http://127.0.0.1:8400 answered
 #     `net::ERR_BLOCKED_BY_CLIENT at http://127.0.0.1:8400/`. The second half
-#     wants an app under test and waits for the engine's wiring.
+#     was run 2026-09-10 with the smoke run: the supervisor's own browser listed
+#     fonts.googleapis.com/css2 200 and fonts.gstatic.com Inter woff2 200 on
+#     both pages, and the executor's document.fonts.check('700 2em Inter') was
+#     true after fonts.ready. The font arrived; the list blocked nothing else.
 #
 #  5. AC-10, the captures. Run an item whose browser.yaml declares pages, and
 #     look in <run_dir>/shots/i<N>-r<M>/ when the round ends.
@@ -2390,7 +2393,11 @@ def test_agents_md_lists_browser_py_and_states_the_gate_rule():
 #     picture is the app.
 #     Then, in the same run's worktree, `ls shots` — there is no such directory.
 #     Every path the engine writes is under the run directory.
-#     Needs the engine's capture wiring; unrun as this file is written.
+#     Run 2026-09-10 with the smoke run: shots/i1-r1/ held home.png,
+#     home-narrow.png and about.png, one per entry and named as declared;
+#     home.png opened as the redesigned page in Inter bold, full page at 1280.
+#     The worktree had no shots directory; the scope gate's
+#     `git status --untracked-files=all` saw index.html and about.html only.
 #
 #  6. AC-13, the worktree. After an executor round in which the model took a
 #     screenshot of its own, in that run's worktree:
@@ -2401,4 +2408,8 @@ def test_agents_md_lists_browser_py_and_states_the_gate_rule():
 #     directory, which is the worktree. If a file is there anyway, the audit
 #     prompt's write-set mismatch block names it — that is the net underneath
 #     working, and this item has still failed.
-#     Needs the engine's MCP wiring; unrun as this file is written.
+#     Run 2026-09-10 with the smoke run: the executor made twelve playwright
+#     calls (navigate, snapshot, click, evaluate, resize, console) and its
+#     snapshots landed under scratch/playwright/ as page-<stamp>.yml; the scope
+#     gate came back `write set in scope` and the audit's write-set mismatch
+#     block named nothing.
