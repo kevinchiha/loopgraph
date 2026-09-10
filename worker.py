@@ -10,7 +10,7 @@ from temporalio.worker import Worker
 
 from activities.audit import audit
 from activities.checkpoint import checkpoint, discard, merge
-from activities.config import load_run_config
+from activities.config import load_run_config, max_rounds
 from activities.discover import discover
 from activities.execute_round import execute_round, run_baseline
 from activities.gate import run_gates
@@ -53,7 +53,9 @@ async def main() -> None:
                     load_run_config, load_work_items, send_card, telegram_configured,
                     record_owner_answer],
     )
-    print(f"worker up on task queue {TASK_QUEUE!r}", flush=True)
+    cap = max_rounds(os.environ.get("LOOPGRAPH_MAX_ROUNDS", ""))
+    print(f"worker up on task queue {TASK_QUEUE!r}, "
+          f"up to {cap} rounds per work item", flush=True)
     await worker.run()
 
 

@@ -1,12 +1,15 @@
 import asyncio
 import inspect
+import pathlib
 import re
 
 import pytest
 from temporalio.exceptions import ApplicationError
 
-from activities.config import (DEFAULT_CONVERGENCE, load_run_config, parse_deadline,
-                               parse_run_config, read_run_config)
+from activities.config import (DEFAULT_CONVERGENCE, DEFAULT_MAX_ROUNDS, load_run_config,
+                               max_rounds, parse_deadline, parse_run_config,
+                               read_run_config)
+from envfile import parse_env
 
 DEFAULTS = {"convergence": {"enabled": True, "every_items": 5, "net_lines": 400}, "sweep": None}
 
@@ -259,3 +262,49 @@ def test_load_run_config_is_registered():
     listed = re.search(r"activities=\[(.*?)\]", inspect.getsource(worker.main), re.S)
     names = [n.strip() for n in listed.group(1).replace("\n", " ").split(",")]
     assert "load_run_config" in names, names
+
+
+# --- the round cap, which comes from .env and not from run.yaml ---
+
+def test_the_round_cap_is_read_from_the_env():
+    assert max_rounds("12") == 12
+    assert max_rounds("1") == 1
+
+
+def test_a_round_cap_that_is_not_a_number_reads_as_unset():
+    """A typo must not park every item on round one, hours after the person who
+    typed it stopped watching. `browser_port` treats its own setting the same
+    way, and `0` is a typo too: an item that gets no round can only park."""
+    for written in ("", "eight", "3.5", "-2", "0", " 4", "8 rounds"):
+        assert max_rounds(written) == DEFAULT_MAX_ROUNDS, written
+
+
+def test_the_config_activity_carries_the_cap_to_the_workflow(tmp_path, monkeypatch):
+    """The workflow reads no env (AC-35), so the number reaches it as an
+    activity result and is recorded in the run's history. A run keeps the cap it
+    started with, whatever .env says later."""
+    monkeypatch.setenv("LOOPGRAPH_MAX_ROUNDS", "5")
+    assert asyncio.run(load_run_config(str(tmp_path)))["max_rounds"] == 5
+    monkeypatch.delenv("LOOPGRAPH_MAX_ROUNDS")
+    assert asyncio.run(load_run_config(str(tmp_path)))["max_rounds"] == DEFAULT_MAX_ROUNDS
+    # run.yaml keeps its own keys: the cap is one number for the machine, and a
+    # run.yaml asking for it is an unknown key, not a per-run override.
+    assert read_run_config(str(tmp_path)) == DEFAULTS
+
+
+def test_env_example_ships_the_cap_commented_out_at_the_default():
+    """One number, in the setting's comment and in the code. Commented out keeps
+    it out of parse_env, so `lg update` does not tell everyone upgrading to add
+    a setting whose default is what they already had."""
+    text = pathlib.Path(__file__).resolve().parent.parent.joinpath(".env.example").read_text()
+    assert f"# LOOPGRAPH_MAX_ROUNDS={DEFAULT_MAX_ROUNDS}" in text
+    assert "LOOPGRAPH_MAX_ROUNDS" not in parse_env(text)
+
+
+def test_the_worker_prints_the_cap_it_took():
+    """The one place a value that did not land is visible before a run is spent
+    on it. A typo reads as unset, so nothing else says which number is live."""
+    import worker
+    src = inspect.getsource(worker.main)
+    assert 'max_rounds(os.environ.get("LOOPGRAPH_MAX_ROUNDS", ""))' in src
+    assert "rounds per work item" in src

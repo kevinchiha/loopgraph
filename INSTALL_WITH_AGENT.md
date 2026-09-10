@@ -39,7 +39,7 @@ you ask, because it decides where they put future projects.
   and its local api-key. Recommended.
 - A plain API key, straight to the Anthropic endpoint.
 
-Tell them why it matters, in one line: a single run can spend three executor
+Tell them why it matters, in one line: a single run can spend eight executor
 rounds plus an audit pass, so per-token billing adds up faster than they expect.
 
 Ask which models their proxy actually serves, and take the answer as it comes.

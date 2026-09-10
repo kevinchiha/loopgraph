@@ -8,7 +8,8 @@ field the owner had authorised looked to it like an invented claim.
 from activities.audit import assemble_audit_prompt
 from activities.execute_round import assemble_prompt
 from activities.owner import HEADER, append_answer, format_answer, read_answers
-from workflows.run import MAX_ASKS, MAX_ROUNDS, budget_spent
+from activities.config import DEFAULT_MAX_ROUNDS
+from workflows.run import MAX_ASKS, budget_spent
 
 
 def test_format_answer_expands_a_button_letter():
@@ -62,13 +63,21 @@ def test_prompts_say_none_when_nothing_was_asked():
 
 def test_questions_do_not_spend_the_correction_budget():
     # Three questions used to consume every round. They must not.
-    assert budget_spent(spent=1, asks=MAX_ASKS - 1) is None
-    assert budget_spent(spent=MAX_ROUNDS - 1, asks=0) is None
+    assert budget_spent(spent=1, asks=MAX_ASKS - 1, cap=DEFAULT_MAX_ROUNDS) is None
+    assert budget_spent(spent=DEFAULT_MAX_ROUNDS - 1, asks=0, cap=DEFAULT_MAX_ROUNDS) is None
 
 
 def test_each_budget_stops_the_item_on_its_own():
-    assert budget_spent(spent=MAX_ROUNDS, asks=0) == "redo cap reached"
-    assert budget_spent(spent=0, asks=MAX_ASKS) == "owner-question cap reached"
+    assert budget_spent(spent=DEFAULT_MAX_ROUNDS, asks=0,
+                        cap=DEFAULT_MAX_ROUNDS) == "redo cap reached"
+    assert budget_spent(spent=0, asks=MAX_ASKS, cap=DEFAULT_MAX_ROUNDS) == "owner-question cap reached"
+
+
+def test_the_item_stops_on_the_cap_the_run_was_given():
+    """The cap is a .env setting the config activity records at the top of the
+    run, so the item counts against the number it was handed, not a constant."""
+    assert budget_spent(spent=4, asks=0, cap=5) is None
+    assert budget_spent(spent=5, asks=0, cap=5) == "redo cap reached"
 
 
 def test_a_multi_item_audit_is_told_which_item_it_judges():

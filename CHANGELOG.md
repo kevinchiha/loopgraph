@@ -6,6 +6,15 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- An item gets eight rounds instead of three before it parks, and the number is
+  now a setting: `LOOPGRAPH_MAX_ROUNDS` in `.env`. The worker takes it from the
+  environment the container started with, and each run records the number it
+  started with, so changing it never moves the line under a run already going.
+  A value that is not a whole number of at least 1 reads as unset, and the worker
+  prints the number it took on the line that says it is up. The cap inside one
+  round, three write-gate-fix attempts before the supervisor sees the work, has
+  not moved.
+
 ## 0.6.0 - 2026-09-10
 
 - A run can declare a web app, and the engine gives everyone a real browser. Put a

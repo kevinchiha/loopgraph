@@ -35,10 +35,15 @@ loop as one second.
 `read_run_config` is a plain function as well as an activity: `discover` reads
 the detectors from inside another activity and must not go through Temporal for
 them. Pure helpers are tested; the activity is thin.
+
+One knob here comes from .env rather than the file: `LOOPGRAPH_MAX_ROUNDS`, the
+per-item round cap, which the activity reads and hands to the workflow because
+the workflow may read no env of its own. See `max_rounds`.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -50,6 +55,7 @@ from activities.items import HEADING
 
 DEFAULT_CONVERGENCE = {"enabled": True, "every_items": 5, "net_lines": 400}
 DEFAULT_MAX_ITEMS = 40
+DEFAULT_MAX_ROUNDS = 8
 DEFAULT_DETECTOR_TIMEOUT = 600
 
 DEADLINE_RE = re.compile(r"^(\d+)(m|h|d)$")
@@ -180,6 +186,26 @@ def parse_run_config(text: str, brief: str = "") -> dict:
     return {"convergence": convergence, "sweep": sweep}
 
 
+def max_rounds(written: str) -> int:
+    """How many rounds one work item gets, from `LOOPGRAPH_MAX_ROUNDS` in .env.
+
+    Not a run.yaml key: it is one number for the machine, and every run on that
+    worker gets it. It lives here because the workflow reads no env of its own
+    (AC-35) and this activity already runs first on every run, so the number
+    reaches the workflow the only replay-safe way there is, as a recorded
+    activity result. A run keeps the number it started with even if .env changes
+    under it.
+
+    Anything that is not a whole number of at least one reads as unset, the way
+    `browser_port` treats a typo: `eight` or `0` must not park every item on the
+    round it was written, hours after anyone was watching. This is the one knob
+    in reach of a run that gets a default taken quietly instead of an error, and
+    the worker prints the number it took at startup so a value that did not land
+    is visible before a run is spent on it.
+    """
+    return int(written) if written.isdigit() and int(written) >= 1 else DEFAULT_MAX_ROUNDS
+
+
 def _read(path: Path) -> str:
     return path.read_text() if path.exists() else ""
 
@@ -201,6 +227,11 @@ async def load_run_config(run_dir: str) -> dict:
     `__cause__`; everything else that can go wrong here is a worker restart or a
     slow disk, which the retry policy is there to cover."""
     try:
-        return read_run_config(run_dir)
+        # The round cap rides along with the run.yaml knobs. It comes from .env
+        # rather than the file, and this is the only activity every run runs
+        # before its first round.
+        return read_run_config(run_dir) | {
+            "max_rounds": max_rounds(os.environ.get("LOOPGRAPH_MAX_ROUNDS", "")),
+        }
     except ValueError as e:
         raise ApplicationError(str(e), type="ValueError", non_retryable=True) from e

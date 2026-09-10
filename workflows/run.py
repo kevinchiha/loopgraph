@@ -16,7 +16,7 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from activities.audit import audit
     from activities.checkpoint import checkpoint, discard, merge
-    from activities.config import load_run_config
+    from activities.config import DEFAULT_MAX_ROUNDS, load_run_config
     from activities.discover import discover
     from activities.execute_round import execute_round, run_baseline
     from activities.gate import run_gates
@@ -79,20 +79,23 @@ class RoundRun:
         return self._result or {"state": "running"}
 
 
-MAX_ROUNDS = 3  # initial round + 2 supervisor redos: cap-3 doctrine, then escalate
-MAX_ASKS = 3    # owner questions per item. Separate budget, see budget_spent.
+MAX_ASKS = 3  # owner questions per item. Separate budget, see budget_spent.
 
 
-def budget_spent(spent: int, asks: int) -> str | None:
+def budget_spent(spent: int, asks: int, cap: int) -> str | None:
     """Why this item must stop, or None to carry on.
 
     Questions and corrections have separate budgets. A question is the engine
     waiting on the owner, not a failed attempt, and charging it as a round meant
     three questions consumed the whole correction budget: the first live `ask`
-    run asked the same thing three times and parked with nothing committed."""
+    run asked the same thing three times and parked with nothing committed.
+
+    `cap` is the round budget the config activity read from .env at the top of
+    the run. It is passed in rather than read here because this module replays
+    from history and must see the same number the run started with."""
     if asks >= MAX_ASKS:
         return "owner-question cap reached"
-    if spent >= MAX_ROUNDS:
+    if spent >= cap:
         return "redo cap reached"
     return None
 
@@ -932,7 +935,8 @@ class LoopGraphRun:
                 )
                 answered = True
                 continue
-            over = budget_spent(spent, asks)
+            over = budget_spent(spent, asks,
+                                self._config.get("max_rounds", DEFAULT_MAX_ROUNDS))
             if over:
                 return {"status": "parked", "result": result, "reason": over}
             d = verdict["directive"]

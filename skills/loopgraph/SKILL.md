@@ -207,7 +207,7 @@ always, `browser.yaml` only for a web app), plus
   `__pycache__/` or `.pytest_cache/` will turn a later scope gate red, and that
   defect is invisible if you only run each gate against a clean tree. The fix is
   a `.gitignore` in the target repo, never a weakened scope gate. A gate that
-  cannot pass on an untouched repo will burn three executor rounds and escalate.
+  cannot pass on an untouched repo will burn eight executor rounds and escalate.
   If one fails on the clean tree, the project is already broken: report that
   instead of starting a run.
 
@@ -310,7 +310,8 @@ answers. Tell them a decision is coming and how to answer it:
 - A merge card takes a letter and nothing else. If they type an answer instead,
   the engine tells them so and keeps waiting; the run is not stuck.
 
-**Parked items.** An item that cannot go green after three rounds is parked and
+**Parked items.** An item that cannot go green after eight rounds (`LOOPGRAPH_MAX_ROUNDS` in the
+engine's `.env`) is parked and
 the run carries on with the rest. The user gets a message straight away, which
 needs no answer, and anything they reply is handed to the next item. So a run can
 finish `merge-ready` with some items missing: read `items` in the ledger, and

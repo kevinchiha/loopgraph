@@ -34,7 +34,7 @@ If you have never run anything like this, here is one job from start to finish.
    its work. The literal `pytest` or `npm run build` you already run, which either
    exits 0 or does not.
 
-4. **If something failed, it is told what and tries again.** Three attempts. After
+4. **If something failed, it is told what and tries again.** Eight attempts. After
    that it stops rather than grinding, and the job moves on.
 
 5. **A second agent checks the claim.** It gets your brief and the diff. It does
@@ -63,10 +63,10 @@ round fails.
 **Auditor** — the second agent, called `supervisor` in the logs. It sees the brief
 and the diff and nothing else, so it cannot be talked into agreeing with itself.
 
-**Round** — one attempt: write, run the gates, get checked. Three per item, then it
-escalates.
+**Round** — one attempt: write, run the gates, get checked. Eight per item, then it
+escalates. `LOOPGRAPH_MAX_ROUNDS` in `.env` changes that number.
 
-**Parked** — an item that would not go green in three rounds. The run leaves it,
+**Parked** — an item that would not go green in eight rounds. The run leaves it,
 tells you, and carries on with the rest.
 
 **Sweep** — a run with no work items of its own. It asks the detectors what is
@@ -123,7 +123,7 @@ For the model, you have two routes:
   [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) runs on your machine,
   signs in with a subscription you already hold, and answers in the format the
   engine speaks. Which providers and models that covers is CLIProxyAPI's business,
-  not this project's. A single run can spend three executor rounds plus an audit
+  not this project's. A single run can spend eight executor rounds plus an audit
   pass, so per-token billing adds up faster than you would guess.
 - **A plain API key.** Simpler to start, metered.
 
@@ -242,7 +242,7 @@ run does them in order: each gets its own rounds, its own audit, and its own com
 on one branch, so page four starts from page three's verified state. You get one
 merge card at the end, not one per page.
 
-An item that will not go green after three rounds is parked and the run carries on.
+An item that will not go green after eight rounds is parked and the run carries on.
 One page with a broken gate does not throw away the five that worked. You get a
 message the moment something is parked, and whatever you reply is handed to the
 next item, so you can correct a run in flight without stopping it. The final card
@@ -254,7 +254,7 @@ starting, then starts the run and reports back. You hear from it again when ther
 is a decision to make.
 
 That clean-tree check matters more than it sounds. A gate that cannot pass on an
-untouched repo burns all three rounds, and then the report blames the executor for
+untouched repo burns all eight rounds, and then the report blames the executor for
 your build.
 
 Work that is not worth a loop: anything you would have finished while writing the
@@ -320,7 +320,7 @@ A gate that cannot fail reads exactly like a gate that passed.
 rounds, so round three does not repeat round one's mistake.
 
 **Run every gate yourself first, in the order they are listed and in the same
-directory.** A gate that cannot pass will burn all three rounds and escalate, and
+directory.** A gate that cannot pass will burn all eight rounds and escalate, and
 the report will blame the executor for your broken build.
 
 Order matters more than it looks. A test gate that leaves `__pycache__/` behind
@@ -457,8 +457,9 @@ never use it: it is the shortest description of how to drive this thing properly
   your network", it is on your machine. Read a brief before you start it, and do
   not run this on a box where "it only listens locally" is what keeps something
   safe.
-- Three rounds, then it escalates. It does not grind forever, and it does not
-  quietly give up either.
+- Eight rounds per item, then it escalates. It does not grind forever, and it
+  does not quietly give up either. `LOOPGRAPH_MAX_ROUNDS` in `.env` moves the
+  line; the worker reads it at startup, so restart the stack after changing it.
 - A Telegram bot is required, not optional. If you want a different channel, the
   place to add one is `activities/notify.py`, which is about ninety lines.
 
