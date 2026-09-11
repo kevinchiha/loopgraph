@@ -6,6 +6,16 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- A question the executor or the supervisor raises no longer dies on the shape it
+  was written in. Both contracts ask for `options` as a letter and a label, and a
+  model that wrote a plain list instead killed the activity that read it: one run
+  lost an audit with every gate green, parked the item, and threw away six files
+  of accepted work at the next worktree reset. A list now gets a letter per
+  choice, a bare string becomes one choice, and nothing is dropped. The card and
+  its buttons take the same treatment, where the failure was silent rather than
+  loud: the label went into the button's callback data, which the dispatcher
+  cannot read back, so the owner tapped a button that did nothing.
+
 ## 0.7.0 - 2026-09-10
 
 - An item gets eight rounds instead of three before it parks, and the number is

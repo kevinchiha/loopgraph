@@ -23,6 +23,8 @@ import os
 import httpx
 from temporalio import activity
 
+from activities.owner import clean_options
+
 API = "https://api.telegram.org"
 
 
@@ -36,7 +38,7 @@ def build_card_text(kind: str, wf_id: str, run_dir: str, summary: str,
     lines.append("")
     lines.append(summary.strip()[:1500])
     lines.append("")
-    lines.extend(f"{letter} — {label}" for letter, label in options.items())
+    lines.extend(f"{letter} — {label}" for letter, label in clean_options(options).items())
     return "\n".join(lines)[:4000]  # telegram message cap is 4096
 
 
@@ -69,8 +71,14 @@ def cb_key(wf_id: str) -> str:
 
 
 def build_keyboard(wf_id: str, options: dict[str, str]) -> dict:
+    """Both builders coerce rather than trust their caller. The workflow hands
+    them a clean map, but this is the last code between a model's idea of options
+    and the owner's phone, and getting it wrong here is silent: a list put the
+    label itself in callback_data, `route.CB_DATA` takes one letter and nothing
+    else, so the owner would tap a button that did nothing at all."""
     return {"inline_keyboard": [[
-        {"text": letter, "callback_data": f"lg:{cb_key(wf_id)}:{letter}"} for letter in options
+        {"text": letter, "callback_data": f"lg:{cb_key(wf_id)}:{letter}"}
+        for letter in clean_options(options)
     ]]}
 
 

@@ -123,3 +123,28 @@ def test_the_supervisor_contract_explains_generated_items():
     assert len(section) < 20, "\n".join(section)
     body = "\n".join(section)
     assert "convergence item" in body and "sweep item" in body
+
+
+# --- the auditor's packet is the boundary the rest of the engine trusts ---
+
+def _ask(options: str) -> str:
+    return ('```json\n{"verdict": "ask", "reasons": ["r"], '
+            '"directive": {"action": "which tier?"}, "options": ' + options + '}\n```')
+
+
+def test_parse_verdict_letters_a_list_of_options():
+    """Everything downstream of this packet — the card, the buttons, the line in
+    owner-answers.md — reads `options` as letter to label. Whatever the model
+    wrote, this is where it becomes that."""
+    assert parse_verdict(_ask('["pay", "stay free"]'))["options"] == \
+        {"A": "pay", "B": "stay free"}
+
+
+def test_parse_verdict_leaves_a_well_formed_map_alone():
+    assert parse_verdict(_ask('{"A": "pay", "B": "stay free"}'))["options"] == \
+        {"A": "pay", "B": "stay free"}
+
+
+def test_parse_verdict_options_are_always_a_map():
+    for raw in ('"pay or stay free"', "null", "[]", "{}", "7"):
+        assert isinstance(parse_verdict(_ask(raw))["options"], dict)

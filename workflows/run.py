@@ -23,7 +23,7 @@ with workflow.unsafe.imports_passed_through():
     from activities.items import load_work_items
     from activities.learn import learn
     from activities.notify import location_line, send_card, telegram_configured
-    from activities.owner import record_owner_answer
+    from activities.owner import clean_options, record_owner_answer
 
 
 @workflow.defn
@@ -908,7 +908,10 @@ class LoopGraphRun:
                 asks += 1
                 d = verdict["directive"]
                 question = d.get("action", "Supervisor needs an owner decision")
-                options = verdict.get("options") or {}
+                # Normalised where the packet is parsed too. A run already in
+                # flight replays the verdict its history recorded, so an upgraded
+                # worker still gets the old shape handed back to it here.
+                options = clean_options(verdict.get("options"))
                 # A sweep counts nothing towards a total: it builds its items
                 # as it goes, and `item 7 of 7` would say the run was on its
                 # last one every time it asked. The auditor still gets the
@@ -987,6 +990,10 @@ class LoopGraphRun:
         (merges), a signal carrying anything else is ignored rather than guessed at.
         """
         wf_id = workflow.info().workflow_id
+        # Every card the engine sends comes through here, and below this line the
+        # options are a letter map: the allowed set, the `lg approve` hint, the
+        # ledger the page reads, and the card itself all assume one.
+        options = clean_options(options)
         allowed = None if accept_text else set(options)
         # Only an answer sent AFTER this card counts. Anything already queued was
         # meant for an earlier card, or was sent before the owner could have seen

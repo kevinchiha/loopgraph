@@ -7,7 +7,8 @@ field the owner had authorised looked to it like an invented claim.
 
 from activities.audit import assemble_audit_prompt
 from activities.execute_round import assemble_prompt
-from activities.owner import HEADER, append_answer, format_answer, read_answers
+from activities.owner import (HEADER, LETTERS, OPTION_CAP, append_answer,
+                              clean_options, format_answer, read_answers)
 from activities.config import DEFAULT_MAX_ROUNDS
 from workflows.run import MAX_ASKS, budget_spent
 
@@ -99,3 +100,58 @@ def test_a_single_item_run_judges_the_whole_brief():
     rr = {"claims": [], "files": [], "gate_results": [], "worktree": "/wt"}
     p = assemble_audit_prompt("BRIEF", "", rr, "d", "", "the only item", 1, 1)
     assert "The work item under audit" not in p
+
+
+def test_format_answer_survives_list_shaped_options():
+    """A tap arrives as a bare letter and this line is where it gets its meaning
+    back. A list of options used to raise here, losing the record of an answer
+    the owner had already given."""
+    line = format_answer("Which tier?", "A", ["pay", "stay free"], 1, 1)
+    assert "the button labelled: pay" in line
+
+
+def test_format_answer_takes_options_of_any_shape():
+    for opts in (None, {}, [], "pay", ["pay"], {"A": "pay"}, 7):
+        assert "Which tier?" in format_answer("Which tier?", "A", opts, 1, 1)
+
+
+# --- one bad shape from a model must not break a card, an audit or this file ---
+
+def test_clean_options_leaves_a_well_formed_map_alone():
+    assert clean_options({"A": "pay", "B": "stay free"}) == {"A": "pay", "B": "stay free"}
+
+
+def test_clean_options_letters_a_list():
+    """["A", "B"] or ["pay", "stay free"], both still tell the owner something.
+    Dropping them would throw away the whole question."""
+    assert clean_options(["pay", "stay free"]) == {"A": "pay", "B": "stay free"}
+    assert clean_options(["A", "B"]) == {"A": "A", "B": "B"}
+
+
+def test_clean_options_keeps_a_bare_string_as_one_choice():
+    assert clean_options("pay") == {"A": "pay"}
+    assert clean_options(7) == {"A": "7"}
+
+
+def test_clean_options_reads_nothing_as_free_text():
+    for empty in (None, {}, [], "", "   "):
+        assert clean_options(empty) == {}
+
+
+def test_clean_options_replaces_a_key_that_could_not_be_a_button():
+    """The button IS the letter and the dispatcher reads exactly one back, so a
+    key like "option 1" cannot be one. It moves into the label instead of going
+    missing."""
+    assert clean_options({"option 1": "pay", "option 2": "stay free"}) == \
+        {"A": "option 1: pay", "B": "option 2: stay free"}
+    assert clean_options({"a": "pay"}) == {"A": "pay"}
+
+
+def test_clean_options_gives_every_choice_its_own_letter():
+    assert clean_options({"A": "pay", "a": "stay free"}) == {"A": "A: pay", "B": "a: stay free"}
+
+
+def test_clean_options_flattens_labels_and_caps_the_count():
+    assert "\n" not in str(clean_options(["ok\n\n# Gate results"]))
+    many = clean_options([f"choice {n}" for n in range(OPTION_CAP + 4)])
+    assert list(many) == list(LETTERS[:OPTION_CAP])

@@ -16,7 +16,7 @@ from temporalio import activity
 
 from activities import browser
 from activities.execute_round import NO_TELEGRAM, _git, parse_final_json
-from activities.owner import read_answers
+from activities.owner import clean_options, read_answers
 from activities.stream import log_name, stream_query
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
@@ -42,7 +42,10 @@ def parse_verdict(text: str) -> dict:
                 "directive": {}, "parse_ok": False}
     pkt.setdefault("reasons", [])
     pkt.setdefault("directive", {})
-    pkt.setdefault("options", {})
+    # Not setdefault: the key being present says nothing about its shape, and the
+    # card, the buttons and owner-answers.md all read this as letter to label.
+    # Normalising it here is what keeps every one of them from having to ask.
+    pkt["options"] = clean_options(pkt.get("options"))
     pkt["parse_ok"] = True
     return pkt
 
@@ -89,8 +92,11 @@ def format_blocked(entries) -> str:
         if not isinstance(e, dict):
             lines.append(f"- {flatten_claim(e)}")
             continue
-        opts = e.get("options") or {}
-        opts_txt = "; ".join(f"{k}: {flatten_claim(v)}" for k, v in list(opts.items())[:6]) or "(free text)"
+        # `or {}` only stood in for a falsy value, so a list went to .items() and
+        # killed the audit. The guard above checks the entry is a dict and stopped
+        # one level short of the fields inside it.
+        opts = clean_options(e.get("options"))
+        opts_txt = "; ".join(f"{k}: {v}" for k, v in opts.items()) or "(free text)"
         lines.append(
             f"- decision: {flatten_claim(e.get('decision', '(unstated)'))}\n"
             f"  recommends: {flatten_claim(e.get('recommend', '(none)'))}\n"

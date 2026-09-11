@@ -359,3 +359,29 @@ def test_a_long_question_is_cut_on_the_card_and_kept_whole_in_the_ledger(monkeyp
     card = build_card_text(*ask.cards[0])
     assert "item 2 of 3 · round 2" in card, "the line the cut is paying for"
     assert card.count("x") < 2000, "the card is capped, as it was before"
+
+
+# --- options the model shaped wrong still reach the owner as a usable card ---
+
+def test_a_card_built_from_a_list_of_options_still_routes_its_buttons():
+    """Worse than the audit crash, because nothing raises: a list put the label
+    itself in callback_data, the dispatcher's regex takes one letter and nothing
+    else, and the owner taps a button that does nothing at all."""
+    text = build_card_text("decision", "run-x-ab12cd", "runs/x", "which tier?", None,
+                           ["pay", "stay free"])
+    assert "A — pay" in text and "B — stay free" in text
+    keyboard = build_keyboard("run-x-ab12cd", ["pay", "stay free"])
+    taps = [{"callback_query": {"id": "1", "data": b["callback_data"],
+                                "message": {"text": text}}}
+            for b in keyboard["inline_keyboard"][0]]
+    assert [route_update(t, "chat", ["run-x-ab12cd"])["value"] for t in taps] == ["A", "B"]
+
+
+def test_the_workflow_hands_the_card_a_letter_map_whatever_the_auditor_wrote(monkeypatch):
+    """The verdict is normalised where it is parsed, but a run already in flight
+    replays the packet its history recorded, so the workflow coerces too."""
+    _, ask = _drive(monkeypatch, "_ask_owner", "runs/x", "which tier?",
+                    ["pay", "stay free"], 1, 3, 2)
+    assert ask.cards[0][5] == {"A": "pay", "B": "stay free"}
+    assert ask.awaiting_when_sent[0]["options"] == {"A": "pay", "B": "stay free"}
+    assert "lg approve run-x-ab12cd <A|B>" in ask.awaiting_when_sent[0]["answer_with"]
