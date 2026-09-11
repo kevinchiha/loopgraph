@@ -6,6 +6,8 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+## 0.7.1 - 2026-09-11
+
 - A question the executor or the supervisor raises no longer dies on the shape it
   was written in. Both contracts ask for `options` as a letter and a label, and a
   model that wrote a plain list instead killed the activity that read it: one run
