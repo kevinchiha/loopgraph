@@ -66,6 +66,12 @@ them and the compose file declares no `restart:` policy, so they run until someo
 takes them down, and a reboot is the only other thing that ever will. On a
 development machine, leave them up.
 
+Note for whoever runs it there: the account the checkout belongs to lost its docker
+group membership on 2026-09-13, because that membership is equivalent to root and
+the account is the one an agent runs as. So both `up` and `down` now need the
+administrative account. If a compose command returns "permission denied while trying
+to connect to the Docker daemon socket", that is this, not a broken install.
+
 **The supervisor knows only what `assemble_audit_prompt` hands it.** It never sees
 the executor's transcript, its directive, or the workflow's state, and that
 isolation is the point. So anything it must weigh has to be built into that
