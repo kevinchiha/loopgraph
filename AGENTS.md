@@ -56,6 +56,16 @@ produced four separate bugs: a retry that re-skipped the queue and lost an answe
 an unconfirmed update replayed as a fresh instruction, a poll that destroyed the
 updates it did not return, and a stale tap deciding the wrong card.
 
+**On the shared server, bring the stack down when the job is done.**
+`docker compose down` in the checkout there, not merely at the end of a session
+but at the end of the work. The six containers hold about 1.4 GB, one of them a
+Chromium, on a 15 GB box that also runs a media stack, nginx and an agent. They
+were found up for 27 hours on 2026-09-13 with nothing running through them, while
+the box sat 1.4 GB into swap. Nothing stops them on their own: no service supervises
+them and the compose file declares no `restart:` policy, so they run until someone
+takes them down, and a reboot is the only other thing that ever will. On a
+development machine, leave them up.
+
 **The supervisor knows only what `assemble_audit_prompt` hands it.** It never sees
 the executor's transcript, its directive, or the workflow's state, and that
 isolation is the point. So anything it must weigh has to be built into that
