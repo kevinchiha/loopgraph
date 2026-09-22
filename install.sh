@@ -99,7 +99,7 @@ cat <<'TXT'
      Simpler to start, billed per token.
 TXT
 ROUTE="$(ask "Route (1 or 2)" "$([ -n "$PREV_KEY" ] && echo 2 || echo 1)")"
-MODEL="$(ask "Model id" "${PREV_MODEL:-claude-opus-5}")"
+MODEL="$(ask "Model id" "${PREV_MODEL:-claude-opus-5-5}")"
 AUTH_LINES=""
 if [ "$ROUTE" = "2" ]; then
   KEY="$(ask_secret "  API key" "$PREV_KEY")"
