@@ -104,15 +104,16 @@ both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 
 ```bash
 lg where                                                # paths, ports, Telegram
-readlink ~/.claude/skills/loopgraph                     # must be <checkout>/skills/loopgraph
+readlink ~/.claude/skills/loopgraph ~/.agents/skills/loopgraph  # both <checkout>/skills/loopgraph
 <docker> compose ps                                     # worker must be Up
 lg start runs/example-hello /projects/loopgraph-example
 ```
 
-The `readlink` is there because the failure is silent. That path has to be a
+The `readlink` is there because the failure is silent. Claude Code reads the
+first path; dsh, Codex and most other agents read the second. Each has to be a
 symlink into the checkout: then every `lg update` changes the skill the user's
-agent reads, for free. If `readlink` prints nothing, it is a copied directory
-instead, frozen at whatever version it was made from and never updated again.
+agent reads, for free. If `readlink` prints only one line, the other is a copied
+directory instead, frozen at whatever version it was made from and never updated again.
 Delete it and re-run `./install.sh`, which will link it. Do not fix this by
 copying the new SKILL.md over the old one.
 

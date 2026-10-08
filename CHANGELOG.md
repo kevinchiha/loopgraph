@@ -6,6 +6,12 @@ heading to the version and date and opens a fresh `## Unreleased` above it.
 
 ## Unreleased
 
+- The skill now reaches agents other than Claude Code. The installer used to link
+  it into `~/.claude/skills/` only, and dsh, Codex and most other agents read
+  `~/.agents/skills/` instead, so they never saw it. The installer now links it
+  into both folders, asking once, and `lg update` adds the second link on a
+  machine that has only the first.
+
 ## 0.7.1 - 2026-09-11
 
 - A question the executor or the supervisor raises no longer dies on the shape it

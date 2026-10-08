@@ -831,10 +831,16 @@ async def _restart_stack(root: str, docker: str, action: str, tag: str) -> int:
     return 1
 
 
-def relink_skill(root: str, home: str) -> str | None:
-    """Point this home's `~/.claude/skills/loopgraph` at this checkout's skill.
+# The skills folders under a home that agents read. Claude Code reads the first.
+# dsh, Codex and most other agents read the second and never look in Claude
+# Code's, so a machine linked only there has a skill half its agents cannot see.
+SKILL_HOMES = (os.path.join(".claude", "skills"), os.path.join(".agents", "skills"))
 
-    install.sh makes that path a symlink, and a symlink needs nothing from an
+
+def relink_skill(root: str, home: str) -> str | None:
+    """Point this home's skill links (see SKILL_HOMES) at this checkout's skill.
+
+    install.sh makes each path a symlink, and a symlink needs nothing from an
     update: the merge rewrites SKILL.md under it and the agent reads the new one
     on its next session. This is here for every machine that is anything else —
     a link left behind by a clone that has since moved, or one nobody ever made
@@ -846,28 +852,37 @@ def relink_skill(root: str, home: str) -> str | None:
     remove instead. `home` is an argument rather than read from the environment
     so a test can be given one under tmp_path.
 
-    Returns the line to print, or None when there was nothing to do.
+    Returns the lines to print, or None when there was nothing to do. Each link
+    gets its own line; the restart line comes once, after the last.
     """
     src = os.path.join(root, "skills", "loopgraph")
     if not os.path.isdir(src):
         return None
-    dst = os.path.join(home, ".claude", "skills", "loopgraph")
-    # islink before exists, in that order: a link whose target is gone answers
-    # False to exists, and reading it as "nothing is there" would try to create
-    # a symlink on top of one and raise FileExistsError.
-    if os.path.islink(dst):
-        if os.path.realpath(dst) == os.path.realpath(src):
-            return None
-        os.remove(dst)
-        verb = "re-pointed"
-    elif os.path.exists(dst):
-        return (f"{dst} is a copy, not a link to {src}\n"
-                "  it did not follow this update; remove it and run lg update again")
-    else:
-        verb = "linked"
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    os.symlink(src, dst)
-    return f"{verb} {dst} -> {src}\n  restart your agent session to pick up the skill"
+    said: list[str] = []
+    changed = False
+    for skills in SKILL_HOMES:
+        dst = os.path.join(home, skills, "loopgraph")
+        # islink before exists, in that order: a link whose target is gone
+        # answers False to exists, and reading it as "nothing is there" would
+        # try to create a symlink on top of one and raise FileExistsError.
+        if os.path.islink(dst):
+            if os.path.realpath(dst) == os.path.realpath(src):
+                continue
+            os.remove(dst)
+            verb = "re-pointed"
+        elif os.path.exists(dst):
+            said.append(f"{dst} is a copy, not a link to {src}\n"
+                        "  it did not follow this update; remove it and run lg update again")
+            continue
+        else:
+            verb = "linked"
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.symlink(src, dst)
+        said.append(f"{verb} {dst} -> {src}")
+        changed = True
+    if changed:
+        said.append("  restart your agent session to pick up the skill")
+    return "\n".join(said) or None
 
 
 async def cmd_update(args: argparse.Namespace) -> int:

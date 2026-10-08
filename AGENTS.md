@@ -127,14 +127,17 @@ scope gate was vacuously green for every run on one machine for weeks, five
 rounds wrote it into a constraints file, and nothing in the engine could tell.
 
 **The skill an agent reads is a link, never a copy.** `~/.claude/skills/loopgraph`
-points into this checkout, and that is the whole reason a release ships a new
-`SKILL.md` for free: the merge rewrites the file the link already points at.
+(Claude Code) and `~/.agents/skills/loopgraph` (dsh, Codex and most other agents,
+which never read Claude Code's folder) both point into this checkout, and that is
+the whole reason a release ships a new `SKILL.md` for free: the merge rewrites the
+file the link already points at.
 Anything else goes stale in silence. install.sh used to ask only whether something
-was at that path, so a link left behind by a checkout someone had moved survived
+was at the path, so a link left behind by a checkout someone had moved survived
 every re-run of the installer and every `lg update` after it, and the only way out
 was asking your agent to copy the file by hand. `relink_skill` in `lg` and section
-6 of install.sh now both ask where it points, repair a link, and leave a directory
-a user copied there alone.
+6 of install.sh now both ask where each link points, repair a link, and leave a
+directory a user copied there alone. Both read the same two folders; change one
+list and you must change the other.
 
 **Gates never get the app URL.** A run with a `browser.yaml` serves its app once
 for the executor and again for the auditor, and both models get

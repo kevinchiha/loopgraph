@@ -694,7 +694,7 @@ def _update(lg, root, monkeypatch, capsys, runner=None, home=None) -> tuple[int,
     two minutes to spend proving it.
 
     HOME is fenced for the same reason and it matters more: the update writes a
-    symlink under ~/.claude/skills, so a test left pointing at the real home
+    symlink under ~/.claude/skills and ~/.agents/skills, so a test left pointing at the real home
     would re-point the skill link of whoever is running the suite. `home` is
     only for the tests that then read what was written there.
     """
@@ -992,9 +992,14 @@ def test_update_never_runs_a_git_command_that_could_lose_work(
 
 # ---------------------------------------------- lg update: the skill on disk ---
 
-# `~/.claude/skills/loopgraph` is how an agent reads this checkout's SKILL.md.
-# install.sh makes it a symlink, and a symlink follows every update by itself.
-# These are the states a machine ends up in when it is anything else.
+# An agent reads this checkout's SKILL.md through a link in its own skills
+# folder. Claude Code looks in `~/.claude/skills`; dsh, Codex and most other
+# agents look in `~/.agents/skills` and never in Claude Code's. install.sh puts a
+# symlink in both, and a symlink follows every update by itself. These are the
+# states a machine ends up in when either one is anything else.
+
+SKILL_HOMES = (".claude", ".agents")
+
 
 def _skill_checkout(tmp_path):
     """A checkout with a skill to link, and a home with nothing linked yet."""
@@ -1006,40 +1011,70 @@ def _skill_checkout(tmp_path):
     return root, home
 
 
-def _skill_dst(home):
-    return home / ".claude" / "skills" / "loopgraph"
+def _skill_dst(home, where=".claude"):
+    return home / where / "skills" / "loopgraph"
 
 
-def test_relink_skill_says_nothing_when_the_link_already_points_here(tmp_path):
+def _link_right(root, home, where):
+    """Link `where`'s skill at this checkout, the state install.sh leaves."""
+    dst = _skill_dst(home, where)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.symlink_to(root / "skills" / "loopgraph")
+    return dst
+
+
+def _other(where):
+    return next(other for other in SKILL_HOMES if other != where)
+
+
+def test_relink_skill_says_nothing_when_both_links_already_point_here(tmp_path):
     """The install.sh default. A symlink is already current the moment the merge
     lands, so an update that announced it every time would be noise."""
     root, home = _skill_checkout(tmp_path)
-    dst = _skill_dst(home)
-    dst.parent.mkdir(parents=True)
-    dst.symlink_to(root / "skills" / "loopgraph")
+    for where in SKILL_HOMES:
+        _link_right(root, home, where)
     assert _lg().relink_skill(str(root), str(home)) is None
 
 
 def test_relink_skill_links_a_home_that_never_had_one(tmp_path):
     """Someone who declined the installer's offer, or installed before the skill
-    existed. Nothing is at the destination, and neither are its parents."""
+    existed. Nothing is at either destination, and neither are their parents.
+    The restart line comes once, after both."""
     root, home = _skill_checkout(tmp_path)
-    dst = _skill_dst(home)
+    src = root / "skills" / "loopgraph"
     said = _lg().relink_skill(str(root), str(home))
-    assert said == (f"linked {dst} -> {root / 'skills' / 'loopgraph'}\n"
+    assert said == (f"linked {_skill_dst(home, '.claude')} -> {src}\n"
+                    f"linked {_skill_dst(home, '.agents')} -> {src}\n"
                     "  restart your agent session to pick up the skill")
-    assert dst.is_symlink()
-    assert dst.resolve() == (root / "skills" / "loopgraph").resolve()
+    for where in SKILL_HOMES:
+        dst = _skill_dst(home, where)
+        assert dst.is_symlink()
+        assert dst.resolve() == src.resolve()
 
 
-def test_relink_skill_repoints_a_link_into_another_checkout(tmp_path):
+def test_relink_skill_adds_the_agents_link_beside_a_claude_one(tmp_path):
+    """Every machine installed before both folders were linked: Claude Code saw
+    the skill, dsh never did. The Claude Code link is right and stays untouched."""
+    root, home = _skill_checkout(tmp_path)
+    claude = _link_right(root, home, ".claude")
+    was = claude.readlink()
+    said = _lg().relink_skill(str(root), str(home))
+    assert said == (f"linked {_skill_dst(home, '.agents')} -> {root / 'skills' / 'loopgraph'}\n"
+                    "  restart your agent session to pick up the skill")
+    assert claude.readlink() == was
+    assert (_skill_dst(home, ".agents") / "SKILL.md").read_text(encoding="utf-8") == "# new\n"
+
+
+@pytest.mark.parametrize("where", SKILL_HOMES)
+def test_relink_skill_repoints_a_link_into_another_checkout(tmp_path, where):
     """A symlink left over from an older clone. It resolves, it reads, and every
     word in it is the version that other checkout is on."""
     root, home = _skill_checkout(tmp_path)
+    _link_right(root, home, _other(where))
     stale = tmp_path / "old-engine" / "skills" / "loopgraph"
     stale.mkdir(parents=True)
     (stale / "SKILL.md").write_text("# old\n", encoding="utf-8")
-    dst = _skill_dst(home)
+    dst = _skill_dst(home, where)
     dst.parent.mkdir(parents=True)
     dst.symlink_to(stale)
     said = _lg().relink_skill(str(root), str(home))
@@ -1050,11 +1085,13 @@ def test_relink_skill_repoints_a_link_into_another_checkout(tmp_path):
     assert (stale / "SKILL.md").read_text(encoding="utf-8") == "# old\n"
 
 
-def test_relink_skill_repoints_a_link_whose_target_is_gone(tmp_path):
+@pytest.mark.parametrize("where", SKILL_HOMES)
+def test_relink_skill_repoints_a_link_whose_target_is_gone(tmp_path, where):
     """A checkout that was moved or deleted. The link is still a link, so
     replacing it costs nothing, but os.path.exists answers False for it."""
     root, home = _skill_checkout(tmp_path)
-    dst = _skill_dst(home)
+    _link_right(root, home, _other(where))
+    dst = _skill_dst(home, where)
     dst.parent.mkdir(parents=True)
     dst.symlink_to(tmp_path / "deleted" / "skills" / "loopgraph")
     said = _lg().relink_skill(str(root), str(home))
@@ -1062,11 +1099,13 @@ def test_relink_skill_repoints_a_link_whose_target_is_gone(tmp_path):
     assert (dst / "SKILL.md").read_text(encoding="utf-8") == "# new\n"
 
 
-def test_relink_skill_refuses_to_touch_a_copied_directory(tmp_path):
+@pytest.mark.parametrize("where", SKILL_HOMES)
+def test_relink_skill_refuses_to_touch_a_copied_directory(tmp_path, where):
     """A copy someone made by hand, or an agent wrote when asked to install the
     skill. It may have edits in it, so this says what to do and writes nothing."""
     root, home = _skill_checkout(tmp_path)
-    dst = _skill_dst(home)
+    _link_right(root, home, _other(where))
+    dst = _skill_dst(home, where)
     dst.mkdir(parents=True)
     (dst / "SKILL.md").write_text("# copied, and edited\n", encoding="utf-8")
     said = _lg().relink_skill(str(root), str(home))
@@ -1083,7 +1122,8 @@ def test_relink_skill_does_nothing_when_the_checkout_has_no_skill(tmp_path):
     root.mkdir()
     home.mkdir()
     assert _lg().relink_skill(str(root), str(home)) is None
-    assert not _skill_dst(home).exists()
+    for where in SKILL_HOMES:
+        assert not _skill_dst(home, where).exists()
 
 
 def test_update_repoints_a_stale_skill_link_after_the_merge(
@@ -1116,9 +1156,8 @@ def test_update_says_nothing_about_a_skill_link_that_is_already_right(
     clone_repo.push()
     _release_on_origin(clone_repo, "v0.2.0", {"CHANGELOG.md": RELEASE_NOTES})
     home = tmp_path / "home"
-    dst = _skill_dst(home)
-    dst.parent.mkdir(parents=True)
-    dst.symlink_to(clone_repo.root / "skills" / "loopgraph")
+    for where in SKILL_HOMES:
+        _link_right(clone_repo.root, home, where)
     _temporal(lg, monkeypatch, ListingClient())
     code, out, err = _update(lg, clone_repo.root, monkeypatch, capsys, home=home)
     assert (code, err) == (0, "")
@@ -1712,13 +1751,42 @@ def installable(tmp_path):
 
 
 def test_install_links_the_skill_into_a_home_that_has_none(installable):
+    """Both folders: Claude Code reads one, dsh and most other agents the other."""
     root, home = installable
     code, out = _install_skill_step(root, home)
-    dst = home / ".claude" / "skills" / "loopgraph"
     assert code == 0
-    assert dst.is_symlink()
-    assert dst.resolve() == (root / "skills" / "loopgraph").resolve()
-    assert "linked" in out
+    for where in SKILL_HOMES:
+        dst = _skill_dst(home, where)
+        assert dst.is_symlink()
+        assert dst.resolve() == (root / "skills" / "loopgraph").resolve()
+        assert f"linked {dst}" in out
+
+
+def test_install_adds_the_agents_link_beside_a_claude_one(installable):
+    """A home installed before both folders were linked. The re-run fills in the
+    missing one and leaves the right one as it was."""
+    root, home = installable
+    claude = _link_right(root, home, ".claude")
+    was = claude.readlink()
+    code, out = _install_skill_step(root, home)
+    assert code == 0
+    assert claude.readlink() == was
+    agents = _skill_dst(home, ".agents")
+    assert agents.resolve() == (root / "skills" / "loopgraph").resolve()
+    assert f"{claude} already linked" in out
+    assert f"linked {agents}" in out
+
+
+def test_install_links_nothing_when_the_user_says_no(installable):
+    """Without --yes the installer asks once for both links, and a no is a no
+    for both."""
+    root, home = installable
+    code, out = _install_skill_step(root, home, yes="0", answer=1)
+    assert code == 0
+    for where in SKILL_HOMES:
+        assert not _skill_dst(home, where).exists()
+        assert not _skill_dst(home, where).is_symlink()
+    assert "linked" not in out
 
 
 def test_install_repoints_a_link_into_another_checkout(installable):

@@ -184,9 +184,10 @@ It refuses, and changes nothing, in three cases you can hit:
 The dashboard header shows the installed release and says when a newer one exists.
 
 The skill check is there because a stale skill is silent. `~/.claude/skills/loopgraph`
-is a symlink into the checkout, so it changes with every update on its own; if it
-has come loose — a link left behind by a checkout you moved, or one nobody ever
-made — `lg update` re-points it and says so. Restart your agent session afterwards
+(read by Claude Code) and `~/.agents/skills/loopgraph` (read by dsh, Codex and most
+other agents) are symlinks into the checkout, so they change with every update on
+their own; if one has come loose — a link left behind by a checkout you moved, or
+one nobody ever made — `lg update` re-points it and says so. Restart your agent session afterwards
 to load it. The one thing it will not do is overwrite a directory you copied there
 yourself; it names the path and leaves your edits alone, and removing it and
 running `lg update` again links it.
@@ -200,8 +201,8 @@ open.
 
 ## Using it
 
-The installer links a skill into `~/.claude/skills/`, so your agent already knows
-how to drive the engine, and `lg update` keeps that link pointing here. You describe the work; it writes the run and starts it.
+The installer links a skill into `~/.claude/skills/` and `~/.agents/skills/`, so your
+agent already knows how to drive the engine, and `lg update` keeps both links pointing here. You describe the work; it writes the run and starts it.
 
 Start with the example, which ships with the repo:
 
